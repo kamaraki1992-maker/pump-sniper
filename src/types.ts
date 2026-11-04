@@ -13,7 +13,8 @@ export type TradeReason =
   | "timeout"
   | "liquidity_drop"
   | "volume_stall"
-  | "sell_pressure";
+  | "sell_pressure"
+  | "trailing_stop";
 
 export interface MarketLaunch {
   kind: "launch";
@@ -88,6 +89,8 @@ export interface TradeRecord {
   sizeSol: number;
   /** USD notional of a buy. Null on sells. */
   sizeUsd?: number | null;
+  /** Curved confidence score used to size a buy. Null on sells. */
+  confidence?: number | null;
   price: number;
   feesSol: number;
   jitoTipSol: number;
@@ -123,6 +126,12 @@ export interface Position {
   lastRealSolSol?: number | null;
   bondingCurve?: string | null;
   lastTradeAtMs?: number;
+  /** Highest mark seen. Drives the profit-lock floor. */
+  peakPriceSol?: number | null;
+  /** Locked floor in percent above entry. Only ratchets up. */
+  trailFloorPct?: number | null;
+  /** Trades applied to this position. Zero means the trade subscription delivered nothing. */
+  tradesSeen?: number;
 }
 
 export interface Executor {

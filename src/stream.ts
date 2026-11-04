@@ -8,21 +8,51 @@ export function nextBackoffMs(attempt: number, baseMs = 1000, capMs = 30_000): n
   return Math.min(capMs, baseMs * 2 ** exp);
 }
 
+export interface PumpSocket {
+  send(data: string): void;
+  close(): void;
+  on(event: "open", cb: () => void): void;
+  on(event: "message", cb: (data: unknown) => void): void;
+  on(event: "close", cb: () => void): void;
+  on(event: "error", cb: (error: Error) => void): void;
+}
+
+function defaultSocket(url: string): PumpSocket {
+  return new WebSocket(url) as unknown as PumpSocket;
+}
+
+function payloadText(data: unknown): string {
+  if (typeof data === "string") return data;
+  if (Buffer.isBuffer(data)) return data.toString();
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString();
+  if (Array.isArray(data) && data.every((part) => Buffer.isBuffer(part))) {
+    return Buffer.concat(data).toString();
+  }
+  return "";
+}
+
 /**
- * PumpDev Solana socket. Control frames (`type`) are ignored. Subscriptions
- * are replayed after every reconnect.
+ * PumpDev Solana socket. Control frames (`type`) are ignored by the parser.
+ * Token-trade subscriptions are replayed after every reconnect and dropped
+ * when the caller unsubscribes, because the anonymous tier only allows a
+ * handful of live keys.
  */
 export class PumpDevStream {
-  private ws: WebSocket | null = null;
+  private ws: PumpSocket | null = null;
+  private opened = false;
   private attempt = 0;
   private stopped = false;
   private timer: NodeJS.Timeout | null = null;
-  private readonly mints = new Set<string>();
+  private retried = false;
+  private readonly wanted = new Set<string>();
+  private readonly acked = new Set<string>();
   private onEvent: (event: MarketEvent) => void = () => {};
 
   constructor(
     private readonly url: string,
     private readonly log: Logger,
+    private readonly sockets: (url: string) => PumpSocket = defaultSocket,
+    private readonly backoff: (attempt: number) => number = nextBackoffMs,
   ) {}
 
   start(onEvent: (event: MarketEvent) => void): void {
@@ -31,62 +61,125 @@ export class PumpDevStream {
     this.open();
   }
 
+  /** True once the server ack listed this mint. A send alone is not delivery. */
+  tradeLive(mint: string): boolean {
+    return this.wanted.has(mint) && this.acked.has(mint);
+  }
+
   subscribeTrades(mints: string[]): void {
-    const fresh = mints.filter((mint) => !this.mints.has(mint));
-    for (const mint of fresh) this.mints.add(mint);
-    if (fresh.length > 0) this.send({ method: "subscribeTokenTrade", keys: fresh });
+    let added = false;
+    for (const mint of mints) {
+      if (!mint || this.wanted.has(mint)) continue;
+      this.wanted.add(mint);
+      added = true;
+    }
+    if (added) this.flushPending();
+  }
+
+  unsubscribeTrades(mints: string[]): void {
+    const drop = mints.filter((mint) => this.wanted.delete(mint));
+    for (const mint of drop) this.acked.delete(mint);
+    if (drop.length === 0) return;
+    this.send({ method: "unsubscribeTokenTrade", keys: drop });
+    this.flushPending();
   }
 
   stop(): void {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
-    this.ws?.removeAllListeners();
     this.ws?.close();
     this.ws = null;
   }
 
   private open(): void {
     if (this.stopped) return;
-    const ws = new WebSocket(this.url);
+    this.opened = false;
+    const ws = this.sockets(this.url);
     this.ws = ws;
     let scheduled = false;
     const reconnect = () => {
       if (this.stopped || scheduled || this.ws !== ws) return;
       scheduled = true;
-      const delay = nextBackoffMs(this.attempt);
+      this.opened = false;
+      const delay = this.backoff(this.attempt);
       this.attempt += 1;
       this.log.info("ws reconnect", { delayMs: delay });
       this.timer = setTimeout(() => this.open(), delay);
     };
     ws.on("open", () => {
+      if (this.ws !== ws) return;
       this.attempt = 0;
+      this.opened = true;
+      this.acked.clear();
+      this.retried = false;
       this.send({ method: "subscribeNewToken" });
-      if (this.mints.size > 0) {
-        this.send({ method: "subscribeTokenTrade", keys: [...this.mints] });
-      }
+      this.flushPending();
       this.log.info("ws open", { url: this.url });
     });
     ws.on("message", (data) => {
+      if (this.ws !== ws) return;
+      const text = payloadText(data);
+      if (!text) return;
       let parsed: unknown;
       try {
-        parsed = JSON.parse(data.toString());
+        parsed = JSON.parse(text);
       } catch {
         return;
       }
+      if (this.onControl(parsed)) return;
       const event = parsePumpDevMessage(parsed);
       if (event) this.onEvent(event);
     });
     ws.on("error", (error) => {
-      this.log.info("ws error", { error: error.message });
+      this.log.info("ws error", { error: error instanceof Error ? error.message : "ws-error" });
       reconnect();
     });
     ws.on("close", () => reconnect());
   }
 
-  private send(payload: unknown): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(payload));
+  /** Returns true when the frame is a control message and should not be parsed as a trade. */
+  private onControl(raw: unknown): boolean {
+    if (!raw || typeof raw !== "object") return false;
+    const record = raw as Record<string, unknown>;
+    if (typeof record.type !== "string") return false;
+    if (record.type === "subscribed" && record.method === "subscribeTokenTrade") {
+      const keys = Array.isArray(record.keys)
+        ? record.keys.filter((key): key is string => typeof key === "string")
+        : [];
+      for (const key of keys) {
+        if (this.wanted.has(key)) this.acked.add(key);
+      }
+      const missing = [...this.wanted].filter((mint) => !this.acked.has(mint));
+      this.log.info("trade subscription", { applied: keys, missing });
+      if (missing.length > 0 && !this.retried) {
+        this.retried = true;
+        this.send({ method: "subscribeTokenTrade", keys: missing });
+      }
+      return true;
     }
+    if (record.type === "error") {
+      const message = typeof record.message === "string" ? record.message.slice(0, 240) : "";
+      this.log.info("ws control", {
+        code: typeof record.code === "string" ? record.code : "error",
+        message,
+      });
+      if (!this.retried) {
+        this.retried = true;
+        this.flushPending();
+      }
+      return true;
+    }
+    return true;
+  }
+
+  private flushPending(): void {
+    const pending = [...this.wanted].filter((mint) => !this.acked.has(mint));
+    if (pending.length > 0) this.send({ method: "subscribeTokenTrade", keys: pending });
+  }
+
+  private send(payload: unknown): void {
+    if (!this.opened) return;
+    this.ws?.send(JSON.stringify(payload));
   }
 }

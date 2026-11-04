@@ -3,7 +3,7 @@ import { Connection, Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 import { SniperBot } from "./bot.js";
 import { RpcCurveWatch } from "./curve-watch.js";
-import { ConfigError, loadConfig, type AppConfig } from "./config.js";
+import { ConfigError, formatTrailTiers, loadConfig, type AppConfig } from "./config.js";
 import { PaperExecutor } from "./executor-paper.js";
 import { createLivePorts, LiveExecutor } from "./executor-live.js";
 import { RpcCreatorHistory } from "./history.js";
@@ -21,6 +21,7 @@ import type { Executor } from "./types.js";
 type LiveStream = {
   start(onEvent: (event: MarketEvent) => void): void;
   subscribeTrades(mints: string[]): void;
+  unsubscribeTrades(mints: string[]): void;
   stop(): void;
 };
 
@@ -102,6 +103,7 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     now: () => new Date(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     subscribeMint: (mint) => subscription.stream?.subscribeTrades([mint]),
+    unsubscribeMint: (mint) => subscription.stream?.unsubscribeTrades([mint]),
     ...(walletBalanceSol ? { walletBalanceSol } : {}),
     safetyCheck: createRpcSafetyCheck(config),
     ...(curveWatch ? { curveWatch } : {}),
@@ -147,6 +149,10 @@ export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promis
     stopLossPct: config.stopLossPct,
     maxOpenPositions: config.maxOpenPositions,
     maxHoldMinutes: config.maxHoldMinutes,
+    volumeStallSec: config.volumeStallSec,
+    volumeStallGraceSec: config.volumeStallGraceSec,
+    trailTiers: formatTrailTiers(config.trailTiers),
+    takeProfitDisabled: config.takeProfitPct === 0,
   });
   const stream = attachStream(runtime);
   let stopped = false;

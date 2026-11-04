@@ -1,5 +1,5 @@
 import { bondingCurveAddress } from "./curve-watch.js";
-import { confidenceScore, sizeFromConfidence } from "./confidence.js";
+import { confidenceBreakdown, sizeFromConfidence, type ConfidenceBreakdown } from "./confidence.js";
 import { clampBuyUsd, requiredBuyBalanceSol, type AppConfig } from "./config.js";
 import { SOL_PRICE_MAX_AGE_MS } from "./sol-price.js";
 import type { FilterDecision } from "./filter.js";
@@ -8,7 +8,7 @@ import { Logger } from "./logger.js";
 import type { PositionBook } from "./positions.js";
 import { TOTAL_SUPPLY_TOKENS } from "./pricing.js";
 import type { TradeLog } from "./report.js";
-import { decideExit, reservesDropped } from "./risk.js";
+import { decideExit, nextTrailFloor, reservesDropped } from "./risk.js";
 import type { SafetyCheckResult } from "./safety.js";
 import type { Executor, MarketLaunch, MarketTrade, OrderRequest, Position, TradeReason } from "./types.js";
 
@@ -25,6 +25,7 @@ export interface BotDeps {
   now: () => Date;
   sleep: (ms: number) => Promise<void>;
   subscribeMint: (mint: string) => void;
+  unsubscribeMint: (mint: string) => void;
   /** Live mode only. Paper mode does not consult a wallet. */
   walletBalanceSol?: () => Promise<number>;
   safetyCheck?: (input: {
@@ -43,6 +44,16 @@ export interface BotDeps {
 
 const MAX_OPEN_LOG_MS = 5_000;
 
+function confidenceFields(confidence: ConfidenceBreakdown): Record<string, number> {
+  return {
+    hold: confidence.hold,
+    flow: confidence.flow,
+    safety: confidence.safety,
+    raw: confidence.raw,
+    score: confidence.score,
+  };
+}
+
 export class SniperBot {
   private readonly seen = new Set<string>();
   private readonly pendingBuys = new Set<string>();
@@ -50,6 +61,7 @@ export class SniperBot {
   private readonly cooldownUntil = new Map<string, number>();
   private lastMaxOpenLogMs = Number.NEGATIVE_INFINITY;
   private readonly flow = new Map<string, Array<{ at: number; side: "buy" | "sell" }>>();
+  private readonly lastMarketTradeAt = new Map<string, number>();
   private stopped = false;
 
   constructor(private readonly deps: BotDeps) {
@@ -124,12 +136,14 @@ export class SniperBot {
       this.skip(launch, "no_price");
       return;
     }
-    const { sizeUsd, sizeSol } = orderSize;
+    const { sizeUsd, sizeSol, confidence } = orderSize;
     if (!this.tryReserve(launch.mint)) {
       this.skipMaxOpen(launch);
       return;
     }
 
+    let held = false;
+    this.deps.subscribeMint(launch.mint);
     const order: OrderRequest = {
       mint: launch.mint,
       name: launch.name,
@@ -175,11 +189,19 @@ export class SniperBot {
         tokenAmount: fill.tokenAmount,
         realizedPnlSol: null,
         costSol: fill.status === "filled" ? fill.cashflowSol : null,
+        confidence: confidence.score,
       });
       if (fill.status !== "filled") {
-        this.deps.log.info("buy failed", { mint: launch.mint, error: fill.error, sizeUsd, sizeSol });
+        this.deps.log.info("buy failed", {
+          mint: launch.mint,
+          error: fill.error,
+          sizeUsd,
+          sizeSol,
+          ...confidenceFields(confidence),
+        });
         return;
       }
+      held = true;
       const position: Position = {
         mint: launch.mint,
         name: launch.name,
@@ -197,10 +219,10 @@ export class SniperBot {
         entryVSolSol: launch.vSolSol,
         lastVSolSol: launch.vSolSol,
         bondingCurve: bondingCurveAddress(launch.mint, launch.bondingCurveKey),
-        lastTradeAtMs: this.deps.now().getTime(),
+        lastTradeAtMs: this.lastMarketTradeAt.get(launch.mint) ?? this.deps.now().getTime(),
+        tradesSeen: 0,
       };
       this.deps.positions.open(position);
-      this.deps.subscribeMint(launch.mint);
       if (position.bondingCurve) this.deps.curveWatch?.watch(launch.mint, position.bondingCurve);
       this.deps.log.info("buy filled", {
         mint: launch.mint,
@@ -211,17 +233,21 @@ export class SniperBot {
         openPositions: this.deps.positions.list().length,
         sizeUsd,
         sizeSol,
+        ...confidenceFields(confidence),
       });
     } finally {
       this.pendingBuys.delete(launch.mint);
+      if (!held) this.deps.unsubscribeMint(launch.mint);
     }
   }
 
   async onTrade(trade: MarketTrade): Promise<void> {
+    const now = this.deps.now().getTime();
+    this.lastMarketTradeAt.set(trade.mint, now);
+    this.noteTrade(trade.mint, trade.txType, now);
     const position = this.deps.positions.get(trade.mint);
     if (!position) return;
-    const now = this.deps.now().getTime();
-    this.noteTrade(trade.mint, trade.txType, now);
+    position.tradesSeen = (position.tradesSeen ?? 0) + 1;
     position.lastTradeAtMs = now;
     if (trade.vSolSol !== null && trade.vSolSol > 0) position.lastVSolSol = trade.vSolSol;
     if (trade.priceSol !== null && trade.priceSol > 0) position.lastMarkPriceSol = trade.priceSol;
@@ -257,6 +283,17 @@ export class SniperBot {
     if (this.deps.now().getTime() < cooldown) return;
     const openedAtMs = Date.parse(position.openedAt);
     const counts = this.windowCounts(position.mint, this.deps.now().getTime());
+    const mark = quote > 0 ? quote : 0;
+    if (mark > 0 && position.entryPriceSol > 0) {
+      const peak = Math.max(position.peakPriceSol ?? mark, mark);
+      position.peakPriceSol = peak;
+      position.trailFloorPct = nextTrailFloor(
+        position.entryPriceSol,
+        peak,
+        this.deps.config.trailTiers,
+        position.trailFloorPct ?? null,
+      );
+    }
     const signal = decideExit({
       entryPrice: position.entryPriceSol,
       markPrice: quote,
@@ -270,6 +307,8 @@ export class SniperBot {
       liqDropPct: this.deps.config.liqDropPct,
       lastTradeAtMs: position.lastTradeAtMs ?? openedAtMs,
       volumeStallMs: this.deps.config.volumeStallSec * 1000,
+      volumeStallGraceMs: this.deps.config.volumeStallGraceSec * 1000,
+      trailFloorPct: position.trailFloorPct ?? null,
       sellsInWindow: counts.sells,
       buysInWindow: counts.buys,
       sellPressureRatio: this.deps.config.sellPressureRatio,
@@ -331,12 +370,15 @@ export class SniperBot {
         if (fill.status === "filled") {
           this.deps.positions.close(current.mint);
           this.flow.delete(current.mint);
+          this.lastMarketTradeAt.delete(current.mint);
           this.deps.curveWatch?.unwatch(current.mint);
+          this.deps.unsubscribeMint(current.mint);
           this.deps.log.info("sell filled", {
             mint: current.mint,
             reason,
             realizedPnlSol: realized,
             signature: fill.signature,
+            ...(reason === "volume_stall" ? { tradesSeen: current.tradesSeen ?? 0 } : {}),
           });
           return;
         }
@@ -355,21 +397,25 @@ export class SniperBot {
   }
 
   /** USD notional clamped to the hard cap, then SOL at the fresh quote. */
-  private quoteBuySize(launch: MarketLaunch): { sizeUsd: number; sizeSol: number } | null {
+  private quoteBuySize(
+    launch: MarketLaunch,
+  ): { sizeUsd: number; sizeSol: number; confidence: ConfidenceBreakdown } | null {
     const quote = this.deps.solQuote();
     if (!quote || !(quote.usd > 0) || !Number.isFinite(quote.usd)) return null;
     if (this.deps.now().getTime() - quote.updatedAtMs > SOL_PRICE_MAX_AGE_MS) return null;
     const holdPct = (launch.initialBuyTokens / TOTAL_SUPPLY_TOKENS) * 100;
-    const earlyBuys = launch.initialBuyTokens > 0 ? 1 : 0;
+    const counts = this.windowCounts(launch.mint, this.deps.now().getTime());
+    const confidence = confidenceBreakdown({
+      holdPct,
+      buys: counts.buys,
+      sells: counts.sells,
+      safetyOk: true,
+    });
     const sizeUsd = clampBuyUsd(
-      sizeFromConfidence(
-        confidenceScore({ holdPct, buys: earlyBuys, sells: 0, safetyOk: true }),
-        this.deps.config.buySizeMinUsd,
-        this.deps.config.buySizeMaxUsd,
-      ),
+      sizeFromConfidence(confidence.score, this.deps.config.buySizeMinUsd, this.deps.config.buySizeMaxUsd),
     );
     if (!(sizeUsd > 0)) return null;
-    return { sizeUsd, sizeSol: sizeUsd / quote.usd };
+    return { sizeUsd, sizeSol: sizeUsd / quote.usd, confidence };
   }
 
   private noteTrade(mint: string, side: "buy" | "sell", at: number): void {

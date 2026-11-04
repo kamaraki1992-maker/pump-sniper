@@ -1,4 +1,17 @@
-export type ExitSignal = "tp" | "sl" | "timeout" | "liquidity_drop" | "volume_stall" | "sell_pressure";
+export type ExitSignal =
+  | "tp"
+  | "sl"
+  | "timeout"
+  | "liquidity_drop"
+  | "volume_stall"
+  | "sell_pressure"
+  | "trailing_stop";
+
+/** Peak-gain threshold and the stop floor it locks in, both in percent above entry. */
+export interface TrailTier {
+  activatePct: number;
+  floorPct: number;
+}
 
 /** Fraction of the position closed by a take-profit or stop-loss. v1 always closes 100%. */
 export const FULL_EXIT_FRACTION = 1;
@@ -15,9 +28,35 @@ export function exitSignal(
 ): ExitSignal | null {
   if (!(entryPrice > 0) || !(markPrice > 0)) return null;
   const ratio = markPrice / entryPrice;
-  if (ratio >= 1 + takeProfitPct / 100) return "tp";
+  if (takeProfitPct > 0 && ratio >= 1 + takeProfitPct / 100) return "tp";
   if (ratio <= 1 - stopLossPct / 100) return "sl";
   return null;
+}
+
+/**
+ * Highest profit-lock floor reached by `peak`. The returned floor is never
+ * below `current`, so a later dip cannot loosen a floor that already latched.
+ */
+export function nextTrailFloor(
+  entry: number,
+  peak: number,
+  tiers: readonly TrailTier[],
+  current: number | null,
+): number | null {
+  if (!(entry > 0) || !(peak > 0)) return current;
+  const gain = peak / entry - 1;
+  let floor = current;
+  for (const tier of tiers) {
+    if (!(tier.activatePct > 0) || gain < tier.activatePct / 100) continue;
+    floor = floor == null ? tier.floorPct : Math.max(floor, tier.floorPct);
+  }
+  return floor;
+}
+
+/** True when the mark is at or below entry raised by the locked floor. */
+export function trailHit(entry: number, mark: number, floorPct: number | null | undefined): boolean {
+  if (floorPct == null || !(entry > 0) || !(mark > 0) || !Number.isFinite(floorPct)) return false;
+  return mark / entry <= 1 + floorPct / 100;
 }
 
 /**
@@ -43,9 +82,15 @@ export function decideExit(input: {
   minPressureSells?: number;
   /** When false, curve SOL from the trade stream is ignored. An account subscription owns that exit. */
   useStreamLiquidity?: boolean;
+  /** Silence before this many ms after entry does not count toward a volume stall. */
+  volumeStallGraceMs?: number;
+  /** Locked profit floor in percent above entry. Null until a tier has armed. */
+  trailFloorPct?: number | null;
 }): ExitSignal | null {
   const priced = exitSignal(input.entryPrice, input.markPrice, input.takeProfitPct, input.stopLossPct);
-  if (priced) return priced;
+  if (priced === "tp") return "tp";
+  if (trailHit(input.entryPrice, input.markPrice, input.trailFloorPct)) return "trailing_stop";
+  if (priced === "sl") return "sl";
   const liqDropPct = input.liqDropPct ?? 20;
   if (input.useStreamLiquidity !== false && reservesDropped(input.entryVSolSol, input.lastVSolSol, liqDropPct)) {
     return "liquidity_drop";
@@ -57,7 +102,9 @@ export function decideExit(input: {
   if (sells >= minSells && sells >= ratio * buys) return "sell_pressure";
   const lastTradeAtMs = input.lastTradeAtMs ?? input.nowMs;
   const volumeStallMs = input.volumeStallMs ?? Number.POSITIVE_INFINITY;
-  if (input.nowMs - lastTradeAtMs >= volumeStallMs) return "volume_stall";
+  const graceMs = input.volumeStallGraceMs ?? 0;
+  const stallAnchorMs = Math.max(input.openedAtMs + graceMs, lastTradeAtMs);
+  if (input.nowMs - stallAnchorMs >= volumeStallMs) return "volume_stall";
   if (input.nowMs - input.openedAtMs >= input.maxHoldMs) return "timeout";
   return null;
 }

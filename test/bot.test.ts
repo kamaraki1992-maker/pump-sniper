@@ -90,6 +90,8 @@ function harness(options: {
       return options.sell ? options.sell(order) : fill({ price: order.quotePriceSol, cashflowSol: 0.2, sizeSol: 0.2 });
     },
   };
+  const subscribed: string[] = [];
+  const unsubscribed: string[] = [];
   const bot = new SniperBot({
     config,
     executor,
@@ -106,12 +108,17 @@ function harness(options: {
       })),
     now: options.now ?? (() => new Date("2026-11-04T12:00:00.000Z")),
     sleep: async () => {},
-    subscribeMint: () => {},
+    subscribeMint: (mint) => {
+      subscribed.push(mint);
+    },
+    unsubscribeMint: (mint) => {
+      unsubscribed.push(mint);
+    },
     ...(options.walletBalanceSol ? { walletBalanceSol: options.walletBalanceSol } : {}),
     ...(options.safetyCheck ? { safetyCheck: options.safetyCheck } : {}),
     ...(options.curveWatch ? { curveWatch: options.curveWatch } : {}),
   });
-  return { bot, positions, trades, sells, config, log };
+  return { bot, positions, trades, sells, config, log, subscribed, unsubscribed };
 }
 
 test("a failed buy is logged and does not open a position", async () => {
@@ -127,7 +134,7 @@ test("a failed buy is logged and does not open a position", async () => {
 });
 
 test("one filled buy per mint, then a take-profit sells the whole position", async () => {
-  const { bot, positions, trades, sells } = harness({});
+  const { bot, positions, trades, sells } = harness({ config: { takeProfitPct: 50 } });
   await bot.onLaunch(launch());
   await bot.onLaunch(launch());
   assert.equal(positions.list().length, 1);
@@ -287,7 +294,7 @@ test("live mode skips a buy the wallet cannot cover, and paper mode does not", a
   assert.equal(skipped.length, 1);
   const required = skipped[0]?.fields?.requiredSol;
   assert.equal(typeof required, "number");
-  assert.ok((required as number) > 0.1);
+  assert.ok((required as number) > 0.05);
 
   const funded = harness({
     config: { mode: "live" },
@@ -354,6 +361,7 @@ test("take profit and stop loss beat a hold that has already expired", async () 
   let now = Date.parse("2026-11-04T12:00:00.000Z");
   const up = harness({
     now: () => new Date(now),
+    config: { takeProfitPct: 50, volumeStallSec: 100_000 },
     buy: async () => fill({ price: 1 }),
   });
   await up.bot.onLaunch(launch({ mint: "Up", priceSol: 1.5 }));
@@ -363,6 +371,7 @@ test("take profit and stop loss beat a hold that has already expired", async () 
 
   const down = harness({
     now: () => new Date(now),
+    config: { volumeStallSec: 100_000 },
     buy: async () => fill({ price: 1 }),
   });
   await down.bot.onLaunch(launch({ mint: "Down", priceSol: 0.85 }));
@@ -380,8 +389,12 @@ test("volume stall, liquidity drop, and sell pressure each sell once", async () 
   await stall.bot.onLaunch(launch({ mint: "Stall", priceSol: 1 }));
   now += 45_000;
   await stall.bot.checkHolds();
+  assert.equal(stall.trades.readAll().find((row) => row.side === "sell"), undefined);
+  now += 90_000;
+  await stall.bot.checkHolds();
   assert.equal(stall.trades.readAll().find((row) => row.side === "sell")?.reason, "volume_stall");
   assert.equal(stall.positions.list().length, 0);
+  assert.deepEqual(stall.unsubscribed, ["Stall"]);
 
   const liq = harness({
     buy: async () => fill({ price: 1 }),
@@ -435,7 +448,7 @@ test("overlapping exit checks do not send two sells", async () => {
     },
   });
   await bot.onLaunch(launch({ mint: "Once", priceSol: 1 }));
-  now += 45_000;
+  now += 135_000;
   await Promise.all([bot.checkHolds(), bot.checkHolds()]);
   assert.equal(calls, 1);
 });
@@ -496,7 +509,8 @@ test("a buy logs USD and SOL size from a fresh SOL/USD quote and stays within $3
   const filled = (log as ListLogger).entries.find((entry) => entry.message === "buy filled");
   const sizeUsd = filled?.fields?.sizeUsd;
   const sizeSol = filled?.fields?.sizeSol;
-  assert.equal(typeof sizeUsd, "number");
+  assert.equal(sizeUsd, 5);
+  assert.equal(filled?.fields?.score, 0);
   assert.equal(typeof sizeSol, "number");
   assert.ok((sizeUsd as number) <= 30);
   assert.ok(Math.abs((sizeSol as number) - (sizeUsd as number) / 100) < 1e-12);
@@ -544,4 +558,119 @@ test("missing or stale SOL/USD skips the buy with no_price", async () => {
   });
   await freshEdge.bot.onLaunch(launch({ mint: "Edge", priceSol: 1 }));
   assert.equal(freshEdge.positions.list().length, 1);
+});
+
+function trade(partial: Partial<MarketTrade> & { mint: string; priceSol: number }): MarketTrade {
+  return {
+    kind: "trade",
+    mint: partial.mint,
+    txType: partial.txType ?? "buy",
+    trader: "x",
+    signature: partial.signature ?? "t",
+    solQuoted: true,
+    priceSol: partial.priceSol,
+    marketCapSol: 30,
+    vSolSol: null,
+  };
+}
+
+test("default take profit is off, and each profit-lock tier sells once at its floor", async () => {
+  const tier30 = harness({ buy: async () => fill({ price: 1 }) });
+  await tier30.bot.onLaunch(launch({ mint: "T30", priceSol: 1 }));
+  await tier30.bot.onTrade(trade({ mint: "T30", priceSol: 1.3, signature: "peak" }));
+  assert.equal(tier30.positions.get("T30")?.trailFloorPct, 15);
+  assert.equal(tier30.positions.list().length, 1);
+  await tier30.bot.onTrade(trade({ mint: "T30", priceSol: 1.15, signature: "out" }));
+  assert.equal(tier30.trades.readAll().find((row) => row.side === "sell")?.reason, "trailing_stop");
+
+  const tier50 = harness({ buy: async () => fill({ price: 1 }) });
+  await tier50.bot.onLaunch(launch({ mint: "T50", priceSol: 1 }));
+  await tier50.bot.onTrade(trade({ mint: "T50", priceSol: 1.5, signature: "peak" }));
+  assert.equal(tier50.positions.list().length, 1);
+  assert.equal(tier50.positions.get("T50")?.trailFloorPct, 35);
+  await tier50.bot.onTrade(trade({ mint: "T50", priceSol: 1.35, signature: "out" }));
+  assert.equal(tier50.trades.readAll().find((row) => row.side === "sell")?.reason, "trailing_stop");
+
+  const tier100 = harness({ buy: async () => fill({ price: 1 }) });
+  await tier100.bot.onLaunch(launch({ mint: "T100", priceSol: 1 }));
+  await tier100.bot.onTrade(trade({ mint: "T100", priceSol: 2, signature: "peak" }));
+  assert.equal(tier100.positions.list().length, 1);
+  assert.equal(tier100.positions.get("T100")?.trailFloorPct, 75);
+  await tier100.bot.onTrade(trade({ mint: "T100", priceSol: 1.4, signature: "out" }));
+  assert.equal(tier100.trades.readAll().find((row) => row.side === "sell")?.reason, "trailing_stop");
+});
+
+test("an enabled take profit still sells 100% at +50%", async () => {
+  const { bot, trades, positions } = harness({
+    config: { takeProfitPct: 50 },
+    buy: async () => fill({ price: 1 }),
+  });
+  await bot.onLaunch(launch({ mint: "Tp", priceSol: 1 }));
+  await bot.onTrade(trade({ mint: "Tp", priceSol: 1.5, signature: "tp" }));
+  assert.equal(positions.list().length, 0);
+  assert.equal(trades.readAll().find((row) => row.side === "sell")?.reason, "tp");
+});
+
+test("overlapping profit-lock checks sell once", async () => {
+  let calls = 0;
+  const { bot, trades } = harness({
+    buy: async () => fill({ price: 1 }),
+    sell: async () => {
+      calls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return fill({ price: 1.15, cashflowSol: 0.12, sizeSol: 0.12 });
+    },
+  });
+  await bot.onLaunch(launch({ mint: "Lock", priceSol: 1 }));
+  await bot.onTrade(trade({ mint: "Lock", priceSol: 1.3, signature: "peak" }));
+  await Promise.all([
+    bot.onTrade(trade({ mint: "Lock", priceSol: 1.15, signature: "a" })),
+    bot.onTrade(trade({ mint: "Lock", priceSol: 1.1, signature: "b" })),
+  ]);
+  assert.equal(calls, 1);
+  assert.equal(trades.readAll().filter((row) => row.side === "sell" && row.reason === "trailing_stop").length, 1);
+});
+
+test("a trade after the grace restarts the stall window", async () => {
+  let now = Date.parse("2026-11-04T12:00:00.000Z");
+  const { bot, trades, positions } = harness({
+    now: () => new Date(now),
+    buy: async () => fill({ price: 1 }),
+  });
+  await bot.onLaunch(launch({ mint: "Late", priceSol: 1 }));
+  now += 100_000;
+  await bot.onTrade(trade({ mint: "Late", priceSol: 1, signature: "late" }));
+  assert.equal(positions.list().length, 1);
+  now += 44_000;
+  await bot.checkHolds();
+  assert.equal(trades.readAll().find((row) => row.side === "sell"), undefined);
+  now += 1_000;
+  await bot.checkHolds();
+  assert.equal(trades.readAll().find((row) => row.side === "sell")?.reason, "volume_stall");
+});
+
+test("a failed buy releases the trade subscription", async () => {
+  const failed = harness({
+    buy: async () => fill({ status: "failed", error: "bundle-not-landed", price: 0, tokenAmount: 0, cashflowSol: 0 }),
+  });
+  await failed.bot.onLaunch(launch({ mint: "Fail", priceSol: 1 }));
+  assert.deepEqual(failed.subscribed, ["Fail"]);
+  assert.deepEqual(failed.unsubscribed, ["Fail"]);
+});
+
+test("market buy flow before the fill raises size", async () => {
+  const { bot, log, trades } = harness({
+    capture: true,
+    buy: async (order) => fill({ sizeSol: order.sizeSol, cashflowSol: order.sizeSol }),
+  });
+  for (let i = 0; i < 40; i += 1) {
+    await bot.onTrade(trade({ mint: "Hot", priceSol: 1, signature: `b${i}` }));
+  }
+  await bot.onLaunch(launch({ mint: "Hot", priceSol: 1, initialBuyTokens: 0 }));
+  const filled = (log as ListLogger).entries.find((entry) => entry.message === "buy filled");
+  assert.equal(typeof filled?.fields?.hold, "number");
+  assert.equal(typeof filled?.fields?.flow, "number");
+  assert.equal(filled?.fields?.safety, 1);
+  assert.ok((filled?.fields?.sizeUsd as number) >= 28);
+  assert.equal(trades.readAll()[0]?.confidence, filled?.fields?.score);
 });

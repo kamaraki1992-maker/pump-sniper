@@ -20,6 +20,8 @@ export interface DailySummary {
   timeouts: number;
   exits: Record<string, number>;
   buySize: { count: number; minSol: number | null; maxSol: number | null; avgSol: number | null };
+  /** Curved confidence on filled buys. */
+  scores: { count: number; min: number | null; median: number | null; max: number | null; avg: number | null };
 }
 
 export function berlinDay(iso: string): string {
@@ -63,6 +65,7 @@ export function summarizeDay(records: TradeRecord[], day: string): DailySummary 
     timeouts: filledSells.filter((row) => row.reason === "timeout").length,
     exits: countReasons(filledSells),
     buySize: sizeDistribution(filledBuys),
+    scores: scoreDistribution(filledBuys),
   };
 }
 
@@ -117,6 +120,24 @@ function sizeDistribution(rows: TradeRecord[]): DailySummary["buySize"] {
     sum += row.sizeSol;
   }
   return { count: rows.length, minSol: round(min, 9), maxSol: round(max, 9), avgSol: round(sum / rows.length, 9) };
+}
+
+function scoreDistribution(rows: TradeRecord[]): DailySummary["scores"] {
+  const scores = rows
+    .map((row) => row.confidence)
+    .filter((score): score is number => typeof score === "number" && Number.isFinite(score));
+  if (scores.length === 0) return { count: 0, min: null, median: null, max: null, avg: null };
+  const sorted = [...scores].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+  const sum = sorted.reduce((total, score) => total + score, 0);
+  return {
+    count: sorted.length,
+    min: round(sorted[0]!, 6),
+    median: round(median, 6),
+    max: round(sorted[sorted.length - 1]!, 6),
+    avg: round(sum / sorted.length, 6),
+  };
 }
 
 function round(value: number, digits: number): number {

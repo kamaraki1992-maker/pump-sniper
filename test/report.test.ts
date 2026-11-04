@@ -92,3 +92,25 @@ test("timeouts are counted apart from wins and losses", () => {
   assert.equal(summary.losses, 0);
   assert.ok(Math.abs(summary.realizedPnlSol - -0.01) < 1e-9);
 });
+
+test("exits group by reason and scores summarize filled buys", () => {
+  const summary = summarizeDay(
+    [
+      row({ confidence: 0 }),
+      row({ mint: "B", confidence: 0.25 }),
+      row({ mint: "C", confidence: 1 }),
+      row({ side: "sell", reason: "trailing_stop", realizedPnlSol: 0.04 }),
+      row({ side: "sell", reason: "volume_stall", mint: "B", realizedPnlSol: -0.01 }),
+      row({ side: "sell", reason: "sl", mint: "C", realizedPnlSol: -0.02 }),
+    ],
+    "2026-11-04",
+  );
+  assert.equal(summary.exits.trailing_stop, 1);
+  assert.equal(summary.exits.volume_stall, 1);
+  assert.equal(summary.exits.sl, 1);
+  assert.equal(summary.scores.count, 3);
+  assert.equal(summary.scores.min, 0);
+  assert.equal(summary.scores.median, 0.25);
+  assert.equal(summary.scores.max, 1);
+  assert.equal(summary.scores.avg, 0.416667);
+});

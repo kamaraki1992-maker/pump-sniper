@@ -101,6 +101,10 @@ export class YellowstoneStream {
     for (const mint of mints) this.mints.add(mint);
   }
 
+  unsubscribeTrades(mints: string[]): void {
+    for (const mint of mints) this.mints.delete(mint);
+  }
+
   stop(): void {
     this.stopped = true;
     this.stream?.end();
