@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
-import { ConfigError, loadConfig } from "../src/config.js";
+import { ConfigError, loadConfig, requiredBuyBalanceSol } from "../src/config.js";
 
 const secret = bs58.encode(Keypair.generate().secretKey);
 
@@ -27,6 +27,7 @@ test("defaults match the risk spec", () => {
   assert.equal(cfg.jitoTipSol, 0.002);
   assert.equal(cfg.takeProfitPct, 100);
   assert.equal(cfg.stopLossPct, 20);
+  assert.equal(cfg.maxOpenPositions, 1);
 });
 
 test("buy size, slippage, and tip hard caps refuse startup", () => {
@@ -39,6 +40,18 @@ test("buy size, slippage, and tip hard caps refuse startup", () => {
   assert.throws(() => loadConfig({ JITO_TIP_SOL: "0.006" }), ConfigError);
   assert.equal(loadConfig({ JITO_TIP_SOL: "0.002" }).jitoTipSol, 0.002);
   assert.equal(loadConfig({ JITO_TIP_SOL: "0.005" }).jitoTipSol, 0.005);
+});
+
+test("open positions cannot be loosened past 1", () => {
+  assert.throws(() => loadConfig({ MAX_OPEN_POSITIONS: "2" }), ConfigError);
+  assert.throws(() => loadConfig({ MAX_OPEN_POSITIONS: "0" }), ConfigError);
+  assert.equal(loadConfig({ MAX_OPEN_POSITIONS: "1" }).maxOpenPositions, 1);
+});
+
+test("live buy requires size, fees, tip, and a sell-fee reserve", () => {
+  const cfg = loadConfig({});
+  const need = requiredBuyBalanceSol(cfg);
+  assert.ok(Math.abs(need - (0.1 + 0.00005 + 0.000005 + 0.002 + 0.00005 + 0.000005)) < 1e-12);
 });
 
 test("creator hold cannot be loosened past 10%", () => {

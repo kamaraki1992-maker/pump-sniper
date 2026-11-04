@@ -48,11 +48,16 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
   await sol.refresh();
   const history = new RpcCreatorHistory(config, log);
   let executor: Executor;
+  let walletBalanceSol: (() => Promise<number>) | undefined;
   if (config.mode === "live") {
     const keypair = loadLiveKeypair();
     log.info("live mode", { pubkey: keypair.publicKey.toBase58() });
     const connection = new Connection(config.rpcUrl, "confirmed");
     executor = new LiveExecutor(createLivePorts(config, keypair, connection));
+    walletBalanceSol = async () => {
+      const lamports = await connection.getBalance(keypair.publicKey, "processed");
+      return lamports / 1e9;
+    };
   } else {
     log.info("paper mode");
     executor = new PaperExecutor(config.paper);
@@ -69,6 +74,7 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     now: () => new Date(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     subscribeMint: (mint) => subscription.stream?.subscribeTrades([mint]),
+    ...(walletBalanceSol ? { walletBalanceSol } : {}),
   });
   return { config, log, bot, positions, sol, executor, subscription };
 }
@@ -97,6 +103,7 @@ export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promis
     jitoTipSol: config.jitoTipSol,
     takeProfitPct: config.takeProfitPct,
     stopLossPct: config.stopLossPct,
+    maxOpenPositions: config.maxOpenPositions,
   });
   const stream = attachStream(runtime);
   let stopped = false;

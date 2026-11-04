@@ -35,14 +35,17 @@ These limits are constants in `src/config.ts`. The process exits on startup if t
 | Take profit | +100% | sells 100% of the position |
 | Stop loss | -20% | sells 100% of the position |
 | Creator hold at launch | under 10% of supply | cannot be configured above 10% |
+| Open positions | 1 | cannot be configured above 1 |
 
-One position per mint. A failed buy is a failed record, not a position. Failed sells are retried with backoff. A sell that still does not land leaves the position open and tries again after a short cooldown.
+One position per mint, and at most one open position at a time. A buy that has been sent and is not confirmed yet holds that slot. A failed buy releases it. Further launches are skipped with reason `max_open_positions` (that line is logged at most once every 5 seconds). A failed buy is a failed record, not a position. Failed sells are retried with backoff. A sell that still does not land leaves the position open and tries again after a short cooldown.
+
+In live mode the bot reads the wallet balance before sending a buy. It skips the buy when the balance is below the order size, the priority fee, the base fee, the Jito tip, and the same priority fee plus base fee kept for the sell. Paper mode does not read a wallet.
 
 ## Paper and live
 
 Paper fills use the stream price, then apply adverse slippage (`PAPER_SLIPPAGE_PCT`, default 2%, capped by the slippage limit), a 1% protocol fee, a 0.25% venue fee, the priority fee, the base signature fee, and the Jito tip. Unrealized PnL uses the same exit model, in SOL and in USD. USD uses the CoinGecko SOL price, with Jupiter as a fallback.
 
-Live mode loads `PRIVATE_KEY` from the environment, derives the public key locally, and discards the secret from every log line. The key is not sent to PumpDev. See the assumptions below for why the live path is the local-sign bundle endpoint rather than server-signed Lightning.
+Live mode loads `PRIVATE_KEY` from the environment, derives the public key locally, and discards the secret from every log line. The key is not sent to PumpDev. Before a live buy it checks the wallet balance as described above. See the assumptions below for why the live path is the local-sign bundle endpoint rather than server-signed Lightning.
 
 `npm run panic-sell` sells every open position. In paper mode the sells are simulated and logged with reason `manual`. In live mode it submits real bundles and requires `MODE=live` plus `PRIVATE_KEY`.
 

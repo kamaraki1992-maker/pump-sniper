@@ -12,6 +12,7 @@ export const HARD_CAPS = {
   minJitoTipSol: 0.002,
   maxJitoTipSol: 0.005,
   maxCreatorHoldPct: 10,
+  maxOpenPositions: 1,
 } as const;
 
 export class ConfigError extends Error {
@@ -39,6 +40,7 @@ export interface AppConfig {
   jitoTipSol: number;
   priorityFeeSol: number;
   creatorMaxHoldPct: number;
+  maxOpenPositions: number;
   wsUrl: string;
   tradeApiUrl: string;
   rpcUrl: string;
@@ -80,6 +82,16 @@ export function assertLiveKey(secret: string): void {
   }
 }
 
+/**
+ * SOL that must be in the wallet before a live buy: the order, this
+ * transaction's priority fee and base fee, the Jito tip, and the same
+ * priority fee plus base fee held back so the sell can pay its network fee.
+ */
+export function requiredBuyBalanceSol(config: AppConfig): number {
+  const txFee = config.priorityFeeSol + config.paper.baseFeeSol;
+  return config.buySizeSol + txFee + config.jitoTipSol + txFee;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const mode: Mode = env.MODE === "live" ? "live" : "paper";
   const buySizeSol = num(env.BUY_SIZE_SOL, 0.1, "BUY_SIZE_SOL");
@@ -89,6 +101,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const stopLossPct = num(env.STOP_LOSS_PCT, 20, "STOP_LOSS_PCT");
   const priorityFeeSol = num(env.PRIORITY_FEE_SOL, 0.00005, "PRIORITY_FEE_SOL");
   const creatorMaxHoldPct = num(env.CREATOR_MAX_HOLD_PCT, 10, "CREATOR_MAX_HOLD_PCT");
+  const maxOpenPositions = num(env.MAX_OPEN_POSITIONS, 1, "MAX_OPEN_POSITIONS");
   const paperSlippagePct = num(env.PAPER_SLIPPAGE_PCT, 2, "PAPER_SLIPPAGE_PCT");
   const protocolFeeBps = num(env.PAPER_PROTOCOL_FEE_BPS, 100, "PAPER_PROTOCOL_FEE_BPS");
   const venueFeeBps = num(env.PAPER_VENUE_FEE_BPS, 25, "PAPER_VENUE_FEE_BPS");
@@ -120,6 +133,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       `CREATOR_MAX_HOLD_PCT ${creatorMaxHoldPct} exceeds hard cap ${HARD_CAPS.maxCreatorHoldPct}`,
     );
   }
+  if (!Number.isInteger(maxOpenPositions) || maxOpenPositions < 1 || maxOpenPositions > HARD_CAPS.maxOpenPositions) {
+    throw new ConfigError(
+      `MAX_OPEN_POSITIONS ${maxOpenPositions} exceeds hard cap ${HARD_CAPS.maxOpenPositions}`,
+    );
+  }
   if (!(paperSlippagePct >= 0) || paperSlippagePct > maxSlippagePct) {
     throw new ConfigError("PAPER_SLIPPAGE_PCT must be between 0 and MAX_SLIPPAGE_PCT");
   }
@@ -145,6 +163,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     jitoTipSol,
     priorityFeeSol,
     creatorMaxHoldPct,
+    maxOpenPositions,
     wsUrl: str(env.WS_URL, "wss://pumpdev.io/ws"),
     tradeApiUrl: str(env.TRADE_API_URL, "https://pumpdev.io/api/bundle"),
     rpcUrl: str(env.RPC_URL, "https://api.mainnet-beta.solana.com"),
