@@ -25,8 +25,8 @@ test("defaults match the risk spec", () => {
   assert.equal(cfg.buySizeSol, 0.1);
   assert.equal(cfg.maxSlippagePct, 20);
   assert.equal(cfg.jitoTipSol, 0.002);
-  assert.equal(cfg.takeProfitPct, 100);
-  assert.equal(cfg.stopLossPct, 20);
+  assert.equal(cfg.takeProfitPct, 50);
+  assert.equal(cfg.stopLossPct, 15);
   assert.equal(cfg.maxOpenPositions, 1);
 });
 
@@ -40,6 +40,17 @@ test("buy size, slippage, and tip hard caps refuse startup", () => {
   assert.throws(() => loadConfig({ JITO_TIP_SOL: "0.006" }), ConfigError);
   assert.equal(loadConfig({ JITO_TIP_SOL: "0.002" }).jitoTipSol, 0.002);
   assert.equal(loadConfig({ JITO_TIP_SOL: "0.005" }).jitoTipSol, 0.005);
+});
+
+test("take profit and stop loss cannot be loosened past 50% and 15%", () => {
+  assert.throws(() => loadConfig({ TAKE_PROFIT_PCT: "51" }), ConfigError);
+  assert.throws(() => loadConfig({ TAKE_PROFIT_PCT: "100" }), ConfigError);
+  assert.equal(loadConfig({ TAKE_PROFIT_PCT: "50" }).takeProfitPct, 50);
+  assert.equal(loadConfig({ TAKE_PROFIT_PCT: "40" }).takeProfitPct, 40);
+  assert.throws(() => loadConfig({ STOP_LOSS_PCT: "16" }), ConfigError);
+  assert.throws(() => loadConfig({ STOP_LOSS_PCT: "20" }), ConfigError);
+  assert.equal(loadConfig({ STOP_LOSS_PCT: "15" }).stopLossPct, 15);
+  assert.equal(loadConfig({ STOP_LOSS_PCT: "10" }).stopLossPct, 10);
 });
 
 test("open positions cannot be loosened past 1", () => {

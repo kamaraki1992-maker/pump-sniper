@@ -4,8 +4,8 @@ export type ExitSignal = "tp" | "sl";
 export const FULL_EXIT_FRACTION = 1;
 
 /**
- * `takeProfitPct` of 100 means the mark is at least 2x the entry fill.
- * `stopLossPct` of 20 means the mark is at most 80% of the entry fill.
+ * `takeProfitPct` of 50 means the mark is at least 1.5x the entry fill.
+ * `stopLossPct` of 15 means the mark is at most 85% of the entry fill.
  */
 export function exitSignal(
   entryPrice: number,

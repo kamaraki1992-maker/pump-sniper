@@ -13,6 +13,8 @@ export const HARD_CAPS = {
   maxJitoTipSol: 0.005,
   maxCreatorHoldPct: 10,
   maxOpenPositions: 1,
+  maxTakeProfitPct: 50,
+  maxStopLossPct: 15,
 } as const;
 
 export class ConfigError extends Error {
@@ -97,8 +99,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const buySizeSol = num(env.BUY_SIZE_SOL, 0.1, "BUY_SIZE_SOL");
   const maxSlippagePct = num(env.MAX_SLIPPAGE_PCT, 20, "MAX_SLIPPAGE_PCT");
   const jitoTipSol = num(env.JITO_TIP_SOL, 0.002, "JITO_TIP_SOL");
-  const takeProfitPct = num(env.TAKE_PROFIT_PCT, 100, "TAKE_PROFIT_PCT");
-  const stopLossPct = num(env.STOP_LOSS_PCT, 20, "STOP_LOSS_PCT");
+  const takeProfitPct = num(env.TAKE_PROFIT_PCT, HARD_CAPS.maxTakeProfitPct, "TAKE_PROFIT_PCT");
+  const stopLossPct = num(env.STOP_LOSS_PCT, HARD_CAPS.maxStopLossPct, "STOP_LOSS_PCT");
   const priorityFeeSol = num(env.PRIORITY_FEE_SOL, 0.00005, "PRIORITY_FEE_SOL");
   const creatorMaxHoldPct = num(env.CREATOR_MAX_HOLD_PCT, 10, "CREATOR_MAX_HOLD_PCT");
   const maxOpenPositions = num(env.MAX_OPEN_POSITIONS, 1, "MAX_OPEN_POSITIONS");
@@ -122,8 +124,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       `JITO_TIP_SOL ${jitoTipSol} is outside hard bounds ${HARD_CAPS.minJitoTipSol}-${HARD_CAPS.maxJitoTipSol}`,
     );
   }
-  if (!(takeProfitPct > 0) || !(stopLossPct > 0)) {
-    throw new ConfigError("TAKE_PROFIT_PCT and STOP_LOSS_PCT must be positive");
+  if (!(takeProfitPct > 0) || takeProfitPct > HARD_CAPS.maxTakeProfitPct) {
+    throw new ConfigError(
+      `TAKE_PROFIT_PCT ${takeProfitPct} exceeds hard cap ${HARD_CAPS.maxTakeProfitPct}`,
+    );
+  }
+  if (!(stopLossPct > 0) || stopLossPct > HARD_CAPS.maxStopLossPct) {
+    throw new ConfigError(
+      `STOP_LOSS_PCT ${stopLossPct} exceeds hard cap ${HARD_CAPS.maxStopLossPct}`,
+    );
   }
   if (!(priorityFeeSol >= 0) || priorityFeeSol > 0.01) {
     throw new ConfigError("PRIORITY_FEE_SOL must be between 0 and 0.01");

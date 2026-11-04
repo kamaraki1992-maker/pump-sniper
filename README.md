@@ -32,8 +32,8 @@ These limits are constants in `src/config.ts`. The process exits on startup if t
 | Buy size | 0.1 SOL | `<= 0.1` SOL |
 | Slippage | 20% | `<= 20%` |
 | Jito tip | 0.002 SOL | `0.002` to `0.005` SOL |
-| Take profit | +100% | sells 100% of the position |
-| Stop loss | -20% | sells 100% of the position |
+| Take profit | +50% | `<= 50%`, sells 100% of the position |
+| Stop loss | -15% | `<= 15%`, sells 100% of the position |
 | Creator hold at launch | under 10% of supply | cannot be configured above 10% |
 | Open positions | 1 | cannot be configured above 1 |
 
