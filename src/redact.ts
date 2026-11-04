@@ -13,7 +13,27 @@ export function redact(text: string, secrets: readonly string[]): string {
     if (secret.length < 16) continue;
     out = out.split(secret).join("[REDACTED]");
   }
-  return out.replace(SECRET_FIELD, '$1[REDACTED]');
+  out = out.replace(SECRET_FIELD, '$1[REDACTED]');
+  return redactRpcUrl(out);
+}
+
+/** Strip api-key query values so an RPC WebSocket URL can be logged. */
+export function redactRpcUrl(text: string): string {
+  return text.replace(/([?&](?:api-key|api_key|apikey)=)[^&\s"]+/gi, "$1[REDACTED]");
+}
+
+export function rpcApiKey(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    return (
+      parsed.searchParams.get("api-key") ??
+      parsed.searchParams.get("api_key") ??
+      parsed.searchParams.get("apikey")
+    );
+  } catch {
+    const match = url.match(/[?&](?:api-key|api_key|apikey)=([^&\s"]+)/i);
+    return match?.[1] ?? null;
+  }
 }
 
 export function installProcessRedaction(secrets: readonly string[]): void {

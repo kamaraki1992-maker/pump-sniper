@@ -26,9 +26,176 @@ export function priceFromReserves(vSol: number, vTokens: number): number | null 
   return sol / tokens;
 }
 
+export function virtualSol(value: number | null): number | null {
+  if (value === null || !Number.isFinite(value) || value <= 0) return null;
+  return value > 1_000 ? value / 1e9 : value;
+}
+
+export function virtualTokens(value: number | null): number | null {
+  if (value === null || !Number.isFinite(value) || value <= 0) return null;
+  return value > 1e12 ? value / 1e6 : value;
+}
+
 export function priceFromMarketCap(marketCapSol: number): number | null {
   if (!Number.isFinite(marketCapSol) || marketCapSol <= 0) return null;
   return marketCapSol / TOTAL_SUPPLY_TOKENS;
+}
+
+/** Initial pump.fun virtual reserves. k stays on this product for the life of the curve. */
+export const PUMP_CURVE_K = 30 * 1_073_000_000;
+/** One unconfirmed update may not move the mark by more than this multiple. */
+export const MARK_JUMP_LIMIT = 5;
+/** First seconds after entry: a print this large is still a real pump. 54x launch prints stay out. */
+export const EARLY_MARK_JUMP_LIMIT = 10;
+export const EARLY_MARK_MS = 15_000;
+
+export function reservesOnCurve(vSol: number, vTokens: number): boolean {
+  if (!(vSol > 0) || !(vTokens > 0) || !Number.isFinite(vSol) || !Number.isFinite(vTokens)) return false;
+  const ratio = (vSol * vTokens) / PUMP_CURVE_K;
+  return ratio >= 0.8 && ratio <= 1.25;
+}
+
+export function spotFromReserves(vSol: number, vTokens: number): number | null {
+  if (!reservesOnCurve(vSol, vTokens)) return null;
+  return vSol / vTokens;
+}
+
+/** Upward gaps above this multiple are rejected. Drops are kept so a stop can see them. */
+function jumpsTooFar(previous: number | null, next: number, limit = MARK_JUMP_LIMIT): boolean {
+  if (previous == null || !(previous > 0)) return false;
+  return next / previous > limit;
+}
+
+function agrees(a: number, b: number): boolean {
+  if (!(a > 0) || !(b > 0)) return false;
+  const ratio = a / b;
+  return ratio >= 0.95 && ratio <= 1.05;
+}
+
+export interface MarkAssessment {
+  /** False when the proposed print is rejected. The returned reserves are the ones still trusted. */
+  accept: boolean;
+  price: number | null;
+  vSol: number | null;
+  vTokens: number | null;
+}
+
+/**
+ * Bonding-curve reserves that moved are the mark, including a fast pump or a
+ * drop through a floor. A print that disagrees with reserves is ignored, except
+ * during the first seconds, when a jump of at most 10x is a real pump whose
+ * curve fields have not caught up. A 54x print against launch reserves is not.
+ */
+export function assessMark(input: {
+  previous: number | null;
+  proposed: number | null;
+  vSol: number | null;
+  vTokens: number | null;
+  nextVSol?: number | null;
+  nextVTokens?: number | null;
+  /** Position is still inside EARLY_MARK_MS. Allows one unconfirmed pump. */
+  early?: boolean;
+}): MarkAssessment {
+  const previous = input.previous != null && input.previous > 0 ? input.previous : null;
+  let vSol = input.vSol;
+  let vTokens = input.vTokens;
+  const trustedSpot = vSol != null && vTokens != null ? spotFromReserves(vSol, vTokens) : null;
+  const nextSol = input.nextVSol ?? null;
+  const nextTok = input.nextVTokens ?? null;
+  const nextSpot = nextSol != null && nextTok != null ? spotFromReserves(nextSol, nextTok) : null;
+  if (nextSpot != null && nextSol != null && nextTok != null && trustedSpot != null) {
+    const moved = Math.abs(nextSpot - trustedSpot) / trustedSpot > 1e-4;
+    if (moved) return { accept: true, price: nextSpot, vSol: nextSol, vTokens: nextTok };
+  }
+  if (nextSpot != null && nextSol != null && nextTok != null && !jumpsTooFar(previous, nextSpot)) {
+    vSol = nextSol;
+    vTokens = nextTok;
+  }
+  const reservePrice = vSol != null && vTokens != null ? spotFromReserves(vSol, vTokens) : null;
+  const proposed = input.proposed != null && input.proposed > 0 ? input.proposed : null;
+  if (proposed != null && reservePrice != null && !agrees(proposed, reservePrice)) {
+    const limit = input.early ? EARLY_MARK_JUMP_LIMIT : MARK_JUMP_LIMIT;
+    if (input.early && !jumpsTooFar(previous, proposed, limit)) {
+      return { accept: true, price: proposed, vSol: input.vSol, vTokens: input.vTokens };
+    }
+    return { accept: false, price: previous, vSol: input.vSol, vTokens: input.vTokens };
+  }
+  const candidate = reservePrice ?? proposed;
+  if (candidate == null) return { accept: false, price: previous, vSol: input.vSol, vTokens: input.vTokens };
+  const limit = input.early ? EARLY_MARK_JUMP_LIMIT : MARK_JUMP_LIMIT;
+  if (jumpsTooFar(previous, candidate, limit)) {
+    return { accept: false, price: previous, vSol: input.vSol, vTokens: input.vTokens };
+  }
+  return { accept: true, price: candidate, vSol, vTokens };
+}
+
+/** Average SOL per token for selling `tokenAmount` into a constant-product pool. */
+export function constantProductSellPrice(
+  base: number | null | undefined,
+  quote: number | null | undefined,
+  tokenAmount: number,
+): number | null {
+  if (base == null || quote == null || !(base > 0) || !(quote > 0) || !(tokenAmount > 0)) return null;
+  const out = quote - (base * quote) / (base + tokenAmount);
+  if (!(out > 0) || !Number.isFinite(out)) return null;
+  return out / tokenAmount;
+}
+
+/**
+ * Average SOL per token for buying `sizeSol` out of the constant-product curve.
+ * This is the price impact of our own size. Slippage is applied by the paper model.
+ */
+export function curveBuyPrice(
+  vSol: number | null | undefined,
+  vTokens: number | null | undefined,
+  sizeSol: number,
+): number | null {
+  if (vSol == null || vTokens == null || !reservesOnCurve(vSol, vTokens) || !(sizeSol > 0)) return null;
+  const tokensOut = vTokens - (vSol * vTokens) / (vSol + sizeSol);
+  if (!(tokensOut > 0) || !Number.isFinite(tokensOut)) return null;
+  return sizeSol / tokensOut;
+}
+
+/** Average SOL per token for selling `tokenAmount` into the constant-product curve. */
+export function curveSellPrice(vSol: number | null | undefined, vTokens: number | null | undefined, tokenAmount: number): number | null {
+  if (vSol == null || vTokens == null || !reservesOnCurve(vSol, vTokens)) return null;
+  return constantProductSellPrice(vTokens, vSol, tokenAmount);
+}
+
+/** PumpSwap spot. `baseTokens` is the display token reserve, `quoteSol` is the SOL reserve. */
+export function poolSpot(baseTokens: number | null | undefined, quoteSol: number | null | undefined): number | null {
+  if (baseTokens == null || quoteSol == null || !(baseTokens > 0) || !(quoteSol > 0)) return null;
+  return quoteSol / baseTokens;
+}
+
+export function poolSellPrice(
+  baseTokens: number | null | undefined,
+  quoteSol: number | null | undefined,
+  tokenAmount: number,
+): number | null {
+  return constantProductSellPrice(baseTokens, quoteSol, tokenAmount);
+}
+
+export interface PoolReserves {
+  baseTokens: number | null;
+  quoteSol: number | null;
+  pool: string | null;
+}
+
+/** Pull PumpSwap reserves off a create_pool or pumpswap trade. Raw fields are lamports and base units. */
+export function poolReservesFromRecord(record: Record<string, unknown>): PoolReserves {
+  const pool = asString(record.pool) ?? asString(record.canonicalPool);
+  const baseUi = asNumber(record.poolBaseReservesUi);
+  const quoteUi = asNumber(record.poolQuoteReservesUi);
+  if (baseUi != null && quoteUi != null && baseUi > 0 && quoteUi > 0) {
+    return { baseTokens: baseUi, quoteSol: quoteUi, pool };
+  }
+  const baseRaw = asNumber(record.poolBaseReserves);
+  const quoteRaw = asNumber(record.poolQuoteReserves);
+  if (baseRaw != null && quoteRaw != null && baseRaw > 0 && quoteRaw > 0) {
+    return { baseTokens: baseRaw / 1e6, quoteSol: quoteRaw / 1e9, pool };
+  }
+  return { baseTokens: null, quoteSol: null, pool };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -66,6 +233,8 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
   if (!mint) return null;
   const quoteMint = asString(record.quoteMint);
   const priced = eventPrice(record);
+  const vSolSol = virtualSol(asNumber(record.vSolInBondingCurve));
+  const vTokens = virtualTokens(asNumber(record.vTokensInBondingCurve));
   const solQuoted = quoteMint === WSOL_MINT || (quoteMint === null && priced.marketCapSol !== null);
 
   if (txType === "create") {
@@ -81,12 +250,27 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
       solQuoted,
       priceSol: priced.priceSol,
       marketCapSol: priced.marketCapSol,
+      vSolSol,
+      vTokens,
       bondingCurveKey: asString(record.bondingCurveKey),
     };
     return launch;
   }
 
+  if (txType === "complete" || txType === "create_pool") {
+    const pool = poolReservesFromRecord(record);
+    return {
+      kind: "graduation",
+      mint,
+      pool: pool.pool,
+      baseTokens: pool.baseTokens,
+      quoteSol: pool.quoteSol,
+    };
+  }
+
   if (txType === "buy" || txType === "sell") {
+    const pool = poolReservesFromRecord(record);
+    const pumpswap = record.source === "pumpswap";
     const trade: MarketTrade = {
       kind: "trade",
       mint,
@@ -96,6 +280,9 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
       solQuoted,
       priceSol: priced.priceSol,
       marketCapSol: priced.marketCapSol,
+      vSolSol,
+      vTokens,
+      ...(pumpswap ? { venue: "pumpswap" as const, poolBaseTokens: pool.baseTokens, poolQuoteSol: pool.quoteSol } : {}),
     };
     return trade;
   }

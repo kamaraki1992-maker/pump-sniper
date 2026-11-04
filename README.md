@@ -29,18 +29,30 @@ These limits are constants in `src/config.ts`. The process exits on startup if t
 
 | Setting | Default | Hard bound |
 | --- | --- | --- |
-| Buy size | 0.1 SOL | `<= 0.1` SOL |
-| Slippage | 20% | `<= 20%` |
+| Slippage | 3% | `<= 20%` |
 | Jito tip | 0.002 SOL | `0.002` to `0.005` SOL |
-| Take profit | +50% | `<= 50%`, sells 100% of the position |
+| Buy size | $5 to $30 | confidence score, hard cap `$30`, converted to SOL at buy time |
+| Take profit | off (`0`) | set above 0 to sell 100% at that gain; hard cap `<= 50%`. `0` disables it |
 | Stop loss | -15% | `<= 15%`, sells 100% of the position |
+| Profit lock | `15:5,30:15,50:35,100:75` | floor ratchets up with peak gain and sells 100% with reason `trailing_stop` |
 | Creator hold at launch | under 10% of supply | cannot be configured above 10% |
-| Open positions | 1 | cannot be configured above 1 |
-| Max hold | 10 min | sells 100% when neither take profit nor stop loss has fired |
+| Open positions | 5 | cannot be configured above 5 |
+| Max hold | 10 min | sells 100% with reason `timeout` |
+| Liquidity drop | 20% | sells 100% when curve SOL reserves fall by more than this from entry |
+| Volume stall | 45 s after a 90 s grace | sells 100% when no trade has arrived since `max(entry + grace, last trade)` |
+| Sell pressure | 3x | sells 100% when sells are at least 3x buys in 30 s, with at least 4 sells |
 
-One position per mint, and at most one open position at a time. A buy that has been sent and is not confirmed yet holds that slot. A failed buy releases it. Further launches are skipped with reason `max_open_positions` (that line is logged at most once every 5 seconds). A failed buy is a failed record, not a position. Failed sells are retried with backoff. A sell that still does not land leaves the position open and tries again after a short cooldown.
+At most `MAX_OPEN_POSITIONS` positions are open at once, and only one position per mint. A buy that has been sent and is not confirmed yet holds a slot. A failed buy releases it. Further launches are skipped with reason `max_open_positions` (that line is logged at most once every 5 seconds). A failed buy is a failed record, not a position. Failed sells are retried with backoff. A sell that still does not land leaves the position open. Exit checks share one in-flight sell per mint, so two signals cannot double-sell.
 
-The hold timer checks about once a second, including when the token has no trades. Take profit and stop loss are evaluated first. A timeout sell uses reason `timeout` and frees the slot only after that sell fills.
+Take profit, when `TAKE_PROFIT_PCT` is above 0, is evaluated first and still sells 100% at that gain. The default is `0`, so the hard target is off and a winner can run into the profit lock. The lock watches the peak mark. `TRAIL_TIERS` defaults to `15:5,30:15,50:35,100:75`: a peak gain of at least 15% lifts the stop floor to +5% above entry, 30% lifts it to +15%, 50% lifts it to +35%, and 100% lifts it to +75%. The floor only ratchets up. The position sells 100% with reason `trailing_stop` when the mark is at or below `entry * (1 + floor)`. The fixed stop at -15% still applies when no tier has armed, and it still applies on a crash that never cleared +30%. After those, the bot can exit for a liquidity drop, sell pressure, a volume stall, or the 10 minute hold. Volume stall does not start at entry. `VOLUME_STALL_GRACE_SEC` (default 90) has to elapse first, and the 45 second silence window is then measured from `max(entry + grace, last trade)`. The hold and stall timers run about once a second, so a token with no trades still exits, just not in the first two minutes. The slot frees only after the sell fills. Paper and live use the same exit rules.
+
+Jito bundles and a 3% default slippage reduce sandwich exposure. They do not guarantee that a fill is protected from MEV, and a bundle can still expire without landing.
+
+When `RPC_WS_URL` is set, each open position `accountSubscribe`s (commitment `confirmed`) to its pump.fun bonding-curve account. Real SOL reserves are the u64 lamports at offset 32. A drop of more than `LIQ_DROP_PCT` from the first sample sells with `liquidity_drop` immediately. The subscription is removed when the position closes. The socket reconnects with backoff and resubscribes every open curve. If the URL is unset or the socket is down, the same exit uses virtual SOL from the trade stream. Logs strip the `api-key` query parameter and never print the raw URL.
+
+Before a buy, the bot reads the mint account and rejects a set mint authority, a set freeze authority, a program other than SPL Token or Token-2022, and a Token-2022 mint with a transfer fee or transfer hook. It also requires a bonding-curve round trip to produce tokens and a `simulateTransaction` of the buy. A sell simulation that fails only because the wallet does not hold the mint yet is not a rejection. The whole check must finish within `SAFETY_CHECK_TIMEOUT_MS` (default 250). If it does not, the token is skipped and the measured latency is logged. Five milliseconds is not achievable over public RPC.
+
+Buy size in dollars is `min + score * (max - min)`, then clamped to $30 and divided by the SOL/USD price. Hold and a passed safety check set the base: a clean launch with no creator hold and no prints scores 0.28 and sizes at $12. Net buy flow scales that base toward 1, so strong tokens land above $20 and an all-strong token lands at $30. Without safety the score is 0. The creator's own initial buy is the hold signal, not flow. Each buy log includes the component signals, the final score, the USD notional, and the SOL size. Fees and the Jito tip are charged on top of the SOL size; the tip stays at its 0.002 SOL minimum and the priority fee is unchanged, so a larger buy pays more in percentage fees on the swapped SOL and the same fixed tip. If the SOL/USD price is missing or older than 60 seconds the buy is skipped with reason `no_price`. The bot does not substitute a guessed price. Live mode still checks the wallet in SOL, including the SOL reserved to exit positions that are already open.
 
 In live mode the bot reads the wallet balance before sending a buy. It skips the buy when the balance is below the order size, the priority fee, the base fee, the Jito tip, and the same priority fee plus base fee kept for the sell. Paper mode does not read a wallet.
 
@@ -61,20 +73,24 @@ npm run report -- --day 2026-11-04
 The day is a calendar date in `Europe/Berlin`. The command prints one JSON object:
 
 - `tradesTaken` — filled buys
-- `wins` / `losses` — filled take-profit and stop-loss sells with positive or negative realized PnL
+- `wins` / `losses` — filled sells with positive or negative realized PnL, except `timeout`
 - `timeouts` — filled sells with reason `timeout`
+- `exits` — filled sell counts by reason (`tp`, `sl`, `trailing_stop`, `timeout`, `liquidity_drop`, `volume_stall`, `sell_pressure`, `manual`)
+- `buySize` — count, min, max, and average SOL of filled buys
+- `scores` — count, min, median, max, and average confidence on filled buys
 - `realizedPnlSol` / `realizedPnlUsd`
 - `feesSol` / `tipsSol` — charged on filled rows
 - `failedBuys` / `failedSells`
 - `mode` — `paper`, `live`, `mixed`, or `none`
 
-`data/trades.jsonl` is append-only. Each row has the timestamp, mode, mint, name, size, price, fees, Jito tip, signature (`paper` or a transaction signature), Solscan URL when there is a live signature, and reason (`entry`, `tp`, `sl`, `timeout`, `manual`).
+`data/trades.jsonl` is append-only. Each row has the timestamp, mode, mint, name, size, price, fees, Jito tip, signature (`paper` or a transaction signature), Solscan URL when there is a live signature, confidence on buys, and reason (`entry`, `tp`, `sl`, `trailing_stop`, `timeout`, `liquidity_drop`, `volume_stall`, `sell_pressure`, `manual`).
 
 ## Layout
 
 | Module | Role |
 | --- | --- |
-| `src/stream.ts` | PumpDev WebSocket, reconnect backoff |
+| `src/stream.ts` | PumpDev WebSocket, used when `GRPC_URL` or `GRPC_TOKEN` is unset |
+| `src/yellowstone.ts` | Optional Yellowstone gRPC source for the same events |
 | `src/pricing.ts` | Message adapter. Swap the parser to change data sources |
 | `src/filter.ts` | Creator hold, dev-dump, and floor-rug decisions |
 | `src/history.ts` | RPC lookup behind the filter |
@@ -90,7 +106,7 @@ The day is a calendar date in `Europe/Berlin`. The command prints one JSON objec
 
 Checked against PumpDev's public docs (`https://pumpdev.io/skill/pumpdev/references/endpoints.md`, the data API, and the Jito bundle pages) and a live socket sample.
 
-**Stream.** `wss://pumpdev.io/ws`. Send `{ "method": "subscribeNewToken" }` and `{ "method": "subscribeTokenTrade", "keys": [mint] }`. Launches are `txType: "create"`. Trades are `buy` and `sell`. Frames with a `type` field are control messages and are ignored. Reconnect starts at 1s and caps at 30s, then resubscribes.
+**Stream.** `wss://pumpdev.io/ws`. Send `{ "method": "subscribeNewToken" }` and `{ "method": "subscribeTokenTrade", "keys": [mint] }`. Launches are `txType: "create"`. Trades are `buy` and `sell`, and they arrive only after `subscribeTokenTrade`. The anonymous tier allows 5 live token subscriptions. The bot subscribes when a buy is reserved and sends `unsubscribeTokenTrade` when the buy fails or the sell fills. Reconnect starts at 1s and caps at 30s, then resubscribes only mints still held. An ack that omits a mint is logged. Frames with a `type` field are control messages and are not treated as trades. After migration the same subscription keeps delivering trades, and those can carry an AMM market cap. That number is not a bonding-curve price. A mark is logged as `mark_rejected` when it disagrees with the mint's virtual reserves or jumps more than 5x upward in one update. Every accepted trade or curve update logs `mark` (at most every 5 seconds, and again when the profit-lock floor changes) and rechecks the stop, the trail, and liquidity. Paper sells simulate the token balance against the curve reserves and then apply slippage. A bonding-curve account with `complete` set, or a stream `complete` / `create_pool` event, graduates the position. After that the bot prices and paper-sells against PumpSwap pool reserves. If those reserves are missing the position is `unpriced` and is not filled at the last curve price; the next pool quote is the fill. A live sell of a graduated mint sets `pool` to `pump-amm` on the same local-sign Jito bundle. A mint is written to `data/bought-mints.json` when the buy is reserved and loaded again on startup, so it is not bought twice after a sell or a restart. The key is the mint address. The same name or symbol on another mint is a different coin.
 
 **Prices.** SOL-quoted creates observed on the socket carry `marketCapSol` and raw reserves: `vSolInBondingCurve` in lamports (`30000000000` = 30 SOL) and `vTokensInBondingCurve` in base units (`1073000000000000` = 1,073,000,000 tokens). Price is `marketCapSol / 1_000_000_000` when that field is present, otherwise virtual SOL divided by virtual tokens. Non-SOL quote mints are skipped. Sizing is in SOL, and a USDC-quoted curve is a different market.
 

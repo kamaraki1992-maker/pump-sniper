@@ -1,15 +1,32 @@
 const JUPITER_SOL =
   "https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112";
 
+/** A buy is skipped when the SOL/USD quote is missing or older than this. */
+export const SOL_PRICE_MAX_AGE_MS = 60_000;
+
 export class SolPriceFeed {
   private value: number | null = null;
+  private updatedAtMs: number | null = null;
 
   constructor(
     private readonly url: string,
     private readonly fetcher: typeof fetch = fetch,
+    private readonly now: () => number = Date.now,
   ) {}
 
+  /** Last quote, including one that is too old to size a buy. */
   price(): number | null {
+    return this.value;
+  }
+
+  updatedAt(): number | null {
+    return this.updatedAtMs;
+  }
+
+  /** Null when there is no quote or it is older than `maxAgeMs`. */
+  fresh(maxAgeMs = SOL_PRICE_MAX_AGE_MS): number | null {
+    if (this.value === null || this.updatedAtMs === null) return null;
+    if (this.now() - this.updatedAtMs > maxAgeMs) return null;
     return this.value;
   }
 
@@ -17,11 +34,15 @@ export class SolPriceFeed {
     const primary = await this.read(this.url);
     if (primary !== null) {
       this.value = primary;
+      this.updatedAtMs = this.now();
       return primary;
     }
     const fallback = await this.read(JUPITER_SOL);
-    if (fallback !== null) this.value = fallback;
-    return this.value;
+    if (fallback !== null) {
+      this.value = fallback;
+      this.updatedAtMs = this.now();
+    }
+    return this.fresh();
   }
 
   private async read(url: string): Promise<number | null> {

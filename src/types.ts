@@ -4,8 +4,17 @@ export type TradeSide = "buy" | "sell";
 
 export type TradeStatus = "filled" | "failed";
 
-/** Operator-facing reason. Buys use `entry`. Panic-sell uses `manual`. Hold-timer exits use `timeout`. */
-export type TradeReason = "entry" | "tp" | "sl" | "manual" | "timeout";
+/** Operator-facing reason. Buys use `entry`. Panic-sell uses `manual`. */
+export type TradeReason =
+  | "entry"
+  | "tp"
+  | "sl"
+  | "manual"
+  | "timeout"
+  | "liquidity_drop"
+  | "volume_stall"
+  | "sell_pressure"
+  | "trailing_stop";
 
 export interface MarketLaunch {
   kind: "launch";
@@ -20,6 +29,10 @@ export interface MarketLaunch {
   solQuoted: boolean;
   priceSol: number | null;
   marketCapSol: number | null;
+  /** Virtual SOL reserves, in SOL. */
+  vSolSol: number | null;
+  /** Virtual token reserves, in display tokens. */
+  vTokens: number | null;
   bondingCurveKey: string | null;
 }
 
@@ -32,9 +45,24 @@ export interface MarketTrade {
   solQuoted: boolean;
   priceSol: number | null;
   marketCapSol: number | null;
+  vSolSol: number | null;
+  /** Virtual token reserves, in display tokens, when the trade carried them. */
+  vTokens?: number | null;
+  venue?: "curve" | "pumpswap";
+  poolBaseTokens?: number | null;
+  poolQuoteSol?: number | null;
 }
 
-export type MarketEvent = MarketLaunch | MarketTrade;
+/** Curve `complete` or PumpSwap `create_pool`. Pricing leaves the bonding curve. */
+export interface MarketGraduation {
+  kind: "graduation";
+  mint: string;
+  pool: string | null;
+  baseTokens: number | null;
+  quoteSol: number | null;
+}
+
+export type MarketEvent = MarketLaunch | MarketTrade | MarketGraduation;
 
 export interface OrderRequest {
   mint: string;
@@ -48,6 +76,8 @@ export interface OrderRequest {
   slippagePct: number;
   reason: TradeReason;
   tokenAmount?: number;
+  /** Set on a graduated sell so the bundle is built against PumpSwap. */
+  pool?: "pump-amm" | "auto";
 }
 
 export interface FillResult {
@@ -73,6 +103,10 @@ export interface TradeRecord {
   name: string;
   symbol: string;
   sizeSol: number;
+  /** USD notional of a buy. Null on sells. */
+  sizeUsd?: number | null;
+  /** Curved confidence score used to size a buy. Null on sells. */
+  confidence?: number | null;
   price: number;
   feesSol: number;
   jitoTipSol: number;
@@ -101,6 +135,30 @@ export interface Position {
   mode: Mode;
   entrySignature: string;
   lastMarkPriceSol: number;
+  entryVSolSol?: number | null;
+  lastVSolSol?: number | null;
+  /** Virtual token reserves, in display tokens, last accepted for this mint. */
+  lastVTokens?: number | null;
+  /** Real SOL reserves sampled from the bonding-curve account. */
+  entryRealSolSol?: number | null;
+  lastRealSolSol?: number | null;
+  bondingCurve?: string | null;
+  lastTradeAtMs?: number;
+  /** Highest mark seen. Drives the profit-lock floor. */
+  peakPriceSol?: number | null;
+  /** Locked floor in percent above entry. Only ratchets up. */
+  trailFloorPct?: number | null;
+  /** Trades applied to this position. Zero means the trade subscription delivered nothing. */
+  tradesSeen?: number;
+  /** Bonding curve completed or a PumpSwap pool was observed. */
+  graduated?: boolean;
+  pool?: string | null;
+  /** PumpSwap base reserve, display tokens. */
+  poolBaseTokens?: number | null;
+  /** PumpSwap quote reserve, SOL. */
+  poolQuoteSol?: number | null;
+  /** Graduated, but no pool reserves yet. Sells wait for the next pool quote. */
+  unpriced?: boolean;
 }
 
 export interface Executor {

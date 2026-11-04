@@ -27,6 +27,8 @@ export interface BundleBody {
   jitoTip: number;
   slippage: number;
   priorityFee: number;
+  /** Present on a graduated sell. PumpDev routes the swap to PumpSwap. */
+  pool?: "pump-amm" | "auto";
 }
 
 /**
@@ -50,6 +52,7 @@ export function buildBundleBody(publicKey: string, order: OrderRequest, config: 
     slippage: order.slippagePct,
     // Compute price is rewritten locally after simulation.
     priorityFee: 0,
+    ...(order.pool ? { pool: order.pool } : {}),
   };
 }
 
