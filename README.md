@@ -32,17 +32,23 @@ These limits are constants in `src/config.ts`. The process exits on startup if t
 | Buy size | 0.1 SOL | `<= 0.1` SOL |
 | Slippage | 20% | `<= 20%` |
 | Jito tip | 0.002 SOL | `0.002` to `0.005` SOL |
-| Take profit | +100% | sells 100% of the position |
-| Stop loss | -20% | sells 100% of the position |
+| Take profit | +50% | `<= 50%`, sells 100% of the position |
+| Stop loss | -15% | `<= 15%`, sells 100% of the position |
 | Creator hold at launch | under 10% of supply | cannot be configured above 10% |
+| Open positions | 1 | cannot be configured above 1 |
+| Max hold | 10 min | sells 100% when neither take profit nor stop loss has fired |
 
-One position per mint. A failed buy is a failed record, not a position. Failed sells are retried with backoff. A sell that still does not land leaves the position open and tries again after a short cooldown.
+One position per mint, and at most one open position at a time. A buy that has been sent and is not confirmed yet holds that slot. A failed buy releases it. Further launches are skipped with reason `max_open_positions` (that line is logged at most once every 5 seconds). A failed buy is a failed record, not a position. Failed sells are retried with backoff. A sell that still does not land leaves the position open and tries again after a short cooldown.
+
+The hold timer checks about once a second, including when the token has no trades. Take profit and stop loss are evaluated first. A timeout sell uses reason `timeout` and frees the slot only after that sell fills.
+
+In live mode the bot reads the wallet balance before sending a buy. It skips the buy when the balance is below the order size, the priority fee, the base fee, the Jito tip, and the same priority fee plus base fee kept for the sell. Paper mode does not read a wallet.
 
 ## Paper and live
 
 Paper fills use the stream price, then apply adverse slippage (`PAPER_SLIPPAGE_PCT`, default 2%, capped by the slippage limit), a 1% protocol fee, a 0.25% venue fee, the priority fee, the base signature fee, and the Jito tip. Unrealized PnL uses the same exit model, in SOL and in USD. USD uses the CoinGecko SOL price, with Jupiter as a fallback.
 
-Live mode loads `PRIVATE_KEY` from the environment, derives the public key locally, and discards the secret from every log line. The key is not sent to PumpDev. See the assumptions below for why the live path is the local-sign bundle endpoint rather than server-signed Lightning.
+Live mode loads `PRIVATE_KEY` from the environment, derives the public key locally, and discards the secret from every log line. The key is not sent to PumpDev. Before a live buy it checks the wallet balance as described above. See the assumptions below for why the live path is the local-sign bundle endpoint rather than server-signed Lightning.
 
 `npm run panic-sell` sells every open position. In paper mode the sells are simulated and logged with reason `manual`. In live mode it submits real bundles and requires `MODE=live` plus `PRIVATE_KEY`.
 
@@ -55,13 +61,14 @@ npm run report -- --day 2026-11-04
 The day is a calendar date in `Europe/Berlin`. The command prints one JSON object:
 
 - `tradesTaken` — filled buys
-- `wins` / `losses` — filled sells with positive or negative realized PnL
+- `wins` / `losses` — filled take-profit and stop-loss sells with positive or negative realized PnL
+- `timeouts` — filled sells with reason `timeout`
 - `realizedPnlSol` / `realizedPnlUsd`
 - `feesSol` / `tipsSol` — charged on filled rows
 - `failedBuys` / `failedSells`
 - `mode` — `paper`, `live`, `mixed`, or `none`
 
-`data/trades.jsonl` is append-only. Each row has the timestamp, mode, mint, name, size, price, fees, Jito tip, signature (`paper` or a transaction signature), Solscan URL when there is a live signature, and reason (`entry`, `tp`, `sl`, `manual`).
+`data/trades.jsonl` is append-only. Each row has the timestamp, mode, mint, name, size, price, fees, Jito tip, signature (`paper` or a transaction signature), Solscan URL when there is a live signature, and reason (`entry`, `tp`, `sl`, `timeout`, `manual`).
 
 ## Layout
 

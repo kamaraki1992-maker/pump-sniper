@@ -16,6 +16,8 @@ export interface DailySummary {
   tipsSol: number;
   failedBuys: number;
   failedSells: number;
+  /** Filled sells whose reason is `timeout`. Not also counted as wins or losses. */
+  timeouts: number;
 }
 
 export function berlinDay(iso: string): string {
@@ -42,19 +44,21 @@ export function summarizeDay(records: TradeRecord[], day: string): DailySummary 
     return sum + row.realizedPnlSol * row.solUsd;
   }, 0);
   const filled = rows.filter((row) => row.status === "filled");
+  const priceSells = filledSells.filter((row) => row.reason !== "timeout");
   return {
     day,
     timezone: "Europe/Berlin",
     mode,
     tradesTaken: filledBuys.length,
-    wins: filledSells.filter((row) => (row.realizedPnlSol ?? 0) > 0).length,
-    losses: filledSells.filter((row) => (row.realizedPnlSol ?? 0) < 0).length,
+    wins: priceSells.filter((row) => (row.realizedPnlSol ?? 0) > 0).length,
+    losses: priceSells.filter((row) => (row.realizedPnlSol ?? 0) < 0).length,
     realizedPnlSol: round(realized, 9),
     realizedPnlUsd: round(realizedUsd, 4),
     feesSol: round(filled.reduce((sum, row) => sum + row.feesSol, 0), 9),
     tipsSol: round(filled.reduce((sum, row) => sum + row.jitoTipSol, 0), 9),
     failedBuys: rows.filter((row) => row.side === "buy" && row.status === "failed").length,
     failedSells: rows.filter((row) => row.side === "sell" && row.status === "failed").length,
+    timeouts: filledSells.filter((row) => row.reason === "timeout").length,
   };
 }
 

@@ -4,8 +4,8 @@ export type TradeSide = "buy" | "sell";
 
 export type TradeStatus = "filled" | "failed";
 
-/** Operator-facing reason. Buys use `entry`. Panic-sell uses `manual`. */
-export type TradeReason = "entry" | "tp" | "sl" | "manual";
+/** Operator-facing reason. Buys use `entry`. Panic-sell uses `manual`. Hold-timer exits use `timeout`. */
+export type TradeReason = "entry" | "tp" | "sl" | "manual" | "timeout";
 
 export interface MarketLaunch {
   kind: "launch";

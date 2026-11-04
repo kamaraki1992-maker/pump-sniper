@@ -66,8 +66,29 @@ test("daily summary counts trades, wins, losses, fees, tips, and failed buys", (
   assert.equal(summary.wins, 1);
   assert.equal(summary.losses, 1);
   assert.equal(summary.failedBuys, 1);
+  assert.equal(summary.timeouts, 0);
   assert.ok(Math.abs(summary.realizedPnlSol - 0.03) < 1e-9);
   assert.ok(Math.abs(summary.realizedPnlUsd - 3) < 1e-9);
   assert.ok(Math.abs(summary.feesSol - 0.004) < 1e-9);
   assert.ok(Math.abs(summary.tipsSol - 0.006) < 1e-9);
+});
+
+test("timeouts are counted apart from wins and losses", () => {
+  const summary = summarizeDay(
+    [
+      row({}),
+      row({
+        side: "sell",
+        reason: "timeout",
+        realizedPnlSol: -0.01,
+        feesSol: 0.001,
+        jitoTipSol: 0.002,
+      }),
+    ],
+    "2026-11-04",
+  );
+  assert.equal(summary.timeouts, 1);
+  assert.equal(summary.wins, 0);
+  assert.equal(summary.losses, 0);
+  assert.ok(Math.abs(summary.realizedPnlSol - -0.01) < 1e-9);
 });
