@@ -41,15 +41,14 @@ export function decideExit(input: {
   buysInWindow?: number;
   sellPressureRatio?: number;
   minPressureSells?: number;
+  /** When false, curve SOL from the trade stream is ignored. An account subscription owns that exit. */
+  useStreamLiquidity?: boolean;
 }): ExitSignal | null {
   const priced = exitSignal(input.entryPrice, input.markPrice, input.takeProfitPct, input.stopLossPct);
   if (priced) return priced;
-  const entryV = input.entryVSolSol ?? null;
-  const lastV = input.lastVSolSol ?? null;
   const liqDropPct = input.liqDropPct ?? 20;
-  if (entryV !== null && lastV !== null && entryV > 0) {
-    const dropPct = ((entryV - lastV) / entryV) * 100;
-    if (dropPct > liqDropPct) return "liquidity_drop";
+  if (input.useStreamLiquidity !== false && reservesDropped(input.entryVSolSol, input.lastVSolSol, liqDropPct)) {
+    return "liquidity_drop";
   }
   const sells = input.sellsInWindow ?? 0;
   const buys = input.buysInWindow ?? 0;
@@ -61,4 +60,14 @@ export function decideExit(input: {
   if (input.nowMs - lastTradeAtMs >= volumeStallMs) return "volume_stall";
   if (input.nowMs - input.openedAtMs >= input.maxHoldMs) return "timeout";
   return null;
+}
+
+/** True when current reserves are more than `dropPct` percent below entry. */
+export function reservesDropped(
+  entry: number | null | undefined,
+  current: number | null | undefined,
+  dropPct: number,
+): boolean {
+  if (entry == null || current == null || !(entry > 0) || !Number.isFinite(current)) return false;
+  return ((entry - current) / entry) * 100 > dropPct;
 }

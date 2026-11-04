@@ -1,3 +1,4 @@
+import { bondingCurveAddress } from "./curve-watch.js";
 import { confidenceScore, sizeFromConfidence } from "./confidence.js";
 import { clampBuyUsd, requiredBuyBalanceSol, type AppConfig } from "./config.js";
 import { SOL_PRICE_MAX_AGE_MS } from "./sol-price.js";
@@ -7,7 +8,7 @@ import { Logger } from "./logger.js";
 import type { PositionBook } from "./positions.js";
 import { TOTAL_SUPPLY_TOKENS } from "./pricing.js";
 import type { TradeLog } from "./report.js";
-import { decideExit } from "./risk.js";
+import { decideExit, reservesDropped } from "./risk.js";
 import type { SafetyCheckResult } from "./safety.js";
 import type { Executor, MarketLaunch, MarketTrade, OrderRequest, Position, TradeReason } from "./types.js";
 
@@ -32,6 +33,12 @@ export interface BotDeps {
     vTokens: number | null;
     spendSol: number;
   }) => Promise<SafetyCheckResult>;
+  curveWatch?: {
+    watch(mint: string, curve: string): void;
+    unwatch(mint: string): void;
+    isLive(mint: string): boolean;
+    stop?(): void;
+  };
 }
 
 const MAX_OPEN_LOG_MS = 5_000;
@@ -54,6 +61,7 @@ export class SniperBot {
 
   stop(): void {
     this.stopped = true;
+    this.deps.curveWatch?.stop?.();
   }
 
   async onLaunch(launch: MarketLaunch): Promise<void> {
@@ -188,10 +196,12 @@ export class SniperBot {
         lastMarkPriceSol: launch.priceSol,
         entryVSolSol: launch.vSolSol,
         lastVSolSol: launch.vSolSol,
+        bondingCurve: bondingCurveAddress(launch.mint, launch.bondingCurveKey),
         lastTradeAtMs: this.deps.now().getTime(),
       };
       this.deps.positions.open(position);
       this.deps.subscribeMint(launch.mint);
+      if (position.bondingCurve) this.deps.curveWatch?.watch(launch.mint, position.bondingCurve);
       this.deps.log.info("buy filled", {
         mint: launch.mint,
         name: launch.name,
@@ -226,6 +236,21 @@ export class SniperBot {
     }
   }
 
+  /** Bonding-curve account notification. The first sample is the entry baseline. */
+  onCurveReserves(mint: string, realSol: number): void {
+    const position = this.deps.positions.get(mint);
+    if (!position || this.stopped || !(realSol >= 0)) return;
+    if (position.entryRealSolSol == null) {
+      position.entryRealSolSol = realSol;
+      position.lastRealSolSol = realSol;
+      return;
+    }
+    position.lastRealSolSol = realSol;
+    if (reservesDropped(position.entryRealSolSol, realSol, this.deps.config.liqDropPct)) {
+      void this.sellPosition(position, "liquidity_drop", position.lastMarkPriceSol);
+    }
+  }
+
   private async maybeExit(position: Position, quote: number): Promise<void> {
     if (this.selling.has(position.mint)) return;
     const cooldown = this.cooldownUntil.get(position.mint) ?? 0;
@@ -249,6 +274,7 @@ export class SniperBot {
       buysInWindow: counts.buys,
       sellPressureRatio: this.deps.config.sellPressureRatio,
       minPressureSells: 4,
+      useStreamLiquidity: this.deps.curveWatch?.isLive(position.mint) !== true,
     });
     if (!signal) return;
     await this.sellPosition(position, signal, quote > 0 ? quote : position.lastMarkPriceSol);
@@ -305,6 +331,7 @@ export class SniperBot {
         if (fill.status === "filled") {
           this.deps.positions.close(current.mint);
           this.flow.delete(current.mint);
+          this.deps.curveWatch?.unwatch(current.mint);
           this.deps.log.info("sell filled", {
             mint: current.mint,
             reason,

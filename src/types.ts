@@ -118,6 +118,10 @@ export interface Position {
   lastMarkPriceSol: number;
   entryVSolSol?: number | null;
   lastVSolSol?: number | null;
+  /** Real SOL reserves sampled from the bonding-curve account. */
+  entryRealSolSol?: number | null;
+  lastRealSolSol?: number | null;
+  bondingCurve?: string | null;
   lastTradeAtMs?: number;
 }
 

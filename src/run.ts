@@ -2,13 +2,14 @@ import { existsSync } from "node:fs";
 import { Connection, Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 import { SniperBot } from "./bot.js";
+import { RpcCurveWatch } from "./curve-watch.js";
 import { ConfigError, loadConfig, type AppConfig } from "./config.js";
 import { PaperExecutor } from "./executor-paper.js";
 import { createLivePorts, LiveExecutor } from "./executor-live.js";
 import { RpcCreatorHistory } from "./history.js";
 import { Logger } from "./logger.js";
 import { PositionBook } from "./positions.js";
-import { installProcessRedaction } from "./redact.js";
+import { installProcessRedaction, rpcApiKey } from "./redact.js";
 import { TradeLog } from "./report.js";
 import { SolPriceFeed } from "./sol-price.js";
 import { createRpcSafetyCheck } from "./safety.js";
@@ -39,6 +40,8 @@ export function readSecrets(): string[] {
   const grpcToken = process.env.GRPC_TOKEN?.trim();
   if (key) secrets.push(key);
   if (grpcToken && grpcToken.length >= 8) secrets.push(grpcToken);
+  const rpcKey = rpcApiKey(process.env.RPC_WS_URL?.trim() ?? "");
+  if (rpcKey && rpcKey.length >= 8) secrets.push(rpcKey);
   return secrets;
 }
 
@@ -60,6 +63,12 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
   const sol = new SolPriceFeed(config.solPriceUrl);
   await sol.refresh();
   const history = new RpcCreatorHistory(config, log);
+  const botRef: { onCurveReserves: (mint: string, realSol: number) => void } = {
+    onCurveReserves: () => {},
+  };
+  const curveWatch = config.rpcWsUrl
+    ? new RpcCurveWatch(config.rpcWsUrl, log, (mint, realSol) => botRef.onCurveReserves(mint, realSol))
+    : undefined;
   let executor: Executor;
   let walletBalanceSol: (() => Promise<number>) | undefined;
   if (config.mode === "live") {
@@ -95,7 +104,12 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     subscribeMint: (mint) => subscription.stream?.subscribeTrades([mint]),
     ...(walletBalanceSol ? { walletBalanceSol } : {}),
     safetyCheck: createRpcSafetyCheck(config),
+    ...(curveWatch ? { curveWatch } : {}),
   });
+  if (curveWatch) {
+    botRef.onCurveReserves = (mint, realSol) => bot.onCurveReserves(mint, realSol);
+    curveWatch.start();
+  }
   return { config, log, bot, positions, sol, executor, subscription };
 }
 

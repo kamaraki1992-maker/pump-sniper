@@ -52,6 +52,8 @@ export interface AppConfig {
   safetyCheckTimeoutMs: number;
   /** Set only when both GRPC_URL and GRPC_TOKEN are present. The token itself is not stored here. */
   grpcUrl: string | null;
+  /** Present only when RPC_WS_URL is set. Logs must redact its api-key. */
+  rpcWsUrl: string | null;
   wsUrl: string;
   tradeApiUrl: string;
   rpcUrl: string;
@@ -220,6 +222,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     sellPressureWindowSec,
     safetyCheckTimeoutMs,
     grpcUrl: grpcUrlRaw && grpcTokenPresent ? grpcUrlRaw : null,
+    rpcWsUrl: str(env.RPC_WS_URL, "") || null,
     wsUrl: str(env.WS_URL, "wss://pumpdev.io/ws"),
     tradeApiUrl: str(env.TRADE_API_URL, "https://pumpdev.io/api/bundle"),
     rpcUrl: str(env.RPC_URL, "https://api.mainnet-beta.solana.com"),

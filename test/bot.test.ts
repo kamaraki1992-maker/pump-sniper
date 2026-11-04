@@ -69,6 +69,11 @@ function harness(options: {
     vTokens: number | null;
     spendSol: number;
   }) => Promise<{ ok: boolean; reason: string | null; latencyMs: number }>;
+  curveWatch?: {
+    watch(mint: string, curve: string): void;
+    unwatch(mint: string): void;
+    isLive(mint: string): boolean;
+  };
 }) {
   const dir = mkdtempSync(join(tmpdir(), "sniper-bot-"));
   const config = { ...loadConfig({ DATA_DIR: dir }), ...options.config, dataDir: dir };
@@ -104,6 +109,7 @@ function harness(options: {
     subscribeMint: () => {},
     ...(options.walletBalanceSol ? { walletBalanceSol: options.walletBalanceSol } : {}),
     ...(options.safetyCheck ? { safetyCheck: options.safetyCheck } : {}),
+    ...(options.curveWatch ? { curveWatch: options.curveWatch } : {}),
   });
   return { bot, positions, trades, sells, config, log };
 }
@@ -432,6 +438,33 @@ test("overlapping exit checks do not send two sells", async () => {
   now += 45_000;
   await Promise.all([bot.checkHolds(), bot.checkHolds()]);
   assert.equal(calls, 1);
+});
+
+test("a curve account update sells on liquidity_drop and does not double-sell", async () => {
+  let calls = 0;
+  const watched: string[] = [];
+  const unwatched: string[] = [];
+  const { bot, trades } = harness({
+    buy: async () => fill({ price: 1 }),
+    sell: async () => {
+      calls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return fill({ price: 1, cashflowSol: 0.09, sizeSol: 0.09 });
+    },
+    curveWatch: {
+      watch: (mint) => watched.push(mint),
+      unwatch: (mint) => unwatched.push(mint),
+      isLive: () => true,
+    },
+  });
+  await bot.onLaunch(launch({ mint: "CurveMint", priceSol: 1, bondingCurveKey: "Curve111" }));
+  assert.deepEqual(watched, ["CurveMint"]);
+  bot.onCurveReserves("CurveMint", 10);
+  await Promise.all([bot.onCurveReserves("CurveMint", 7), bot.onCurveReserves("CurveMint", 6)]);
+  assert.equal(calls, 1);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(trades.readAll().find((row) => row.side === "sell")?.reason, "liquidity_drop");
+  assert.deepEqual(unwatched, ["CurveMint"]);
 });
 
 test("a failed safety check skips the buy and logs latency", async () => {
