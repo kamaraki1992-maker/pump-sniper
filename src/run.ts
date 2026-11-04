@@ -84,6 +84,12 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     trades,
     log,
     solUsd: () => sol.price(),
+    solQuote: () => {
+      const usd = sol.fresh();
+      const updatedAtMs = sol.updatedAt();
+      if (usd === null || updatedAtMs === null) return null;
+      return { usd, updatedAtMs };
+    },
     now: () => new Date(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     subscribeMint: (mint) => subscription.stream?.subscribeTrades([mint]),
@@ -119,8 +125,8 @@ export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promis
   const { config, log, bot, positions, sol } = runtime;
   log.info("sniper start", {
     mode: config.mode,
-    buySizeMinSol: config.buySizeMinSol,
-    buySizeMaxSol: config.buySizeMaxSol,
+    buySizeMinUsd: config.buySizeMinUsd,
+    buySizeMaxUsd: config.buySizeMaxUsd,
     maxSlippagePct: config.maxSlippagePct,
     jitoTipSol: config.jitoTipSol,
     takeProfitPct: config.takeProfitPct,

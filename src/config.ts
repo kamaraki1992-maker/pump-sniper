@@ -7,7 +7,7 @@ import type { Mode } from "./types.js";
  * Loosening them means editing this object.
  */
 export const HARD_CAPS = {
-  maxBuySol: 0.16,
+  maxBuyUsd: 30,
   maxSlippagePct: 20,
   minJitoTipSol: 0.002,
   maxJitoTipSol: 0.005,
@@ -35,8 +35,8 @@ export interface PaperModel {
 
 export interface AppConfig {
   mode: Mode;
-  buySizeMinSol: number;
-  buySizeMaxSol: number;
+  buySizeMinUsd: number;
+  buySizeMaxUsd: number;
   maxSlippagePct: number;
   takeProfitPct: number;
   stopLossPct: number;
@@ -98,6 +98,12 @@ export function assertLiveKey(secret: string): void {
  * later sell (priority fee, base fee, and tip), and this order needs the same
  * plus its size.
  */
+/** Clamp a computed USD notional to the hard cap. Non-positive values become 0. */
+export function clampBuyUsd(usd: number): number {
+  if (!Number.isFinite(usd) || usd <= 0) return 0;
+  return Math.min(usd, HARD_CAPS.maxBuyUsd);
+}
+
 export function requiredBuyBalanceSol(config: AppConfig, buySize: number, openPositions = 0): number {
   const txFee = config.priorityFeeSol + config.paper.baseFeeSol;
   const exitReserve = txFee + config.jitoTipSol;
@@ -106,8 +112,8 @@ export function requiredBuyBalanceSol(config: AppConfig, buySize: number, openPo
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const mode: Mode = env.MODE === "live" ? "live" : "paper";
-  const buySizeMinSol = num(env.BUY_SIZE_MIN_SOL, 0.05, "BUY_SIZE_MIN_SOL");
-  const buySizeMaxSol = num(env.BUY_SIZE_MAX_SOL, HARD_CAPS.maxBuySol, "BUY_SIZE_MAX_SOL");
+  const buySizeMinUsd = num(env.BUY_SIZE_MIN_USD, 5, "BUY_SIZE_MIN_USD");
+  const buySizeMaxUsd = num(env.BUY_SIZE_MAX_USD, HARD_CAPS.maxBuyUsd, "BUY_SIZE_MAX_USD");
   const maxSlippagePct = num(env.MAX_SLIPPAGE_PCT, 3, "MAX_SLIPPAGE_PCT");
   const jitoTipSol = num(env.JITO_TIP_SOL, 0.002, "JITO_TIP_SOL");
   const takeProfitPct = num(env.TAKE_PROFIT_PCT, HARD_CAPS.maxTakeProfitPct, "TAKE_PROFIT_PCT");
@@ -128,14 +134,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const venueFeeBps = num(env.PAPER_VENUE_FEE_BPS, 25, "PAPER_VENUE_FEE_BPS");
   const baseFeeSol = num(env.PAPER_BASE_FEE_SOL, 0.000005, "PAPER_BASE_FEE_SOL");
 
-  if (!(buySizeMinSol > 0) || buySizeMinSol > HARD_CAPS.maxBuySol) {
+  if (!(buySizeMinUsd > 0) || buySizeMinUsd > HARD_CAPS.maxBuyUsd) {
     throw new ConfigError(
-      `BUY_SIZE_MIN_SOL ${buySizeMinSol} exceeds hard cap ${HARD_CAPS.maxBuySol}`,
+      `BUY_SIZE_MIN_USD ${buySizeMinUsd} exceeds hard cap ${HARD_CAPS.maxBuyUsd}`,
     );
   }
-  if (!(buySizeMaxSol > 0) || buySizeMaxSol > HARD_CAPS.maxBuySol || buySizeMaxSol < buySizeMinSol) {
+  if (!(buySizeMaxUsd > 0) || buySizeMaxUsd > HARD_CAPS.maxBuyUsd || buySizeMaxUsd < buySizeMinUsd) {
     throw new ConfigError(
-      `BUY_SIZE_MAX_SOL ${buySizeMaxSol} exceeds hard cap ${HARD_CAPS.maxBuySol}`,
+      `BUY_SIZE_MAX_USD ${buySizeMaxUsd} exceeds hard cap ${HARD_CAPS.maxBuyUsd}`,
     );
   }
   if (!(maxSlippagePct > 0) || maxSlippagePct > HARD_CAPS.maxSlippagePct) {
@@ -198,8 +204,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const dataDir = str(env.DATA_DIR, "./data");
   return {
     mode,
-    buySizeMinSol,
-    buySizeMaxSol,
+    buySizeMinUsd,
+    buySizeMaxUsd,
     maxSlippagePct,
     takeProfitPct,
     stopLossPct,

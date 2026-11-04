@@ -86,6 +86,8 @@ export interface TradeRecord {
   name: string;
   symbol: string;
   sizeSol: number;
+  /** USD notional of a buy. Null on sells. */
+  sizeUsd?: number | null;
   price: number;
   feesSol: number;
   jitoTipSol: number;

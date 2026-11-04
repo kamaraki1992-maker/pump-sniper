@@ -29,10 +29,9 @@ These limits are constants in `src/config.ts`. The process exits on startup if t
 
 | Setting | Default | Hard bound |
 | --- | --- | --- |
-| Buy size | 0.1 SOL | `<= 0.1` SOL |
 | Slippage | 3% | `<= 20%` |
 | Jito tip | 0.002 SOL | `0.002` to `0.005` SOL |
-| Buy size | 0.05 to 0.16 SOL | chosen from a confidence score, hard cap `0.16` |
+| Buy size | $5 to $30 | confidence score, hard cap `$30`, converted to SOL at buy time |
 | Take profit | +50% | `<= 50%`, sells 100% of the position |
 | Stop loss | -15% | `<= 15%`, sells 100% of the position |
 | Creator hold at launch | under 10% of supply | cannot be configured above 10% |
@@ -50,7 +49,7 @@ Jito bundles and a 3% default slippage reduce sandwich exposure. They do not gua
 
 Before a buy, the bot reads the mint account and rejects a set mint authority, a set freeze authority, a program other than SPL Token or Token-2022, and a Token-2022 mint with a transfer fee or transfer hook. It also requires a bonding-curve round trip to produce tokens and a `simulateTransaction` of the buy. A sell simulation that fails only because the wallet does not hold the mint yet is not a rejection. The whole check must finish within `SAFETY_CHECK_TIMEOUT_MS` (default 250). If it does not, the token is skipped and the measured latency is logged. Five milliseconds is not achievable over public RPC.
 
-Buy size is `min + confidence * (max - min)`. Confidence is 40% launch-hold (lower is better), 30% early buy/sell flow (no prints yet is neutral), and 30% safety pass. Live mode still checks the wallet, including the SOL reserved to exit positions that are already open.
+Buy size in dollars is `min + confidence * (max - min)`, then clamped to $30 and divided by the SOL/USD price. Confidence is 40% launch-hold (lower is better), 30% early buy/sell flow (no prints yet is neutral), and 30% safety pass. If that price is missing or older than 60 seconds the buy is skipped with reason `no_price`. The bot does not substitute a guessed price. Each buy log includes both the USD notional and the SOL size. Live mode still checks the wallet in SOL, including the SOL reserved to exit positions that are already open.
 
 In live mode the bot reads the wallet balance before sending a buy. It skips the buy when the balance is below the order size, the priority fee, the base fee, the Jito tip, and the same priority fee plus base fee kept for the sell. Paper mode does not read a wallet.
 

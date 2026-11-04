@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
-import { ConfigError, loadConfig, requiredBuyBalanceSol } from "../src/config.js";
+import { clampBuyUsd, ConfigError, loadConfig, requiredBuyBalanceSol } from "../src/config.js";
 
 const secret = bs58.encode(Keypair.generate().secretKey);
 
@@ -22,8 +22,8 @@ test("paper mode does not require a key and does not keep the key on the config"
 
 test("defaults match the risk spec", () => {
   const cfg = loadConfig({});
-  assert.equal(cfg.buySizeMinSol, 0.05);
-  assert.equal(cfg.buySizeMaxSol, 0.16);
+  assert.equal(cfg.buySizeMinUsd, 5);
+  assert.equal(cfg.buySizeMaxUsd, 30);
   assert.equal(cfg.maxSlippagePct, 3);
   assert.equal(cfg.jitoTipSol, 0.002);
   assert.equal(cfg.takeProfitPct, 50);
@@ -38,11 +38,11 @@ test("defaults match the risk spec", () => {
 });
 
 test("buy size, slippage, and tip hard caps refuse startup", () => {
-  assert.throws(() => loadConfig({ BUY_SIZE_MAX_SOL: "0.17" }), ConfigError);
-  assert.throws(() => loadConfig({ BUY_SIZE_MAX_SOL: "0.25" }), ConfigError);
-  assert.throws(() => loadConfig({ BUY_SIZE_MIN_SOL: "0" }), ConfigError);
-  assert.equal(loadConfig({ BUY_SIZE_MAX_SOL: "0.16" }).buySizeMaxSol, 0.16);
-  assert.equal(loadConfig({ BUY_SIZE_MIN_SOL: "0.05", BUY_SIZE_MAX_SOL: "0.12" }).buySizeMaxSol, 0.12);
+  assert.throws(() => loadConfig({ BUY_SIZE_MAX_USD: "31" }), ConfigError);
+  assert.throws(() => loadConfig({ BUY_SIZE_MAX_USD: "30.01" }), ConfigError);
+  assert.throws(() => loadConfig({ BUY_SIZE_MIN_USD: "0" }), ConfigError);
+  assert.equal(loadConfig({ BUY_SIZE_MAX_USD: "30" }).buySizeMaxUsd, 30);
+  assert.equal(loadConfig({ BUY_SIZE_MIN_USD: "5", BUY_SIZE_MAX_USD: "20" }).buySizeMaxUsd, 20);
   assert.throws(() => loadConfig({ MAX_SLIPPAGE_PCT: "21" }), ConfigError);
   assert.equal(loadConfig({ MAX_SLIPPAGE_PCT: "20" }).maxSlippagePct, 20);
   assert.equal(loadConfig({}).maxSlippagePct, 3);
@@ -70,13 +70,15 @@ test("open positions cannot be loosened past 5", () => {
   assert.equal(loadConfig({ MAX_OPEN_POSITIONS: "1" }).maxOpenPositions, 1);
 });
 
-test("live buy reserves exit SOL for this order and for positions already open", () => {
+test("live buy reserves exit SOL for the USD notional and for positions already open", () => {
   const cfg = loadConfig({});
   const fee = 0.00005 + 0.000005;
   const tip = 0.002;
-  const one = requiredBuyBalanceSol(cfg, 0.16, 0);
-  assert.ok(Math.abs(one - (0.16 + fee + tip + fee + tip)) < 1e-12);
-  const withOpen = requiredBuyBalanceSol(cfg, 0.16, 2);
+  const sizeSol = clampBuyUsd(30) / 100;
+  const one = requiredBuyBalanceSol(cfg, sizeSol, 0);
+  assert.equal(clampBuyUsd(40), 30);
+  assert.ok(Math.abs(one - (sizeSol + fee + tip + fee + tip)) < 1e-12);
+  const withOpen = requiredBuyBalanceSol(cfg, sizeSol, 2);
   assert.ok(Math.abs(withOpen - (one + 2 * (fee + tip))) < 1e-12);
 });
 

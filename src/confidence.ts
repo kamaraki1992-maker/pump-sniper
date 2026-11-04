@@ -21,8 +21,8 @@ export function confidenceScore(input: {
   return clamp01(0.4 * hold + 0.3 * flow + 0.3 * safety);
 }
 
-/** Linear map from confidence onto [min, max]. */
-export function sizeFromConfidence(score: number, minSol: number, maxSol: number): number {
-  const span = Math.max(0, maxSol - minSol);
-  return minSol + clamp01(score) * span;
+/** Linear map from confidence onto [minUsd, maxUsd]. */
+export function sizeFromConfidence(score: number, minUsd: number, maxUsd: number): number {
+  const span = Math.max(0, maxUsd - minUsd);
+  return minUsd + clamp01(score) * span;
 }

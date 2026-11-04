@@ -62,6 +62,7 @@ function harness(options: {
   walletBalanceSol?: () => Promise<number>;
   capture?: boolean;
   now?: () => Date;
+  solQuote?: () => { usd: number; updatedAtMs: number } | null;
   safetyCheck?: (input: {
     mint: string;
     vSol: number | null;
@@ -92,6 +93,12 @@ function harness(options: {
     trades,
     log,
     solUsd: () => 100,
+    solQuote:
+      options.solQuote ??
+      (() => ({
+        usd: 100,
+        updatedAtMs: (options.now ?? (() => new Date("2026-11-04T12:00:00.000Z")))().getTime(),
+      })),
     now: options.now ?? (() => new Date("2026-11-04T12:00:00.000Z")),
     sleep: async () => {},
     subscribeMint: () => {},
@@ -442,4 +449,66 @@ test("a failed safety check skips the buy and logs latency", async () => {
   assert.equal(positions.list().length, 0);
   const row = (log as ListLogger).entries.find((entry) => entry.fields?.reason === "freeze-authority-set");
   assert.equal(row?.fields?.latencyMs, 18);
+});
+
+test("a buy logs USD and SOL size from a fresh SOL/USD quote and stays within $30", async () => {
+  const now = Date.parse("2026-11-04T12:00:00.000Z");
+  const { bot, log, trades } = harness({
+    capture: true,
+    now: () => new Date(now),
+    solQuote: () => ({ usd: 100, updatedAtMs: now }),
+    buy: async (order) => fill({ sizeSol: order.sizeSol, cashflowSol: order.sizeSol }),
+  });
+  await bot.onLaunch(launch({ mint: "Usd", priceSol: 1, initialBuyTokens: 0 }));
+  const filled = (log as ListLogger).entries.find((entry) => entry.message === "buy filled");
+  const sizeUsd = filled?.fields?.sizeUsd;
+  const sizeSol = filled?.fields?.sizeSol;
+  assert.equal(typeof sizeUsd, "number");
+  assert.equal(typeof sizeSol, "number");
+  assert.ok((sizeUsd as number) <= 30);
+  assert.ok(Math.abs((sizeSol as number) - (sizeUsd as number) / 100) < 1e-12);
+  const row = trades.readAll().find((entry) => entry.side === "buy");
+  assert.equal(row?.sizeUsd, sizeUsd);
+  assert.equal(row?.sizeSol, sizeSol);
+});
+
+test("missing or stale SOL/USD skips the buy with no_price", async () => {
+  const now = Date.parse("2026-11-04T12:00:00.000Z");
+  let missingBuys = 0;
+  const missing = harness({
+    capture: true,
+    now: () => new Date(now),
+    solQuote: () => null,
+    buy: async () => {
+      missingBuys += 1;
+      return fill({});
+    },
+  });
+  await missing.bot.onLaunch(launch({ mint: "NoQuote", priceSol: 1 }));
+  assert.equal(missingBuys, 0);
+  assert.ok(
+    (missing.log as ListLogger).entries.some((entry) => entry.fields?.reason === "no_price"),
+  );
+
+  let staleBuys = 0;
+  const stale = harness({
+    capture: true,
+    now: () => new Date(now),
+    solQuote: () => ({ usd: 100, updatedAtMs: now - 60_001 }),
+    buy: async () => {
+      staleBuys += 1;
+      return fill({});
+    },
+  });
+  await stale.bot.onLaunch(launch({ mint: "Stale", priceSol: 1 }));
+  assert.equal(staleBuys, 0);
+  assert.equal(stale.positions.list().length, 0);
+  assert.ok((stale.log as ListLogger).entries.some((entry) => entry.fields?.reason === "no_price"));
+
+  const freshEdge = harness({
+    now: () => new Date(now),
+    solQuote: () => ({ usd: 100, updatedAtMs: now - 60_000 }),
+  });
+  await freshEdge.bot.onLaunch(launch({ mint: "Edge", priceSol: 1 }));
+  assert.equal(freshEdge.positions.list().length, 1);
 });

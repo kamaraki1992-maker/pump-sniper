@@ -1,5 +1,6 @@
 import { confidenceScore, sizeFromConfidence } from "./confidence.js";
-import { requiredBuyBalanceSol, type AppConfig } from "./config.js";
+import { clampBuyUsd, requiredBuyBalanceSol, type AppConfig } from "./config.js";
+import { SOL_PRICE_MAX_AGE_MS } from "./sol-price.js";
 import type { FilterDecision } from "./filter.js";
 import { holdDecision } from "./filter.js";
 import { Logger } from "./logger.js";
@@ -18,6 +19,8 @@ export interface BotDeps {
   trades: TradeLog;
   log: Logger;
   solUsd: () => number | null;
+  /** Live SOL/USD quote and the time it was fetched. Null when unknown. */
+  solQuote: () => { usd: number; updatedAtMs: number } | null;
   now: () => Date;
   sleep: (ms: number) => Promise<void>;
   subscribeMint: (mint: string) => void;
@@ -84,19 +87,17 @@ export class SniperBot {
       return;
     }
     if (this.stopped) return;
-    const holdPct = (launch.initialBuyTokens / TOTAL_SUPPLY_TOKENS) * 100;
-    const earlyBuys = launch.initialBuyTokens > 0 ? 1 : 0;
-    const sizeSol = sizeFromConfidence(
-      confidenceScore({ holdPct, buys: earlyBuys, sells: 0, safetyOk: true }),
-      this.deps.config.buySizeMinSol,
-      this.deps.config.buySizeMaxSol,
-    );
+    const sized = this.quoteBuySize(launch);
+    if (!sized) {
+      this.skip(launch, "no_price");
+      return;
+    }
     if (this.deps.safetyCheck) {
       const safety = await this.deps.safetyCheck({
         mint: launch.mint,
         vSol: launch.vSolSol,
         vTokens: launch.vTokens,
-        spendSol: sizeSol,
+        spendSol: sized.sizeSol,
       });
       this.deps.log.info("safety", {
         mint: launch.mint,
@@ -110,6 +111,12 @@ export class SniperBot {
       }
     }
     if (this.stopped) return;
+    const orderSize = this.quoteBuySize(launch);
+    if (!orderSize) {
+      this.skip(launch, "no_price");
+      return;
+    }
+    const { sizeUsd, sizeSol } = orderSize;
     if (!this.tryReserve(launch.mint)) {
       this.skipMaxOpen(launch);
       return;
@@ -148,6 +155,7 @@ export class SniperBot {
         name: launch.name,
         symbol: launch.symbol,
         sizeSol: fill.status === "filled" ? fill.sizeSol : order.sizeSol,
+        sizeUsd,
         price: fill.price,
         feesSol: fill.feesSol,
         jitoTipSol: fill.jitoTipSol,
@@ -155,13 +163,13 @@ export class SniperBot {
         solscan: fill.solscan,
         reason: "entry",
         error: fill.error,
-        solUsd: this.deps.solUsd(),
+        solUsd: sizeUsd / sizeSol,
         tokenAmount: fill.tokenAmount,
         realizedPnlSol: null,
         costSol: fill.status === "filled" ? fill.cashflowSol : null,
       });
       if (fill.status !== "filled") {
-        this.deps.log.info("buy failed", { mint: launch.mint, error: fill.error });
+        this.deps.log.info("buy failed", { mint: launch.mint, error: fill.error, sizeUsd, sizeSol });
         return;
       }
       const position: Position = {
@@ -191,6 +199,7 @@ export class SniperBot {
         tokenAmount: fill.tokenAmount,
         signature: fill.signature,
         openPositions: this.deps.positions.list().length,
+        sizeUsd,
         sizeSol,
       });
     } finally {
@@ -316,6 +325,24 @@ export class SniperBot {
     } finally {
       this.selling.delete(position.mint);
     }
+  }
+
+  /** USD notional clamped to the hard cap, then SOL at the fresh quote. */
+  private quoteBuySize(launch: MarketLaunch): { sizeUsd: number; sizeSol: number } | null {
+    const quote = this.deps.solQuote();
+    if (!quote || !(quote.usd > 0) || !Number.isFinite(quote.usd)) return null;
+    if (this.deps.now().getTime() - quote.updatedAtMs > SOL_PRICE_MAX_AGE_MS) return null;
+    const holdPct = (launch.initialBuyTokens / TOTAL_SUPPLY_TOKENS) * 100;
+    const earlyBuys = launch.initialBuyTokens > 0 ? 1 : 0;
+    const sizeUsd = clampBuyUsd(
+      sizeFromConfidence(
+        confidenceScore({ holdPct, buys: earlyBuys, sells: 0, safetyOk: true }),
+        this.deps.config.buySizeMinUsd,
+        this.deps.config.buySizeMaxUsd,
+      ),
+    );
+    if (!(sizeUsd > 0)) return null;
+    return { sizeUsd, sizeSol: sizeUsd / quote.usd };
   }
 
   private noteTrade(mint: string, side: "buy" | "sell", at: number): void {
