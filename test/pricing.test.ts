@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { assessMark, curveSellPrice, PUMP_CURVE_K } from "../src/pricing.js";
+import { assessMark, curveSellPrice, parsePumpDevMessage, poolSellPrice, PUMP_CURVE_K } from "../src/pricing.js";
+import { curveCompleteFlag } from "../src/curve-watch.js";
 
 /** Microsoft in the 4 Nov 2026 paper run: launch quote, then a 1574 SOL "mark". */
 const LAUNCH_VTOKENS = 1_073_000_000;
@@ -46,4 +47,30 @@ test("a mark that jumps more than 5x in one update is rejected", () => {
   });
   assert.equal(accepted.accept, true);
   assert.equal(accepted.price, 4e-8);
+});
+
+test("complete and create_pool graduate, and a pool sell does not use the curve price", () => {
+  const complete = parsePumpDevMessage({ txType: "complete", mint: "MintA" });
+  assert.equal(complete?.kind, "graduation");
+  const created = parsePumpDevMessage({
+    txType: "create_pool",
+    mint: "MintA",
+    pool: "Pool111",
+    poolBaseReservesUi: 206_900_000,
+    poolQuoteReservesUi: 85,
+  });
+  assert.equal(created?.kind, "graduation");
+  if (created?.kind !== "graduation") return;
+  assert.equal(created.pool, "Pool111");
+  assert.equal(created.baseTokens, 206_900_000);
+  assert.equal(created.quoteSol, 85);
+  const curve = curveSellPrice(30, 1_073_000_000, 1_000);
+  const pool = poolSellPrice(206_900_000, 85, 1_000);
+  assert.ok(curve != null && pool != null);
+  assert.ok(Math.abs(pool! - curve!) / curve! > 0.5);
+
+  const data = new Uint8Array(49);
+  assert.equal(curveCompleteFlag(data), false);
+  data[48] = 1;
+  assert.equal(curveCompleteFlag(data), true);
 });

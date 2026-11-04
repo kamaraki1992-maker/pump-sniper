@@ -70,13 +70,14 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
       mint: string,
       realSol: number,
       reserves?: { vSol: number; vTokens: number } | null,
+      complete?: boolean,
     ) => void;
   } = {
     onCurveReserves: () => {},
   };
   const curveWatch = config.rpcWsUrl
-    ? new RpcCurveWatch(config.rpcWsUrl, log, (mint, realSol, reserves) =>
-        botRef.onCurveReserves(mint, realSol, reserves),
+    ? new RpcCurveWatch(config.rpcWsUrl, log, (mint, realSol, reserves, complete) =>
+        botRef.onCurveReserves(mint, realSol, reserves, complete),
       )
     : undefined;
   let executor: Executor;
@@ -119,7 +120,8 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     ...(curveWatch ? { curveWatch } : {}),
   });
   if (curveWatch) {
-    botRef.onCurveReserves = (mint, realSol, reserves) => bot.onCurveReserves(mint, realSol, reserves);
+    botRef.onCurveReserves = (mint, realSol, reserves, complete) =>
+      bot.onCurveReserves(mint, realSol, reserves, complete);
     curveWatch.start();
   }
   return { config, log, bot, positions, sol, executor, subscription };
@@ -138,6 +140,10 @@ export function attachStream(runtime: Runtime): LiveStream {
   stream.start((event) => {
     if (event.kind === "launch") {
       void runtime.bot.onLaunch(event);
+      return;
+    }
+    if (event.kind === "graduation") {
+      void runtime.bot.onGraduation(event);
       return;
     }
     void runtime.bot.onTrade(event);

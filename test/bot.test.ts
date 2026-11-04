@@ -3,6 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { poolSellPrice } from "../src/pricing.js";
 import { BoughtMints } from "../src/bought.js";
 import { SniperBot } from "../src/bot.js";
 import { loadConfig, type AppConfig } from "../src/config.js";
@@ -728,4 +729,49 @@ test("a 54x stream mark is rejected and the paper sell uses the curve", async ()
   assert.ok(quote > 0);
   assert.ok(quote < 1e-7);
   assert.equal(sells[0]?.reason, "volume_stall");
+});
+
+test("a climb to 10x then a fall sells at the trailing floor", async () => {
+  const { bot, sells, positions } = harness({
+    buy: async () => fill({ price: 1, tokenAmount: 1_000 }),
+  });
+  await bot.onLaunch(launch({ mint: "Climb", priceSol: 1 }));
+  for (const price of [2, 4, 8, 10]) {
+    await bot.onTrade(trade({ mint: "Climb", priceSol: price, signature: `p${price}` }));
+    assert.equal(sells.length, 0);
+  }
+  assert.equal(positions.get("Climb")?.trailFloorPct, 75);
+  await bot.onTrade(trade({ mint: "Climb", priceSol: 1.75, signature: "down" }));
+  assert.equal(sells.length, 1);
+  assert.equal(sells[0]?.reason, "trailing_stop");
+  assert.equal(sells[0]?.quotePriceSol, 1.75);
+});
+
+test("a graduated position waits for a pool quote and does not fill at the curve", async () => {
+  let now = Date.parse("2026-11-04T20:35:47.000Z");
+  const { bot, sells, log } = harness({
+    capture: true,
+    now: () => new Date(now),
+    buy: async () => fill({ price: 1, tokenAmount: 1_000 }),
+  });
+  await bot.onLaunch(launch({ mint: "Grad", priceSol: 1, vSolSol: 30, vTokens: 1_073_000_000 }));
+  await bot.onGraduation({ kind: "graduation", mint: "Grad", pool: "Pool111", baseTokens: null, quoteSol: null });
+  now += 135_000;
+  await bot.checkHolds();
+  assert.equal(sells.length, 0);
+  assert.ok((log as ListLogger).entries.some((entry) => entry.message === "unpriced"));
+
+  await bot.onGraduation({
+    kind: "graduation",
+    mint: "Grad",
+    pool: "Pool111",
+    baseTokens: 1_000_000,
+    quoteSol: 2,
+  });
+  assert.equal(sells.length, 1);
+  assert.equal(sells[0]?.pool, "pump-amm");
+  const expected = poolSellPrice(1_000_000, 2, 1_000);
+  assert.ok(expected != null);
+  assert.equal(sells[0]?.quotePriceSol, expected);
+  assert.ok((sells[0]?.quotePriceSol ?? 0) > 1e-6);
 });

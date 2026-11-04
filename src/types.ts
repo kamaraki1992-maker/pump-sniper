@@ -48,9 +48,21 @@ export interface MarketTrade {
   vSolSol: number | null;
   /** Virtual token reserves, in display tokens, when the trade carried them. */
   vTokens?: number | null;
+  venue?: "curve" | "pumpswap";
+  poolBaseTokens?: number | null;
+  poolQuoteSol?: number | null;
 }
 
-export type MarketEvent = MarketLaunch | MarketTrade;
+/** Curve `complete` or PumpSwap `create_pool`. Pricing leaves the bonding curve. */
+export interface MarketGraduation {
+  kind: "graduation";
+  mint: string;
+  pool: string | null;
+  baseTokens: number | null;
+  quoteSol: number | null;
+}
+
+export type MarketEvent = MarketLaunch | MarketTrade | MarketGraduation;
 
 export interface OrderRequest {
   mint: string;
@@ -64,6 +76,8 @@ export interface OrderRequest {
   slippagePct: number;
   reason: TradeReason;
   tokenAmount?: number;
+  /** Set on a graduated sell so the bundle is built against PumpSwap. */
+  pool?: "pump-amm" | "auto";
 }
 
 export interface FillResult {
@@ -136,6 +150,15 @@ export interface Position {
   trailFloorPct?: number | null;
   /** Trades applied to this position. Zero means the trade subscription delivered nothing. */
   tradesSeen?: number;
+  /** Bonding curve completed or a PumpSwap pool was observed. */
+  graduated?: boolean;
+  pool?: string | null;
+  /** PumpSwap base reserve, display tokens. */
+  poolBaseTokens?: number | null;
+  /** PumpSwap quote reserve, SOL. */
+  poolQuoteSol?: number | null;
+  /** Graduated, but no pool reserves yet. Sells wait for the next pool quote. */
+  unpriced?: boolean;
 }
 
 export interface Executor {

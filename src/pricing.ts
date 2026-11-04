@@ -57,10 +57,10 @@ export function spotFromReserves(vSol: number, vTokens: number): number | null {
   return vSol / vTokens;
 }
 
+/** Upward gaps above this multiple are rejected. Drops are kept so a stop can see them. */
 function jumpsTooFar(previous: number | null, next: number): boolean {
   if (previous == null || !(previous > 0)) return false;
-  const ratio = next / previous;
-  return ratio > MARK_JUMP_LIMIT || ratio < 1 / MARK_JUMP_LIMIT;
+  return next / previous > MARK_JUMP_LIMIT;
 }
 
 function agrees(a: number, b: number): boolean {
@@ -115,13 +115,58 @@ export function assessMark(input: {
   return { accept: true, price: candidate, vSol, vTokens };
 }
 
+/** Average SOL per token for selling `tokenAmount` into a constant-product pool. */
+export function constantProductSellPrice(
+  base: number | null | undefined,
+  quote: number | null | undefined,
+  tokenAmount: number,
+): number | null {
+  if (base == null || quote == null || !(base > 0) || !(quote > 0) || !(tokenAmount > 0)) return null;
+  const out = quote - (base * quote) / (base + tokenAmount);
+  if (!(out > 0) || !Number.isFinite(out)) return null;
+  return out / tokenAmount;
+}
+
 /** Average SOL per token for selling `tokenAmount` into the constant-product curve. */
 export function curveSellPrice(vSol: number | null | undefined, vTokens: number | null | undefined, tokenAmount: number): number | null {
-  if (vSol == null || vTokens == null || !reservesOnCurve(vSol, vTokens) || !(tokenAmount > 0)) return null;
-  const k = vSol * vTokens;
-  const out = vSol - k / (vTokens + tokenAmount);
-  if (!(out > 0)) return null;
-  return out / tokenAmount;
+  if (vSol == null || vTokens == null || !reservesOnCurve(vSol, vTokens)) return null;
+  return constantProductSellPrice(vTokens, vSol, tokenAmount);
+}
+
+/** PumpSwap spot. `baseTokens` is the display token reserve, `quoteSol` is the SOL reserve. */
+export function poolSpot(baseTokens: number | null | undefined, quoteSol: number | null | undefined): number | null {
+  if (baseTokens == null || quoteSol == null || !(baseTokens > 0) || !(quoteSol > 0)) return null;
+  return quoteSol / baseTokens;
+}
+
+export function poolSellPrice(
+  baseTokens: number | null | undefined,
+  quoteSol: number | null | undefined,
+  tokenAmount: number,
+): number | null {
+  return constantProductSellPrice(baseTokens, quoteSol, tokenAmount);
+}
+
+export interface PoolReserves {
+  baseTokens: number | null;
+  quoteSol: number | null;
+  pool: string | null;
+}
+
+/** Pull PumpSwap reserves off a create_pool or pumpswap trade. Raw fields are lamports and base units. */
+export function poolReservesFromRecord(record: Record<string, unknown>): PoolReserves {
+  const pool = asString(record.pool) ?? asString(record.canonicalPool);
+  const baseUi = asNumber(record.poolBaseReservesUi);
+  const quoteUi = asNumber(record.poolQuoteReservesUi);
+  if (baseUi != null && quoteUi != null && baseUi > 0 && quoteUi > 0) {
+    return { baseTokens: baseUi, quoteSol: quoteUi, pool };
+  }
+  const baseRaw = asNumber(record.poolBaseReserves);
+  const quoteRaw = asNumber(record.poolQuoteReserves);
+  if (baseRaw != null && quoteRaw != null && baseRaw > 0 && quoteRaw > 0) {
+    return { baseTokens: baseRaw / 1e6, quoteSol: quoteRaw / 1e9, pool };
+  }
+  return { baseTokens: null, quoteSol: null, pool };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -183,7 +228,20 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
     return launch;
   }
 
+  if (txType === "complete" || txType === "create_pool") {
+    const pool = poolReservesFromRecord(record);
+    return {
+      kind: "graduation",
+      mint,
+      pool: pool.pool,
+      baseTokens: pool.baseTokens,
+      quoteSol: pool.quoteSol,
+    };
+  }
+
   if (txType === "buy" || txType === "sell") {
+    const pool = poolReservesFromRecord(record);
+    const pumpswap = record.source === "pumpswap";
     const trade: MarketTrade = {
       kind: "trade",
       mint,
@@ -195,6 +253,7 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
       marketCapSol: priced.marketCapSol,
       vSolSol,
       vTokens,
+      ...(pumpswap ? { venue: "pumpswap" as const, poolBaseTokens: pool.baseTokens, poolQuoteSol: pool.quoteSol } : {}),
     };
     return trade;
   }

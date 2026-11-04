@@ -20,6 +20,11 @@ export function realSolFromCurveData(data: Uint8Array): number | null {
   return sol;
 }
 
+/** Byte 48 is the bonding-curve `complete` flag. Set when the curve has migrated. */
+export function curveCompleteFlag(data: Uint8Array): boolean {
+  return data.byteLength > 48 && data[48] === 1;
+}
+
 /** Virtual SOL and virtual tokens from the same account. Price is sol/tokens, not real SOL. */
 export function virtualReservesFromCurveData(data: Uint8Array): { vSol: number; vTokens: number } | null {
   if (data.byteLength < 24) return null;
@@ -75,6 +80,7 @@ export class RpcCurveWatch {
     mint: string,
     realSol: number,
     reserves: { vSol: number; vTokens: number } | null,
+    complete?: boolean,
   ) => void,
     private readonly sockets: (url: string) => RpcSocket = defaultSocket,
     private readonly backoff: (attempt: number) => number = nextBackoffMs,
@@ -199,7 +205,8 @@ export class RpcCurveWatch {
     const bytes = Buffer.from(encoded, "base64");
     const sol = realSolFromCurveData(bytes);
     if (sol === null) return;
-    this.onReserves(mint, sol, virtualReservesFromCurveData(bytes));
+    const complete = curveCompleteFlag(bytes);
+    this.onReserves(mint, sol, virtualReservesFromCurveData(bytes), complete);
   }
 
   private schedule(): void {
