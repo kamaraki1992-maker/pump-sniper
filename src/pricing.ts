@@ -43,8 +43,11 @@ export function priceFromMarketCap(marketCapSol: number): number | null {
 
 /** Initial pump.fun virtual reserves. k stays on this product for the life of the curve. */
 export const PUMP_CURVE_K = 30 * 1_073_000_000;
-/** One update may not move the mark by more than this multiple. */
+/** One unconfirmed update may not move the mark by more than this multiple. */
 export const MARK_JUMP_LIMIT = 5;
+/** First seconds after entry: a print this large is still a real pump. 54x launch prints stay out. */
+export const EARLY_MARK_JUMP_LIMIT = 10;
+export const EARLY_MARK_MS = 15_000;
 
 export function reservesOnCurve(vSol: number, vTokens: number): boolean {
   if (!(vSol > 0) || !(vTokens > 0) || !Number.isFinite(vSol) || !Number.isFinite(vTokens)) return false;
@@ -58,9 +61,9 @@ export function spotFromReserves(vSol: number, vTokens: number): number | null {
 }
 
 /** Upward gaps above this multiple are rejected. Drops are kept so a stop can see them. */
-function jumpsTooFar(previous: number | null, next: number): boolean {
+function jumpsTooFar(previous: number | null, next: number, limit = MARK_JUMP_LIMIT): boolean {
   if (previous == null || !(previous > 0)) return false;
-  return next / previous > MARK_JUMP_LIMIT;
+  return next / previous > limit;
 }
 
 function agrees(a: number, b: number): boolean {
@@ -78,9 +81,10 @@ export interface MarkAssessment {
 }
 
 /**
- * A print is usable only when it agrees with this mint's bonding-curve reserves
- * and does not jump more than 5x from the previous mark. Reserves that leave
- * the pump constant-product curve are ignored.
+ * Bonding-curve reserves that moved are the mark, including a fast pump or a
+ * drop through a floor. A print that disagrees with reserves is ignored, except
+ * during the first seconds, when a jump of at most 10x is a real pump whose
+ * curve fields have not caught up. A 54x print against launch reserves is not.
  */
 export function assessMark(input: {
   previous: number | null;
@@ -89,27 +93,37 @@ export function assessMark(input: {
   vTokens: number | null;
   nextVSol?: number | null;
   nextVTokens?: number | null;
+  /** Position is still inside EARLY_MARK_MS. Allows one unconfirmed pump. */
+  early?: boolean;
 }): MarkAssessment {
   const previous = input.previous != null && input.previous > 0 ? input.previous : null;
   let vSol = input.vSol;
   let vTokens = input.vTokens;
+  const trustedSpot = vSol != null && vTokens != null ? spotFromReserves(vSol, vTokens) : null;
   const nextSol = input.nextVSol ?? null;
   const nextTok = input.nextVTokens ?? null;
-  if (nextSol != null && nextTok != null) {
-    const nextSpot = spotFromReserves(nextSol, nextTok);
-    if (nextSpot != null && !jumpsTooFar(previous, nextSpot)) {
-      vSol = nextSol;
-      vTokens = nextTok;
-    }
+  const nextSpot = nextSol != null && nextTok != null ? spotFromReserves(nextSol, nextTok) : null;
+  if (nextSpot != null && nextSol != null && nextTok != null && trustedSpot != null) {
+    const moved = Math.abs(nextSpot - trustedSpot) / trustedSpot > 1e-4;
+    if (moved) return { accept: true, price: nextSpot, vSol: nextSol, vTokens: nextTok };
+  }
+  if (nextSpot != null && nextSol != null && nextTok != null && !jumpsTooFar(previous, nextSpot)) {
+    vSol = nextSol;
+    vTokens = nextTok;
   }
   const reservePrice = vSol != null && vTokens != null ? spotFromReserves(vSol, vTokens) : null;
   const proposed = input.proposed != null && input.proposed > 0 ? input.proposed : null;
   if (proposed != null && reservePrice != null && !agrees(proposed, reservePrice)) {
+    const limit = input.early ? EARLY_MARK_JUMP_LIMIT : MARK_JUMP_LIMIT;
+    if (input.early && !jumpsTooFar(previous, proposed, limit)) {
+      return { accept: true, price: proposed, vSol: input.vSol, vTokens: input.vTokens };
+    }
     return { accept: false, price: previous, vSol: input.vSol, vTokens: input.vTokens };
   }
   const candidate = reservePrice ?? proposed;
   if (candidate == null) return { accept: false, price: previous, vSol: input.vSol, vTokens: input.vTokens };
-  if (jumpsTooFar(previous, candidate)) {
+  const limit = input.early ? EARLY_MARK_JUMP_LIMIT : MARK_JUMP_LIMIT;
+  if (jumpsTooFar(previous, candidate, limit)) {
     return { accept: false, price: previous, vSol: input.vSol, vTokens: input.vTokens };
   }
   return { accept: true, price: candidate, vSol, vTokens };

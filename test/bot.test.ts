@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { poolSellPrice } from "../src/pricing.js";
+import { curveSellPrice, poolSellPrice } from "../src/pricing.js";
 import { BoughtMints } from "../src/bought.js";
 import { SniperBot } from "../src/bot.js";
 import { loadConfig, type AppConfig } from "../src/config.js";
@@ -727,8 +727,9 @@ function trade(partial: Partial<MarketTrade> & { mint: string; priceSol: number 
     signature: partial.signature ?? "t",
     solQuoted: true,
     priceSol: partial.priceSol,
-    marketCapSol: 30,
-    vSolSol: null,
+    marketCapSol: partial.marketCapSol ?? 30,
+    vSolSol: partial.vSolSol ?? null,
+    ...(partial.vTokens != null ? { vTokens: partial.vTokens } : {}),
   };
 }
 
@@ -882,6 +883,76 @@ test("a 54x stream mark is rejected and the paper sell uses the curve", async ()
   assert.ok(quote > 0);
   assert.ok(quote < 1e-7);
   assert.equal(sells[0]?.reason, "volume_stall");
+});
+
+test("a fast drop through the floor sells on that update at those reserves", async () => {
+  const launchTokens = 1_073_000_000;
+  const launchSpot = 30 / launchTokens;
+  const k = 30 * launchTokens;
+  const at = (multiple: number) => {
+    const spot = launchSpot * multiple;
+    const vTokens = Math.sqrt(k / spot);
+    return { spot, vSol: spot * vTokens, vTokens };
+  };
+  const high = at(3.3);
+  const low = at(1.7);
+  const { bot, sells, log } = harness({
+    capture: true,
+    buy: async () => fill({ price: launchSpot, tokenAmount: 1_000_000 }),
+  });
+  await bot.onLaunch(launch({ mint: "Gap", priceSol: launchSpot, vSolSol: 30, vTokens: launchTokens }));
+  await bot.onTrade(
+    trade({
+      mint: "Gap",
+      priceSol: high.spot,
+      vSolSol: high.vSol,
+      vTokens: high.vTokens,
+      signature: "up",
+    }),
+  );
+  assert.equal(sells.length, 0);
+  await bot.onTrade(
+    trade({
+      mint: "Gap",
+      priceSol: high.spot,
+      vSolSol: low.vSol,
+      vTokens: low.vTokens,
+      signature: "down",
+    }),
+  );
+  assert.equal(sells.length, 1);
+  assert.equal(sells[0]?.reason, "trailing_stop");
+  const expected = curveSellPrice(low.vSol, low.vTokens, 1_000_000);
+  assert.ok(expected != null);
+  assert.ok(Math.abs((sells[0]?.quotePriceSol ?? 0) - expected) < 1e-12);
+  const sold = (log as ListLogger).entries.find((entry) => entry.message === "sell filled");
+  assert.equal(sold?.fields?.triggerMarkSol, low.spot);
+  assert.equal(sold?.fields?.fillPriceSol, sells[0]?.quotePriceSol);
+});
+
+test("a legit 5x pump in the first seconds is accepted", async () => {
+  const launchTokens = 1_073_000_000;
+  const launchSpot = 30 / launchTokens;
+  const { bot, positions, log } = harness({
+    capture: true,
+    buy: async () => fill({ price: launchSpot, tokenAmount: 1_000 }),
+  });
+  await bot.onLaunch(launch({ mint: "Early", priceSol: launchSpot, vSolSol: 30, vTokens: launchTokens }));
+  const pumped = launchSpot * 5.3;
+  await bot.onTrade(
+    trade({
+      mint: "Early",
+      priceSol: pumped,
+      vSolSol: 30,
+      vTokens: launchTokens,
+      signature: "pump",
+    }),
+  );
+  assert.equal(positions.get("Early")?.lastMarkPriceSol, pumped);
+  assert.equal(
+    (log as ListLogger).entries.some((entry) => entry.message === "mark_rejected"),
+    false,
+  );
 });
 
 test("a climb to 10x then a fall sells at the trailing floor", async () => {

@@ -7,7 +7,7 @@ import type { FilterDecision } from "./filter.js";
 import { holdDecision } from "./filter.js";
 import { Logger } from "./logger.js";
 import type { PositionBook } from "./positions.js";
-import { assessMark, curveBuyPrice, curveSellPrice, poolSellPrice, poolSpot, reservesOnCurve, TOTAL_SUPPLY_TOKENS } from "./pricing.js";
+import { assessMark, curveBuyPrice, curveSellPrice, EARLY_MARK_MS, poolSellPrice, poolSpot, reservesOnCurve, TOTAL_SUPPLY_TOKENS } from "./pricing.js";
 import type { TradeLog } from "./report.js";
 import { decideExit, nextTrailFloor, reservesDropped } from "./risk.js";
 import type { SafetyCheckResult } from "./safety.js";
@@ -283,8 +283,10 @@ export class SniperBot {
       await this.afterMark(position, "pool");
       return;
     }
-    if (trade.vSolSol !== null && trade.vSolSol > 0) position.lastVSolSol = trade.vSolSol;
     this.applyMark(position, trade.priceSol, trade.vSolSol, trade.vTokens ?? null);
+    if ((trade.vTokens == null || !(trade.vTokens > 0)) && trade.vSolSol !== null && trade.vSolSol > 0) {
+      position.lastVSolSol = trade.vSolSol;
+    }
     await this.afterMark(position, "trade");
   }
 
@@ -458,6 +460,8 @@ export class SniperBot {
             reason,
             realizedPnlSol: realized,
             signature: fill.signature,
+            triggerMarkSol: quote,
+            fillPriceSol: fill.price,
             ...(reason === "volume_stall" ? { tradesSeen: current.tradesSeen ?? 0 } : {}),
           });
           return;
@@ -483,8 +487,12 @@ export class SniperBot {
   private sellQuote(position: Position, mark: number): number | null {
     if (position.graduated) return poolSellPrice(position.poolBaseTokens, position.poolQuoteSol, position.tokenAmount);
     if (this.deps.config.mode !== "paper") return mark > 0 ? mark : position.lastMarkPriceSol;
-    const curve = curveSellPrice(position.lastVSolSol, position.lastVTokens, position.tokenAmount);
-    if (curve != null && curve > 0) return curve;
+    const vSol = position.lastVSolSol;
+    const vTokens = position.lastVTokens;
+    const curve = curveSellPrice(vSol, vTokens, position.tokenAmount);
+    const spot = vSol != null && vTokens != null && vTokens > 0 ? vSol / vTokens : null;
+    const sameReserves = spot != null && mark > 0 && spot / mark >= 0.95 && spot / mark <= 1.05;
+    if (curve != null && curve > 0 && sameReserves) return curve;
     return mark > 0 ? mark : position.lastMarkPriceSol;
   }
 
@@ -538,6 +546,8 @@ export class SniperBot {
     nextVSol: number | null,
     nextVTokens: number | null,
   ): void {
+    const openedAtMs = Date.parse(position.openedAt);
+    const ageMs = this.deps.now().getTime() - openedAtMs;
     const decision = assessMark({
       previous: position.lastMarkPriceSol,
       proposed,
@@ -545,6 +555,7 @@ export class SniperBot {
       vTokens: position.lastVTokens ?? null,
       nextVSol,
       nextVTokens,
+      early: Number.isFinite(openedAtMs) && ageMs >= 0 && ageMs <= EARLY_MARK_MS,
     });
     if (!decision.accept) {
       this.deps.log.info("mark_rejected", {
