@@ -28,6 +28,7 @@ test("defaults match the risk spec", () => {
   assert.equal(cfg.takeProfitPct, 50);
   assert.equal(cfg.stopLossPct, 15);
   assert.equal(cfg.maxOpenPositions, 1);
+  assert.equal(cfg.maxHoldMinutes, 10);
 });
 
 test("buy size, slippage, and tip hard caps refuse startup", () => {

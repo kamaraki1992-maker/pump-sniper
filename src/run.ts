@@ -104,6 +104,7 @@ export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promis
     takeProfitPct: config.takeProfitPct,
     stopLossPct: config.stopLossPct,
     maxOpenPositions: config.maxOpenPositions,
+    maxHoldMinutes: config.maxHoldMinutes,
   });
   const stream = attachStream(runtime);
   let stopped = false;
@@ -125,8 +126,12 @@ export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promis
     void sol.refresh();
     positions.save(sol.price(), config.paper, new Date().toISOString());
   }, 5_000);
+  const holdWatch = setInterval(() => {
+    void bot.checkHolds();
+  }, 1_000);
   stopWatch.unref();
   priceWatch.unref();
+  holdWatch.unref();
   if (options.maxRuntimeMs && options.maxRuntimeMs > 0) {
     const timer = setTimeout(() => shutdown("max-runtime"), options.maxRuntimeMs);
     timer.unref();

@@ -4,7 +4,7 @@ import { holdDecision } from "./filter.js";
 import { Logger } from "./logger.js";
 import type { PositionBook } from "./positions.js";
 import type { TradeLog } from "./report.js";
-import { exitSignal } from "./risk.js";
+import { decideExit } from "./risk.js";
 import type { Executor, MarketLaunch, MarketTrade, OrderRequest, Position, TradeReason } from "./types.js";
 
 export interface BotDeps {
@@ -158,17 +158,33 @@ export class SniperBot {
     const position = this.deps.positions.get(trade.mint);
     if (!position || !(trade.priceSol && trade.priceSol > 0)) return;
     position.lastMarkPriceSol = trade.priceSol;
-    if (this.selling.has(trade.mint)) return;
-    const cooldown = this.cooldownUntil.get(trade.mint) ?? 0;
+    await this.maybeExit(position, trade.priceSol);
+  }
+
+  /** Timer entry. Sells a quiet position once max hold elapses, without a new trade. */
+  async checkHolds(): Promise<void> {
+    if (this.stopped) return;
+    for (const position of this.deps.positions.list()) {
+      await this.maybeExit(position, position.lastMarkPriceSol);
+    }
+  }
+
+  private async maybeExit(position: Position, quote: number): Promise<void> {
+    if (this.selling.has(position.mint)) return;
+    const cooldown = this.cooldownUntil.get(position.mint) ?? 0;
     if (this.deps.now().getTime() < cooldown) return;
-    const signal = exitSignal(
-      position.entryPriceSol,
-      trade.priceSol,
-      this.deps.config.takeProfitPct,
-      this.deps.config.stopLossPct,
-    );
+    const openedAtMs = Date.parse(position.openedAt);
+    const signal = decideExit({
+      entryPrice: position.entryPriceSol,
+      markPrice: quote,
+      takeProfitPct: this.deps.config.takeProfitPct,
+      stopLossPct: this.deps.config.stopLossPct,
+      openedAtMs,
+      nowMs: this.deps.now().getTime(),
+      maxHoldMs: this.deps.config.maxHoldMinutes * 60_000,
+    });
     if (!signal) return;
-    await this.sellPosition(position, signal, trade.priceSol);
+    await this.sellPosition(position, signal, quote > 0 ? quote : position.lastMarkPriceSol);
   }
 
   async panicSell(): Promise<void> {

@@ -43,6 +43,7 @@ export interface AppConfig {
   priorityFeeSol: number;
   creatorMaxHoldPct: number;
   maxOpenPositions: number;
+  maxHoldMinutes: number;
   wsUrl: string;
   tradeApiUrl: string;
   rpcUrl: string;
@@ -104,6 +105,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const priorityFeeSol = num(env.PRIORITY_FEE_SOL, 0.00005, "PRIORITY_FEE_SOL");
   const creatorMaxHoldPct = num(env.CREATOR_MAX_HOLD_PCT, 10, "CREATOR_MAX_HOLD_PCT");
   const maxOpenPositions = num(env.MAX_OPEN_POSITIONS, 1, "MAX_OPEN_POSITIONS");
+  const maxHoldMinutes = num(env.MAX_HOLD_MINUTES, 10, "MAX_HOLD_MINUTES");
   const paperSlippagePct = num(env.PAPER_SLIPPAGE_PCT, 2, "PAPER_SLIPPAGE_PCT");
   const protocolFeeBps = num(env.PAPER_PROTOCOL_FEE_BPS, 100, "PAPER_PROTOCOL_FEE_BPS");
   const venueFeeBps = num(env.PAPER_VENUE_FEE_BPS, 25, "PAPER_VENUE_FEE_BPS");
@@ -147,6 +149,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       `MAX_OPEN_POSITIONS ${maxOpenPositions} exceeds hard cap ${HARD_CAPS.maxOpenPositions}`,
     );
   }
+  if (!(maxHoldMinutes > 0)) {
+    throw new ConfigError("MAX_HOLD_MINUTES must be positive");
+  }
   if (!(paperSlippagePct >= 0) || paperSlippagePct > maxSlippagePct) {
     throw new ConfigError("PAPER_SLIPPAGE_PCT must be between 0 and MAX_SLIPPAGE_PCT");
   }
@@ -173,6 +178,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     priorityFeeSol,
     creatorMaxHoldPct,
     maxOpenPositions,
+    maxHoldMinutes,
     wsUrl: str(env.WS_URL, "wss://pumpdev.io/ws"),
     tradeApiUrl: str(env.TRADE_API_URL, "https://pumpdev.io/api/bundle"),
     rpcUrl: str(env.RPC_URL, "https://api.mainnet-beta.solana.com"),

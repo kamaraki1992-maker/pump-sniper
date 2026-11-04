@@ -59,6 +59,7 @@ function harness(options: {
   config?: Partial<AppConfig>;
   walletBalanceSol?: () => Promise<number>;
   capture?: boolean;
+  now?: () => Date;
 }) {
   const dir = mkdtempSync(join(tmpdir(), "sniper-bot-"));
   const config = { ...loadConfig({ DATA_DIR: dir }), ...options.config, dataDir: dir };
@@ -83,7 +84,7 @@ function harness(options: {
     trades,
     log,
     solUsd: () => 100,
-    now: () => new Date("2026-11-04T12:00:00.000Z"),
+    now: options.now ?? (() => new Date("2026-11-04T12:00:00.000Z")),
     sleep: async () => {},
     subscribeMint: () => {},
     ...(options.walletBalanceSol ? { walletBalanceSol: options.walletBalanceSol } : {}),
@@ -280,4 +281,66 @@ test("live mode skips a buy the wallet cannot cover, and paper mode does not", a
   await paper.bot.onLaunch(launch({ mint: "Paper" }));
   assert.equal(paperBuys, 1);
   assert.equal(paper.positions.list().length, 1);
+});
+
+test("a quiet position times out with no price update, and the slot frees only after the sell fills", async () => {
+  let now = Date.parse("2026-11-04T12:00:00.000Z");
+  let attempts = 0;
+  const { bot, positions, trades } = harness({
+    now: () => new Date(now),
+    config: { sellMaxAttempts: 1 },
+    buy: async () => fill({ price: 1 }),
+    sell: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return fill({ status: "failed", error: "bundle-not-landed", price: 0, cashflowSol: 0, tokenAmount: 0 });
+      }
+      return fill({ price: 1, cashflowSol: 0.09, sizeSol: 0.09 });
+    },
+  });
+  await bot.onLaunch(launch({ mint: "Quiet", priceSol: 1 }));
+  await bot.checkHolds();
+  assert.equal(attempts, 0);
+  assert.equal(positions.list().length, 1);
+
+  now += 10 * 60_000;
+  await bot.checkHolds();
+  assert.equal(attempts, 1);
+  assert.equal(positions.list().length, 1);
+  const failed = trades.readAll().find((row) => row.reason === "timeout" && row.status === "failed");
+  assert.ok(failed);
+
+  await bot.onLaunch(launch({ mint: "Blocked", priceSol: 1 }));
+  assert.equal(positions.get("Blocked"), undefined);
+
+  now += 6_000;
+  await bot.checkHolds();
+  assert.equal(positions.list().length, 0);
+  const filled = trades.readAll().find((row) => row.reason === "timeout" && row.status === "filled");
+  assert.ok(filled);
+
+  await bot.onLaunch(launch({ mint: "Next", priceSol: 1 }));
+  assert.equal(positions.list().length, 1);
+  assert.equal(positions.get("Next")?.mint, "Next");
+});
+
+test("take profit and stop loss beat a hold that has already expired", async () => {
+  let now = Date.parse("2026-11-04T12:00:00.000Z");
+  const up = harness({
+    now: () => new Date(now),
+    buy: async () => fill({ price: 1 }),
+  });
+  await up.bot.onLaunch(launch({ mint: "Up", priceSol: 1.5 }));
+  now += 10 * 60_000;
+  await up.bot.checkHolds();
+  assert.equal(up.trades.readAll().find((row) => row.side === "sell")?.reason, "tp");
+
+  const down = harness({
+    now: () => new Date(now),
+    buy: async () => fill({ price: 1 }),
+  });
+  await down.bot.onLaunch(launch({ mint: "Down", priceSol: 0.85 }));
+  now += 10 * 60_000;
+  await down.bot.checkHolds();
+  assert.equal(down.trades.readAll().find((row) => row.side === "sell")?.reason, "sl");
 });
