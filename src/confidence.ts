@@ -10,17 +10,23 @@ export interface ConfidenceBreakdown {
   flow: number;
   /** 1 when the safety check passed, otherwise 0. */
   safety: number;
-  /** Product of the three signals, capped at 0.5 unless flow is net buying and safety passed. */
+  /** Hold and safety set the base. Net buy flow scales it toward 1. */
   raw: number;
   /** `raw` squared. This is what maps onto the USD size range. */
   score: number;
 }
 
 /**
- * Conservative 0-1 score. Signals are multiplied, so any missing one pulls
- * the result toward 0. The product cannot exceed 0.5 unless early flow is
- * net buying and the safety check passed. Squaring then keeps ordinary
- * tokens near the floor of the size range.
+ * No-flow weight. Squared, a clean safety-pass with no creator hold maps to
+ * a score of 0.28, which is $12 on the $5..$30 line. Net buy flow fills the
+ * rest of the way to 1.
+ */
+const NO_FLOW_WEIGHT = Math.sqrt(0.28);
+
+/**
+ * Hold and safety set a base near the middle of the size range. Net buy flow
+ * scales that base up to 1. Without safety the score is 0. Without net buying
+ * the raw value stays at or below `NO_FLOW_WEIGHT`.
  */
 export function confidenceBreakdown(input: {
   holdPct: number;
@@ -34,9 +40,9 @@ export function confidenceBreakdown(input: {
   const prints = buys + sells;
   const flow = buys > 0 && prints > 0 ? clamp01(buys / prints) : 0;
   const safety = input.safetyOk ? 1 : 0;
-  let raw = hold * flow * safety;
-  const strong = buys > sells && buys > 0 && input.safetyOk;
-  if (!strong) raw = Math.min(raw, 0.5);
+  const netFlow = buys > sells && buys > 0 ? flow : 0;
+  let raw = safety * hold * (NO_FLOW_WEIGHT + (1 - NO_FLOW_WEIGHT) * netFlow);
+  if (!(input.safetyOk && netFlow > 0)) raw = Math.min(raw, NO_FLOW_WEIGHT);
   return { hold, flow, safety, raw, score: clamp01(raw * raw) };
 }
 

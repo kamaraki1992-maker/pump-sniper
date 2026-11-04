@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { decideExit, exitSignal, FULL_EXIT_FRACTION, nextTrailFloor, type TrailTier } from "../src/risk.js";
 
 const tiers: TrailTier[] = [
+  { activatePct: 15, floorPct: 5 },
   { activatePct: 30, floorPct: 15 },
   { activatePct: 50, floorPct: 35 },
   { activatePct: 100, floorPct: 75 },
@@ -40,7 +41,9 @@ test("take profit at 0 is disabled and does not sell a flat or higher mark", () 
 });
 
 test("each profit-lock tier ratchets the floor and never lowers it", () => {
-  assert.equal(nextTrailFloor(1, 1.29, tiers, null), null);
+  assert.equal(nextTrailFloor(1, 1.14, tiers, null), null);
+  assert.equal(nextTrailFloor(1, 1.15, tiers, null), 5);
+  assert.equal(nextTrailFloor(1, 1.29, tiers, null), 5);
   assert.equal(nextTrailFloor(1, 1.3, tiers, null), 15);
   assert.equal(nextTrailFloor(1, 1.5, tiers, null), 35);
   assert.equal(nextTrailFloor(1, 2, tiers, null), 75);
@@ -58,6 +61,8 @@ test("a locked floor sells at entry times that floor, and take profit still wins
     maxHoldMs: 10 * 60_000,
   };
   assert.equal(decideExit({ ...held, markPrice: 1.3, trailFloorPct: 15 }), null);
+  assert.equal(decideExit({ ...held, markPrice: 1.05, trailFloorPct: 5 }), "trailing_stop");
+  assert.equal(decideExit({ ...held, markPrice: 1.06, trailFloorPct: 5 }), null);
   assert.equal(decideExit({ ...held, markPrice: 1.15, trailFloorPct: 15 }), "trailing_stop");
   assert.equal(decideExit({ ...held, markPrice: 1.5, trailFloorPct: 35 }), null);
   assert.equal(decideExit({ ...held, markPrice: 1.35, trailFloorPct: 35 }), "trailing_stop");

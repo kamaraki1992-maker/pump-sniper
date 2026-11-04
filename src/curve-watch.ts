@@ -20,6 +20,16 @@ export function realSolFromCurveData(data: Uint8Array): number | null {
   return sol;
 }
 
+/** Virtual SOL and virtual tokens from the same account. Price is sol/tokens, not real SOL. */
+export function virtualReservesFromCurveData(data: Uint8Array): { vSol: number; vTokens: number } | null {
+  if (data.byteLength < 24) return null;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const vTokensRaw = Number(view.getBigUint64(8, true));
+  const vSolLamports = Number(view.getBigUint64(16, true));
+  if (!(vTokensRaw > 0) || !(vSolLamports > 0)) return null;
+  return { vSol: vSolLamports / 1e9, vTokens: vTokensRaw / 1e6 };
+}
+
 export function bondingCurveAddress(mint: string, hinted: string | null): string | null {
   if (hinted && hinted.length > 0) return hinted;
   try {
@@ -61,7 +71,11 @@ export class RpcCurveWatch {
   constructor(
     private readonly url: string | null,
     private readonly log: Logger,
-    private readonly onReserves: (mint: string, realSol: number) => void,
+    private readonly onReserves: (
+    mint: string,
+    realSol: number,
+    reserves: { vSol: number; vTokens: number } | null,
+  ) => void,
     private readonly sockets: (url: string) => RpcSocket = defaultSocket,
     private readonly backoff: (attempt: number) => number = nextBackoffMs,
   ) {}
@@ -182,9 +196,10 @@ export class RpcCurveWatch {
     const mint = this.bySub.get(sub);
     const encoded = message.params?.result?.value?.data?.[0];
     if (!mint || typeof encoded !== "string") return;
-    const sol = realSolFromCurveData(Buffer.from(encoded, "base64"));
+    const bytes = Buffer.from(encoded, "base64");
+    const sol = realSolFromCurveData(bytes);
     if (sol === null) return;
-    this.onReserves(mint, sol);
+    this.onReserves(mint, sol, virtualReservesFromCurveData(bytes));
   }
 
   private schedule(): void {

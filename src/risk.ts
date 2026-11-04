@@ -44,10 +44,9 @@ export function nextTrailFloor(
   current: number | null,
 ): number | null {
   if (!(entry > 0) || !(peak > 0)) return current;
-  const gain = peak / entry - 1;
   let floor = current;
   for (const tier of tiers) {
-    if (!(tier.activatePct > 0) || gain < tier.activatePct / 100) continue;
+    if (!(tier.activatePct > 0) || peak / entry + 1e-9 < 1 + tier.activatePct / 100) continue;
     floor = floor == null ? tier.floorPct : Math.max(floor, tier.floorPct);
   }
   return floor;

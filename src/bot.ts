@@ -1,3 +1,4 @@
+import type { BoughtMints } from "./bought.js";
 import { bondingCurveAddress } from "./curve-watch.js";
 import { confidenceBreakdown, sizeFromConfidence, type ConfidenceBreakdown } from "./confidence.js";
 import { clampBuyUsd, requiredBuyBalanceSol, type AppConfig } from "./config.js";
@@ -6,7 +7,7 @@ import type { FilterDecision } from "./filter.js";
 import { holdDecision } from "./filter.js";
 import { Logger } from "./logger.js";
 import type { PositionBook } from "./positions.js";
-import { TOTAL_SUPPLY_TOKENS } from "./pricing.js";
+import { assessMark, curveSellPrice, TOTAL_SUPPLY_TOKENS } from "./pricing.js";
 import type { TradeLog } from "./report.js";
 import { decideExit, nextTrailFloor, reservesDropped } from "./risk.js";
 import type { SafetyCheckResult } from "./safety.js";
@@ -26,6 +27,8 @@ export interface BotDeps {
   sleep: (ms: number) => Promise<void>;
   subscribeMint: (mint: string) => void;
   unsubscribeMint: (mint: string) => void;
+  /** Mints already reserved, including ones whose position has since closed. */
+  bought?: BoughtMints;
   /** Live mode only. Paper mode does not consult a wallet. */
   walletBalanceSol?: () => Promise<number>;
   safetyCheck?: (input: {
@@ -65,6 +68,7 @@ export class SniperBot {
   private stopped = false;
 
   constructor(private readonly deps: BotDeps) {
+    for (const mint of deps.bought?.list() ?? []) this.seen.add(mint);
     for (const position of deps.positions.list()) {
       this.seen.add(position.mint);
       deps.subscribeMint(position.mint);
@@ -78,7 +82,13 @@ export class SniperBot {
 
   async onLaunch(launch: MarketLaunch): Promise<void> {
     if (this.stopped) return;
-    if (this.seen.has(launch.mint) || this.deps.positions.get(launch.mint)) return;
+    if (this.deps.bought?.has(launch.mint)) {
+      this.skip(launch, "already_bought");
+      return;
+    }
+    if (this.seen.has(launch.mint) || this.deps.positions.get(launch.mint) || this.pendingBuys.has(launch.mint)) {
+      return;
+    }
     this.seen.add(launch.mint);
     if (this.occupied() >= this.deps.config.maxOpenPositions) {
       this.skipMaxOpen(launch);
@@ -143,6 +153,7 @@ export class SniperBot {
     }
 
     let held = false;
+    this.deps.bought?.add(launch.mint);
     this.deps.subscribeMint(launch.mint);
     const order: OrderRequest = {
       mint: launch.mint,
@@ -218,6 +229,7 @@ export class SniperBot {
         lastMarkPriceSol: launch.priceSol,
         entryVSolSol: launch.vSolSol,
         lastVSolSol: launch.vSolSol,
+        lastVTokens: launch.vTokens,
         bondingCurve: bondingCurveAddress(launch.mint, launch.bondingCurveKey),
         lastTradeAtMs: this.lastMarketTradeAt.get(launch.mint) ?? this.deps.now().getTime(),
         tradesSeen: 0,
@@ -250,7 +262,7 @@ export class SniperBot {
     position.tradesSeen = (position.tradesSeen ?? 0) + 1;
     position.lastTradeAtMs = now;
     if (trade.vSolSol !== null && trade.vSolSol > 0) position.lastVSolSol = trade.vSolSol;
-    if (trade.priceSol !== null && trade.priceSol > 0) position.lastMarkPriceSol = trade.priceSol;
+    this.applyMark(position, trade.priceSol, trade.vSolSol, trade.vTokens ?? null);
     await this.maybeExit(position, position.lastMarkPriceSol);
   }
 
@@ -263,9 +275,14 @@ export class SniperBot {
   }
 
   /** Bonding-curve account notification. The first sample is the entry baseline. */
-  onCurveReserves(mint: string, realSol: number): void {
+  onCurveReserves(
+    mint: string,
+    realSol: number,
+    reserves?: { vSol: number; vTokens: number } | null,
+  ): void {
     const position = this.deps.positions.get(mint);
     if (!position || this.stopped || !(realSol >= 0)) return;
+    if (reserves) this.applyMark(position, reserves.vSol / reserves.vTokens, reserves.vSol, reserves.vTokens);
     if (position.entryRealSolSol == null) {
       position.entryRealSolSol = realSol;
       position.lastRealSolSol = realSol;
@@ -340,7 +357,7 @@ export class SniperBot {
           symbol: current.symbol,
           creator: current.creator,
           sizeSol: current.costSol,
-          quotePriceSol: quote > 0 ? quote : current.lastMarkPriceSol,
+          quotePriceSol: this.sellQuote(current, quote),
           slippagePct: this.deps.config.maxSlippagePct,
           reason,
           tokenAmount: current.tokenAmount,
@@ -394,6 +411,46 @@ export class SniperBot {
     } finally {
       this.selling.delete(position.mint);
     }
+  }
+
+  /**
+   * Paper fills sell into this mint's bonding curve. A stream mark is only a
+   * signal; it is not the execution price.
+   */
+  private sellQuote(position: Position, mark: number): number {
+    if (this.deps.config.mode !== "paper") return mark > 0 ? mark : position.lastMarkPriceSol;
+    const curve = curveSellPrice(position.lastVSolSol, position.lastVTokens, position.tokenAmount);
+    if (curve != null && curve > 0) return curve;
+    return mark > 0 ? mark : position.lastMarkPriceSol;
+  }
+
+  private applyMark(
+    position: Position,
+    proposed: number | null,
+    nextVSol: number | null,
+    nextVTokens: number | null,
+  ): void {
+    const decision = assessMark({
+      previous: position.lastMarkPriceSol,
+      proposed,
+      vSol: position.lastVSolSol ?? null,
+      vTokens: position.lastVTokens ?? null,
+      nextVSol,
+      nextVTokens,
+    });
+    if (!decision.accept) {
+      this.deps.log.info("mark_rejected", {
+        mint: position.mint,
+        proposed,
+        previous: position.lastMarkPriceSol,
+        vSol: position.lastVSolSol ?? null,
+        vTokens: position.lastVTokens ?? null,
+      });
+      return;
+    }
+    if (decision.price != null && decision.price > 0) position.lastMarkPriceSol = decision.price;
+    if (decision.vSol != null) position.lastVSolSol = decision.vSol;
+    if (decision.vTokens != null) position.lastVTokens = decision.vTokens;
   }
 
   /** USD notional clamped to the hard cap, then SOL at the fresh quote. */

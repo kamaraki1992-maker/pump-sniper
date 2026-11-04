@@ -46,6 +46,8 @@ export interface MarketTrade {
   priceSol: number | null;
   marketCapSol: number | null;
   vSolSol: number | null;
+  /** Virtual token reserves, in display tokens, when the trade carried them. */
+  vTokens?: number | null;
 }
 
 export type MarketEvent = MarketLaunch | MarketTrade;
@@ -121,6 +123,8 @@ export interface Position {
   lastMarkPriceSol: number;
   entryVSolSol?: number | null;
   lastVSolSol?: number | null;
+  /** Virtual token reserves, in display tokens, last accepted for this mint. */
+  lastVTokens?: number | null;
   /** Real SOL reserves sampled from the bonding-curve account. */
   entryRealSolSol?: number | null;
   lastRealSolSol?: number | null;

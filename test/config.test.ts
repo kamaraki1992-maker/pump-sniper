@@ -33,7 +33,7 @@ test("defaults match the risk spec", () => {
   assert.equal(cfg.liqDropPct, 20);
   assert.equal(cfg.volumeStallSec, 45);
   assert.equal(cfg.volumeStallGraceSec, 90);
-  assert.equal(formatTrailTiers(cfg.trailTiers), "30:15,50:35,100:75");
+  assert.equal(formatTrailTiers(cfg.trailTiers), "15:5,30:15,50:35,100:75");
   assert.equal(cfg.sellPressureRatio, 3);
   assert.equal(cfg.safetyCheckTimeoutMs, 250);
   assert.equal(cfg.grpcUrl, null);

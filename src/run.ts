@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { Connection, Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
+import { BoughtMints } from "./bought.js";
 import { SniperBot } from "./bot.js";
 import { RpcCurveWatch } from "./curve-watch.js";
 import { ConfigError, formatTrailTiers, loadConfig, type AppConfig } from "./config.js";
@@ -64,11 +65,19 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
   const sol = new SolPriceFeed(config.solPriceUrl);
   await sol.refresh();
   const history = new RpcCreatorHistory(config, log);
-  const botRef: { onCurveReserves: (mint: string, realSol: number) => void } = {
+  const botRef: {
+    onCurveReserves: (
+      mint: string,
+      realSol: number,
+      reserves?: { vSol: number; vTokens: number } | null,
+    ) => void;
+  } = {
     onCurveReserves: () => {},
   };
   const curveWatch = config.rpcWsUrl
-    ? new RpcCurveWatch(config.rpcWsUrl, log, (mint, realSol) => botRef.onCurveReserves(mint, realSol))
+    ? new RpcCurveWatch(config.rpcWsUrl, log, (mint, realSol, reserves) =>
+        botRef.onCurveReserves(mint, realSol, reserves),
+      )
     : undefined;
   let executor: Executor;
   let walletBalanceSol: (() => Promise<number>) | undefined;
@@ -104,12 +113,13 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     subscribeMint: (mint) => subscription.stream?.subscribeTrades([mint]),
     unsubscribeMint: (mint) => subscription.stream?.unsubscribeTrades([mint]),
+    bought: new BoughtMints(`${config.dataDir}/bought-mints.json`),
     ...(walletBalanceSol ? { walletBalanceSol } : {}),
     safetyCheck: createRpcSafetyCheck(config),
     ...(curveWatch ? { curveWatch } : {}),
   });
   if (curveWatch) {
-    botRef.onCurveReserves = (mint, realSol) => bot.onCurveReserves(mint, realSol);
+    botRef.onCurveReserves = (mint, realSol, reserves) => bot.onCurveReserves(mint, realSol, reserves);
     curveWatch.start();
   }
   return { config, log, bot, positions, sol, executor, subscription };

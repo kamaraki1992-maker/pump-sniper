@@ -82,9 +82,9 @@ function num(value: string | undefined, fallback: number, name: string): number 
   return parsed;
 }
 
-const DEFAULT_TRAIL_TIERS = "30:15,50:35,100:75";
+const DEFAULT_TRAIL_TIERS = "15:5,30:15,50:35,100:75";
 
-/** "30:15,50:35,100:75" locks a +15% floor at +30% peak, +35% at +50%, and +75% at +100%. */
+/** "15:5,30:15,50:35,100:75" locks +5% at +15% peak, then +15%, +35%, and +75%. */
 export function parseTrailTiers(value: string | undefined): TrailTier[] {
   const text = value === undefined || value.trim() === "" ? DEFAULT_TRAIL_TIERS : value.trim();
   const tiers: TrailTier[] = [];

@@ -3,6 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { BoughtMints } from "../src/bought.js";
 import { SniperBot } from "../src/bot.js";
 import { loadConfig, type AppConfig } from "../src/config.js";
 import type { FilterDecision } from "../src/filter.js";
@@ -74,6 +75,7 @@ function harness(options: {
     unwatch(mint: string): void;
     isLive(mint: string): boolean;
   };
+  bought?: BoughtMints;
 }) {
   const dir = mkdtempSync(join(tmpdir(), "sniper-bot-"));
   const config = { ...loadConfig({ DATA_DIR: dir }), ...options.config, dataDir: dir };
@@ -92,6 +94,7 @@ function harness(options: {
   };
   const subscribed: string[] = [];
   const unsubscribed: string[] = [];
+  const bought = options.bought ?? new BoughtMints(join(dir, "bought-mints.json"));
   const bot = new SniperBot({
     config,
     executor,
@@ -114,11 +117,12 @@ function harness(options: {
     unsubscribeMint: (mint) => {
       unsubscribed.push(mint);
     },
+    bought,
     ...(options.walletBalanceSol ? { walletBalanceSol: options.walletBalanceSol } : {}),
     ...(options.safetyCheck ? { safetyCheck: options.safetyCheck } : {}),
     ...(options.curveWatch ? { curveWatch: options.curveWatch } : {}),
   });
-  return { bot, positions, trades, sells, config, log, subscribed, unsubscribed };
+  return { bot, positions, trades, sells, config, log, subscribed, unsubscribed, bought };
 }
 
 test("a failed buy is logged and does not open a position", async () => {
@@ -135,7 +139,7 @@ test("a failed buy is logged and does not open a position", async () => {
 
 test("one filled buy per mint, then a take-profit sells the whole position", async () => {
   const { bot, positions, trades, sells } = harness({ config: { takeProfitPct: 50 } });
-  await bot.onLaunch(launch());
+  await bot.onLaunch(launch({ priceSol: 1 }));
   await bot.onLaunch(launch());
   assert.equal(positions.list().length, 1);
   assert.equal(trades.readAll().filter((row) => row.side === "buy" && row.status === "filled").length, 1);
@@ -509,8 +513,8 @@ test("a buy logs USD and SOL size from a fresh SOL/USD quote and stays within $3
   const filled = (log as ListLogger).entries.find((entry) => entry.message === "buy filled");
   const sizeUsd = filled?.fields?.sizeUsd;
   const sizeSol = filled?.fields?.sizeSol;
-  assert.equal(sizeUsd, 5);
-  assert.equal(filled?.fields?.score, 0);
+  assert.ok(Math.abs((sizeUsd as number) - 12) < 1e-9);
+  assert.ok(Math.abs((filled?.fields?.score as number) - 0.28) < 1e-9);
   assert.equal(typeof sizeSol, "number");
   assert.ok((sizeUsd as number) <= 30);
   assert.ok(Math.abs((sizeSol as number) - (sizeUsd as number) / 100) < 1e-12);
@@ -673,4 +677,55 @@ test("market buy flow before the fill raises size", async () => {
   assert.equal(filled?.fields?.safety, 1);
   assert.ok((filled?.fields?.sizeUsd as number) >= 28);
   assert.equal(trades.readAll()[0]?.confidence, filled?.fields?.score);
+});
+
+test("the same mint is not bought again after the sell or a restart, and the key is the mint", async () => {
+  const first = harness({ buy: async () => fill({ price: 1 }) });
+  await first.bot.onLaunch(launch({ mint: "MintA", priceSol: 1, name: "META", symbol: "META" }));
+  await first.bot.onTrade(trade({ mint: "MintA", priceSol: 0.85, signature: "out", txType: "sell" }));
+  assert.equal(first.positions.list().length, 0);
+  await first.bot.onLaunch(launch({ mint: "MintA", priceSol: 1, name: "META", symbol: "META" }));
+  assert.equal(first.trades.readAll().filter((row) => row.side === "buy" && row.status === "filled").length, 1);
+
+  const restarted = harness({ bought: first.bought, buy: async () => fill({ price: 1 }) });
+  await restarted.bot.onLaunch(launch({ mint: "MintA", priceSol: 1, name: "META", symbol: "META" }));
+  assert.equal(restarted.positions.list().length, 0);
+  assert.equal(restarted.trades.readAll().filter((row) => row.side === "buy").length, 0);
+
+  await restarted.bot.onLaunch(launch({ mint: "MintB", priceSol: 1, name: "META", symbol: "META" }));
+  assert.equal(restarted.positions.list().length, 1);
+  assert.equal(restarted.positions.get("MintB")?.mint, "MintB");
+});
+
+test("a 54x stream mark is rejected and the paper sell uses the curve", async () => {
+  let now = Date.parse("2026-11-04T20:04:15.000Z");
+  const { bot, log, sells } = harness({
+    capture: true,
+    now: () => new Date(now),
+    buy: async () => fill({ price: 2.8518173345759554e-8, tokenAmount: 1_832_118.6499291072 }),
+  });
+  await bot.onLaunch(
+    launch({
+      mint: "4313WPjwvWAMrpo1oWrW7BXGWS2nXbqj47nbMFSDpump",
+      name: "Microsoft",
+      priceSol: 30 / 1_073_000_000,
+      vSolSol: 30,
+      vTokens: 1_073_000_000,
+    }),
+  );
+  await bot.onTrade(
+    trade({
+      mint: "4313WPjwvWAMrpo1oWrW7BXGWS2nXbqj47nbMFSDpump",
+      priceSol: 1574.2135076795605 / 1e9,
+      signature: "bad",
+    }),
+  );
+  const rejected = (log as ListLogger).entries.find((entry) => entry.message === "mark_rejected");
+  assert.ok(rejected);
+  now += 135_000;
+  await bot.checkHolds();
+  const quote = sells[0]?.quotePriceSol ?? 0;
+  assert.ok(quote > 0);
+  assert.ok(quote < 1e-7);
+  assert.equal(sells[0]?.reason, "volume_stall");
 });

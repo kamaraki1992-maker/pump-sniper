@@ -41,6 +41,89 @@ export function priceFromMarketCap(marketCapSol: number): number | null {
   return marketCapSol / TOTAL_SUPPLY_TOKENS;
 }
 
+/** Initial pump.fun virtual reserves. k stays on this product for the life of the curve. */
+export const PUMP_CURVE_K = 30 * 1_073_000_000;
+/** One update may not move the mark by more than this multiple. */
+export const MARK_JUMP_LIMIT = 5;
+
+export function reservesOnCurve(vSol: number, vTokens: number): boolean {
+  if (!(vSol > 0) || !(vTokens > 0) || !Number.isFinite(vSol) || !Number.isFinite(vTokens)) return false;
+  const ratio = (vSol * vTokens) / PUMP_CURVE_K;
+  return ratio >= 0.8 && ratio <= 1.25;
+}
+
+export function spotFromReserves(vSol: number, vTokens: number): number | null {
+  if (!reservesOnCurve(vSol, vTokens)) return null;
+  return vSol / vTokens;
+}
+
+function jumpsTooFar(previous: number | null, next: number): boolean {
+  if (previous == null || !(previous > 0)) return false;
+  const ratio = next / previous;
+  return ratio > MARK_JUMP_LIMIT || ratio < 1 / MARK_JUMP_LIMIT;
+}
+
+function agrees(a: number, b: number): boolean {
+  if (!(a > 0) || !(b > 0)) return false;
+  const ratio = a / b;
+  return ratio >= 0.95 && ratio <= 1.05;
+}
+
+export interface MarkAssessment {
+  /** False when the proposed print is rejected. The returned reserves are the ones still trusted. */
+  accept: boolean;
+  price: number | null;
+  vSol: number | null;
+  vTokens: number | null;
+}
+
+/**
+ * A print is usable only when it agrees with this mint's bonding-curve reserves
+ * and does not jump more than 5x from the previous mark. Reserves that leave
+ * the pump constant-product curve are ignored.
+ */
+export function assessMark(input: {
+  previous: number | null;
+  proposed: number | null;
+  vSol: number | null;
+  vTokens: number | null;
+  nextVSol?: number | null;
+  nextVTokens?: number | null;
+}): MarkAssessment {
+  const previous = input.previous != null && input.previous > 0 ? input.previous : null;
+  let vSol = input.vSol;
+  let vTokens = input.vTokens;
+  const nextSol = input.nextVSol ?? null;
+  const nextTok = input.nextVTokens ?? null;
+  if (nextSol != null && nextTok != null) {
+    const nextSpot = spotFromReserves(nextSol, nextTok);
+    if (nextSpot != null && !jumpsTooFar(previous, nextSpot)) {
+      vSol = nextSol;
+      vTokens = nextTok;
+    }
+  }
+  const reservePrice = vSol != null && vTokens != null ? spotFromReserves(vSol, vTokens) : null;
+  const proposed = input.proposed != null && input.proposed > 0 ? input.proposed : null;
+  if (proposed != null && reservePrice != null && !agrees(proposed, reservePrice)) {
+    return { accept: false, price: previous, vSol: input.vSol, vTokens: input.vTokens };
+  }
+  const candidate = reservePrice ?? proposed;
+  if (candidate == null) return { accept: false, price: previous, vSol: input.vSol, vTokens: input.vTokens };
+  if (jumpsTooFar(previous, candidate)) {
+    return { accept: false, price: previous, vSol: input.vSol, vTokens: input.vTokens };
+  }
+  return { accept: true, price: candidate, vSol, vTokens };
+}
+
+/** Average SOL per token for selling `tokenAmount` into the constant-product curve. */
+export function curveSellPrice(vSol: number | null | undefined, vTokens: number | null | undefined, tokenAmount: number): number | null {
+  if (vSol == null || vTokens == null || !reservesOnCurve(vSol, vTokens) || !(tokenAmount > 0)) return null;
+  const k = vSol * vTokens;
+  const out = vSol - k / (vTokens + tokenAmount);
+  if (!(out > 0)) return null;
+  return out / tokenAmount;
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object") return null;
   return value as Record<string, unknown>;
@@ -111,6 +194,7 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
       priceSol: priced.priceSol,
       marketCapSol: priced.marketCapSol,
       vSolSol,
+      vTokens,
     };
     return trade;
   }
