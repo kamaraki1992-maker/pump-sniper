@@ -30,17 +30,27 @@ These limits are constants in `src/config.ts`. The process exits on startup if t
 | Setting | Default | Hard bound |
 | --- | --- | --- |
 | Buy size | 0.1 SOL | `<= 0.1` SOL |
-| Slippage | 20% | `<= 20%` |
+| Slippage | 3% | `<= 20%` |
 | Jito tip | 0.002 SOL | `0.002` to `0.005` SOL |
+| Buy size | 0.05 to 0.16 SOL | chosen from a confidence score, hard cap `0.16` |
 | Take profit | +50% | `<= 50%`, sells 100% of the position |
 | Stop loss | -15% | `<= 15%`, sells 100% of the position |
 | Creator hold at launch | under 10% of supply | cannot be configured above 10% |
-| Open positions | 1 | cannot be configured above 1 |
-| Max hold | 10 min | sells 100% when neither take profit nor stop loss has fired |
+| Open positions | 5 | cannot be configured above 5 |
+| Max hold | 10 min | sells 100% with reason `timeout` |
+| Liquidity drop | 20% | sells 100% when curve SOL reserves fall by more than this from entry |
+| Volume stall | 45 s | sells 100% when the token has no trades for that long |
+| Sell pressure | 3x | sells 100% when sells are at least 3x buys in 30 s, with at least 4 sells |
 
-One position per mint, and at most one open position at a time. A buy that has been sent and is not confirmed yet holds that slot. A failed buy releases it. Further launches are skipped with reason `max_open_positions` (that line is logged at most once every 5 seconds). A failed buy is a failed record, not a position. Failed sells are retried with backoff. A sell that still does not land leaves the position open and tries again after a short cooldown.
+At most `MAX_OPEN_POSITIONS` positions are open at once, and only one position per mint. A buy that has been sent and is not confirmed yet holds a slot. A failed buy releases it. Further launches are skipped with reason `max_open_positions` (that line is logged at most once every 5 seconds). A failed buy is a failed record, not a position. Failed sells are retried with backoff. A sell that still does not land leaves the position open. Exit checks share one in-flight sell per mint, so two signals cannot double-sell.
 
-The hold timer checks about once a second, including when the token has no trades. Take profit and stop loss are evaluated first. A timeout sell uses reason `timeout` and frees the slot only after that sell fills.
+Take profit and stop loss are evaluated first. After those, the bot can exit for a liquidity drop, sell pressure, a volume stall, or the 10 minute hold. The hold and stall timers run about once a second, so a token with no trades still exits. The slot frees only after the sell fills.
+
+Jito bundles and a 3% default slippage reduce sandwich exposure. They do not guarantee that a fill is protected from MEV, and a bundle can still expire without landing.
+
+Before a buy, the bot reads the mint account and rejects a set mint authority, a set freeze authority, a program other than SPL Token or Token-2022, and a Token-2022 mint with a transfer fee or transfer hook. It also requires a bonding-curve round trip to produce tokens and a `simulateTransaction` of the buy. A sell simulation that fails only because the wallet does not hold the mint yet is not a rejection. The whole check must finish within `SAFETY_CHECK_TIMEOUT_MS` (default 250). If it does not, the token is skipped and the measured latency is logged. Five milliseconds is not achievable over public RPC.
+
+Buy size is `min + confidence * (max - min)`. Confidence is 40% launch-hold (lower is better), 30% early buy/sell flow (no prints yet is neutral), and 30% safety pass. Live mode still checks the wallet, including the SOL reserved to exit positions that are already open.
 
 In live mode the bot reads the wallet balance before sending a buy. It skips the buy when the balance is below the order size, the priority fee, the base fee, the Jito tip, and the same priority fee plus base fee kept for the sell. Paper mode does not read a wallet.
 
@@ -61,20 +71,23 @@ npm run report -- --day 2026-11-04
 The day is a calendar date in `Europe/Berlin`. The command prints one JSON object:
 
 - `tradesTaken` — filled buys
-- `wins` / `losses` — filled take-profit and stop-loss sells with positive or negative realized PnL
+- `wins` / `losses` — filled sells with positive or negative realized PnL, except `timeout`
 - `timeouts` — filled sells with reason `timeout`
+- `exits` — filled sell counts by reason
+- `buySize` — count, min, max, and average SOL of filled buys
 - `realizedPnlSol` / `realizedPnlUsd`
 - `feesSol` / `tipsSol` — charged on filled rows
 - `failedBuys` / `failedSells`
 - `mode` — `paper`, `live`, `mixed`, or `none`
 
-`data/trades.jsonl` is append-only. Each row has the timestamp, mode, mint, name, size, price, fees, Jito tip, signature (`paper` or a transaction signature), Solscan URL when there is a live signature, and reason (`entry`, `tp`, `sl`, `timeout`, `manual`).
+`data/trades.jsonl` is append-only. Each row has the timestamp, mode, mint, name, size, price, fees, Jito tip, signature (`paper` or a transaction signature), Solscan URL when there is a live signature, and reason (`entry`, `tp`, `sl`, `timeout`, `liquidity_drop`, `volume_stall`, `sell_pressure`, `manual`).
 
 ## Layout
 
 | Module | Role |
 | --- | --- |
-| `src/stream.ts` | PumpDev WebSocket, reconnect backoff |
+| `src/stream.ts` | PumpDev WebSocket, used when `GRPC_URL` or `GRPC_TOKEN` is unset |
+| `src/yellowstone.ts` | Optional Yellowstone gRPC source for the same events |
 | `src/pricing.ts` | Message adapter. Swap the parser to change data sources |
 | `src/filter.ts` | Creator hold, dev-dump, and floor-rug decisions |
 | `src/history.ts` | RPC lookup behind the filter |

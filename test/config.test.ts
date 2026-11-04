@@ -22,21 +22,30 @@ test("paper mode does not require a key and does not keep the key on the config"
 
 test("defaults match the risk spec", () => {
   const cfg = loadConfig({});
-  assert.equal(cfg.buySizeSol, 0.1);
-  assert.equal(cfg.maxSlippagePct, 20);
+  assert.equal(cfg.buySizeMinSol, 0.05);
+  assert.equal(cfg.buySizeMaxSol, 0.16);
+  assert.equal(cfg.maxSlippagePct, 3);
   assert.equal(cfg.jitoTipSol, 0.002);
   assert.equal(cfg.takeProfitPct, 50);
   assert.equal(cfg.stopLossPct, 15);
-  assert.equal(cfg.maxOpenPositions, 1);
+  assert.equal(cfg.maxOpenPositions, 5);
   assert.equal(cfg.maxHoldMinutes, 10);
+  assert.equal(cfg.liqDropPct, 20);
+  assert.equal(cfg.volumeStallSec, 45);
+  assert.equal(cfg.sellPressureRatio, 3);
+  assert.equal(cfg.safetyCheckTimeoutMs, 250);
+  assert.equal(cfg.grpcUrl, null);
 });
 
 test("buy size, slippage, and tip hard caps refuse startup", () => {
-  assert.throws(() => loadConfig({ BUY_SIZE_SOL: "0.11" }), ConfigError);
-  assert.throws(() => loadConfig({ BUY_SIZE_SOL: "0" }), ConfigError);
-  assert.equal(loadConfig({ BUY_SIZE_SOL: "0.1" }).buySizeSol, 0.1);
+  assert.throws(() => loadConfig({ BUY_SIZE_MAX_SOL: "0.17" }), ConfigError);
+  assert.throws(() => loadConfig({ BUY_SIZE_MAX_SOL: "0.25" }), ConfigError);
+  assert.throws(() => loadConfig({ BUY_SIZE_MIN_SOL: "0" }), ConfigError);
+  assert.equal(loadConfig({ BUY_SIZE_MAX_SOL: "0.16" }).buySizeMaxSol, 0.16);
+  assert.equal(loadConfig({ BUY_SIZE_MIN_SOL: "0.05", BUY_SIZE_MAX_SOL: "0.12" }).buySizeMaxSol, 0.12);
   assert.throws(() => loadConfig({ MAX_SLIPPAGE_PCT: "21" }), ConfigError);
   assert.equal(loadConfig({ MAX_SLIPPAGE_PCT: "20" }).maxSlippagePct, 20);
+  assert.equal(loadConfig({}).maxSlippagePct, 3);
   assert.throws(() => loadConfig({ JITO_TIP_SOL: "0.001" }), ConfigError);
   assert.throws(() => loadConfig({ JITO_TIP_SOL: "0.006" }), ConfigError);
   assert.equal(loadConfig({ JITO_TIP_SOL: "0.002" }).jitoTipSol, 0.002);
@@ -54,16 +63,21 @@ test("take profit and stop loss cannot be loosened past 50% and 15%", () => {
   assert.equal(loadConfig({ STOP_LOSS_PCT: "10" }).stopLossPct, 10);
 });
 
-test("open positions cannot be loosened past 1", () => {
-  assert.throws(() => loadConfig({ MAX_OPEN_POSITIONS: "2" }), ConfigError);
+test("open positions cannot be loosened past 5", () => {
+  assert.throws(() => loadConfig({ MAX_OPEN_POSITIONS: "6" }), ConfigError);
   assert.throws(() => loadConfig({ MAX_OPEN_POSITIONS: "0" }), ConfigError);
+  assert.equal(loadConfig({ MAX_OPEN_POSITIONS: "5" }).maxOpenPositions, 5);
   assert.equal(loadConfig({ MAX_OPEN_POSITIONS: "1" }).maxOpenPositions, 1);
 });
 
-test("live buy requires size, fees, tip, and a sell-fee reserve", () => {
+test("live buy reserves exit SOL for this order and for positions already open", () => {
   const cfg = loadConfig({});
-  const need = requiredBuyBalanceSol(cfg);
-  assert.ok(Math.abs(need - (0.1 + 0.00005 + 0.000005 + 0.002 + 0.00005 + 0.000005)) < 1e-12);
+  const fee = 0.00005 + 0.000005;
+  const tip = 0.002;
+  const one = requiredBuyBalanceSol(cfg, 0.16, 0);
+  assert.ok(Math.abs(one - (0.16 + fee + tip + fee + tip)) < 1e-12);
+  const withOpen = requiredBuyBalanceSol(cfg, 0.16, 2);
+  assert.ok(Math.abs(withOpen - (one + 2 * (fee + tip))) < 1e-12);
 });
 
 test("creator hold cannot be loosened past 10%", () => {

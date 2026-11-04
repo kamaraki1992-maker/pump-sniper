@@ -11,8 +11,17 @@ import { PositionBook } from "./positions.js";
 import { installProcessRedaction } from "./redact.js";
 import { TradeLog } from "./report.js";
 import { SolPriceFeed } from "./sol-price.js";
+import { createRpcSafetyCheck } from "./safety.js";
 import { PumpDevStream } from "./stream.js";
+import type { MarketEvent } from "./types.js";
+import { YellowstoneStream } from "./yellowstone.js";
 import type { Executor } from "./types.js";
+
+type LiveStream = {
+  start(onEvent: (event: MarketEvent) => void): void;
+  subscribeTrades(mints: string[]): void;
+  stop(): void;
+};
 
 export interface Runtime {
   config: AppConfig;
@@ -21,12 +30,16 @@ export interface Runtime {
   positions: PositionBook;
   sol: SolPriceFeed;
   executor: Executor;
-  subscription: { stream: PumpDevStream | null };
+  subscription: { stream: LiveStream | null };
 }
 
 export function readSecrets(): string[] {
+  const secrets: string[] = [];
   const key = process.env.PRIVATE_KEY?.trim();
-  return key ? [key] : [];
+  const grpcToken = process.env.GRPC_TOKEN?.trim();
+  if (key) secrets.push(key);
+  if (grpcToken && grpcToken.length >= 8) secrets.push(grpcToken);
+  return secrets;
 }
 
 export function loadLiveKeypair(): Keypair {
@@ -62,7 +75,7 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     log.info("paper mode");
     executor = new PaperExecutor(config.paper);
   }
-  const subscription: { stream: PumpDevStream | null } = { stream: null };
+  const subscription: { stream: LiveStream | null } = { stream: null };
   const bot = new SniperBot({
     config,
     executor,
@@ -75,12 +88,20 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     subscribeMint: (mint) => subscription.stream?.subscribeTrades([mint]),
     ...(walletBalanceSol ? { walletBalanceSol } : {}),
+    safetyCheck: createRpcSafetyCheck(config),
   });
   return { config, log, bot, positions, sol, executor, subscription };
 }
 
-export function attachStream(runtime: Runtime): PumpDevStream {
-  const stream = new PumpDevStream(runtime.config.wsUrl, runtime.log);
+export function attachStream(runtime: Runtime): LiveStream {
+  const grpcToken = process.env.GRPC_TOKEN?.trim() ?? "";
+  const stream: LiveStream =
+    runtime.config.grpcUrl && grpcToken
+      ? new YellowstoneStream(runtime.config.grpcUrl, grpcToken, runtime.log)
+      : new PumpDevStream(runtime.config.wsUrl, runtime.log);
+  if (!(stream instanceof YellowstoneStream)) {
+    runtime.log.info("stream", { source: "pumpdev-ws" });
+  }
   runtime.subscription.stream = stream;
   stream.start((event) => {
     if (event.kind === "launch") {
@@ -98,7 +119,8 @@ export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promis
   const { config, log, bot, positions, sol } = runtime;
   log.info("sniper start", {
     mode: config.mode,
-    buySizeSol: config.buySizeSol,
+    buySizeMinSol: config.buySizeMinSol,
+    buySizeMaxSol: config.buySizeMaxSol,
     maxSlippagePct: config.maxSlippagePct,
     jitoTipSol: config.jitoTipSol,
     takeProfitPct: config.takeProfitPct,

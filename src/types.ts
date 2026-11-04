@@ -4,8 +4,16 @@ export type TradeSide = "buy" | "sell";
 
 export type TradeStatus = "filled" | "failed";
 
-/** Operator-facing reason. Buys use `entry`. Panic-sell uses `manual`. Hold-timer exits use `timeout`. */
-export type TradeReason = "entry" | "tp" | "sl" | "manual" | "timeout";
+/** Operator-facing reason. Buys use `entry`. Panic-sell uses `manual`. */
+export type TradeReason =
+  | "entry"
+  | "tp"
+  | "sl"
+  | "manual"
+  | "timeout"
+  | "liquidity_drop"
+  | "volume_stall"
+  | "sell_pressure";
 
 export interface MarketLaunch {
   kind: "launch";
@@ -20,6 +28,10 @@ export interface MarketLaunch {
   solQuoted: boolean;
   priceSol: number | null;
   marketCapSol: number | null;
+  /** Virtual SOL reserves, in SOL. */
+  vSolSol: number | null;
+  /** Virtual token reserves, in display tokens. */
+  vTokens: number | null;
   bondingCurveKey: string | null;
 }
 
@@ -32,6 +44,7 @@ export interface MarketTrade {
   solQuoted: boolean;
   priceSol: number | null;
   marketCapSol: number | null;
+  vSolSol: number | null;
 }
 
 export type MarketEvent = MarketLaunch | MarketTrade;
@@ -101,6 +114,9 @@ export interface Position {
   mode: Mode;
   entrySignature: string;
   lastMarkPriceSol: number;
+  entryVSolSol?: number | null;
+  lastVSolSol?: number | null;
+  lastTradeAtMs?: number;
 }
 
 export interface Executor {

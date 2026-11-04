@@ -26,6 +26,16 @@ export function priceFromReserves(vSol: number, vTokens: number): number | null 
   return sol / tokens;
 }
 
+export function virtualSol(value: number | null): number | null {
+  if (value === null || !Number.isFinite(value) || value <= 0) return null;
+  return value > 1_000 ? value / 1e9 : value;
+}
+
+export function virtualTokens(value: number | null): number | null {
+  if (value === null || !Number.isFinite(value) || value <= 0) return null;
+  return value > 1e12 ? value / 1e6 : value;
+}
+
 export function priceFromMarketCap(marketCapSol: number): number | null {
   if (!Number.isFinite(marketCapSol) || marketCapSol <= 0) return null;
   return marketCapSol / TOTAL_SUPPLY_TOKENS;
@@ -66,6 +76,8 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
   if (!mint) return null;
   const quoteMint = asString(record.quoteMint);
   const priced = eventPrice(record);
+  const vSolSol = virtualSol(asNumber(record.vSolInBondingCurve));
+  const vTokens = virtualTokens(asNumber(record.vTokensInBondingCurve));
   const solQuoted = quoteMint === WSOL_MINT || (quoteMint === null && priced.marketCapSol !== null);
 
   if (txType === "create") {
@@ -81,6 +93,8 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
       solQuoted,
       priceSol: priced.priceSol,
       marketCapSol: priced.marketCapSol,
+      vSolSol,
+      vTokens,
       bondingCurveKey: asString(record.bondingCurveKey),
     };
     return launch;
@@ -96,6 +110,7 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
       solQuoted,
       priceSol: priced.priceSol,
       marketCapSol: priced.marketCapSol,
+      vSolSol,
     };
     return trade;
   }

@@ -7,12 +7,12 @@ import type { Mode } from "./types.js";
  * Loosening them means editing this object.
  */
 export const HARD_CAPS = {
-  maxBuySol: 0.1,
+  maxBuySol: 0.16,
   maxSlippagePct: 20,
   minJitoTipSol: 0.002,
   maxJitoTipSol: 0.005,
   maxCreatorHoldPct: 10,
-  maxOpenPositions: 1,
+  maxOpenPositions: 5,
   maxTakeProfitPct: 50,
   maxStopLossPct: 15,
 } as const;
@@ -35,7 +35,8 @@ export interface PaperModel {
 
 export interface AppConfig {
   mode: Mode;
-  buySizeSol: number;
+  buySizeMinSol: number;
+  buySizeMaxSol: number;
   maxSlippagePct: number;
   takeProfitPct: number;
   stopLossPct: number;
@@ -44,6 +45,13 @@ export interface AppConfig {
   creatorMaxHoldPct: number;
   maxOpenPositions: number;
   maxHoldMinutes: number;
+  liqDropPct: number;
+  volumeStallSec: number;
+  sellPressureRatio: number;
+  sellPressureWindowSec: number;
+  safetyCheckTimeoutMs: number;
+  /** Set only when both GRPC_URL and GRPC_TOKEN are present. The token itself is not stored here. */
+  grpcUrl: string | null;
   wsUrl: string;
   tradeApiUrl: string;
   rpcUrl: string;
@@ -86,34 +94,48 @@ export function assertLiveKey(secret: string): void {
 }
 
 /**
- * SOL that must be in the wallet before a live buy: the order, this
- * transaction's priority fee and base fee, the Jito tip, and the same
- * priority fee plus base fee held back so the sell can pay its network fee.
+ * SOL that must be free before a live buy. Each open position still needs a
+ * later sell (priority fee, base fee, and tip), and this order needs the same
+ * plus its size.
  */
-export function requiredBuyBalanceSol(config: AppConfig): number {
+export function requiredBuyBalanceSol(config: AppConfig, buySize: number, openPositions = 0): number {
   const txFee = config.priorityFeeSol + config.paper.baseFeeSol;
-  return config.buySizeSol + txFee + config.jitoTipSol + txFee;
+  const exitReserve = txFee + config.jitoTipSol;
+  return buySize + txFee + config.jitoTipSol + exitReserve + openPositions * exitReserve;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const mode: Mode = env.MODE === "live" ? "live" : "paper";
-  const buySizeSol = num(env.BUY_SIZE_SOL, 0.1, "BUY_SIZE_SOL");
-  const maxSlippagePct = num(env.MAX_SLIPPAGE_PCT, 20, "MAX_SLIPPAGE_PCT");
+  const buySizeMinSol = num(env.BUY_SIZE_MIN_SOL, 0.05, "BUY_SIZE_MIN_SOL");
+  const buySizeMaxSol = num(env.BUY_SIZE_MAX_SOL, HARD_CAPS.maxBuySol, "BUY_SIZE_MAX_SOL");
+  const maxSlippagePct = num(env.MAX_SLIPPAGE_PCT, 3, "MAX_SLIPPAGE_PCT");
   const jitoTipSol = num(env.JITO_TIP_SOL, 0.002, "JITO_TIP_SOL");
   const takeProfitPct = num(env.TAKE_PROFIT_PCT, HARD_CAPS.maxTakeProfitPct, "TAKE_PROFIT_PCT");
   const stopLossPct = num(env.STOP_LOSS_PCT, HARD_CAPS.maxStopLossPct, "STOP_LOSS_PCT");
   const priorityFeeSol = num(env.PRIORITY_FEE_SOL, 0.00005, "PRIORITY_FEE_SOL");
   const creatorMaxHoldPct = num(env.CREATOR_MAX_HOLD_PCT, 10, "CREATOR_MAX_HOLD_PCT");
-  const maxOpenPositions = num(env.MAX_OPEN_POSITIONS, 1, "MAX_OPEN_POSITIONS");
+  const maxOpenPositions = num(env.MAX_OPEN_POSITIONS, HARD_CAPS.maxOpenPositions, "MAX_OPEN_POSITIONS");
   const maxHoldMinutes = num(env.MAX_HOLD_MINUTES, 10, "MAX_HOLD_MINUTES");
+  const liqDropPct = num(env.LIQ_DROP_PCT, 20, "LIQ_DROP_PCT");
+  const volumeStallSec = num(env.VOLUME_STALL_SEC, 45, "VOLUME_STALL_SEC");
+  const sellPressureRatio = num(env.SELL_PRESSURE_RATIO, 3, "SELL_PRESSURE_RATIO");
+  const sellPressureWindowSec = num(env.SELL_PRESSURE_WINDOW_SEC, 30, "SELL_PRESSURE_WINDOW_SEC");
+  const safetyCheckTimeoutMs = num(env.SAFETY_CHECK_TIMEOUT_MS, 250, "SAFETY_CHECK_TIMEOUT_MS");
+  const grpcUrlRaw = str(env.GRPC_URL, "");
+  const grpcTokenPresent = Boolean(env.GRPC_TOKEN?.trim());
   const paperSlippagePct = num(env.PAPER_SLIPPAGE_PCT, 2, "PAPER_SLIPPAGE_PCT");
   const protocolFeeBps = num(env.PAPER_PROTOCOL_FEE_BPS, 100, "PAPER_PROTOCOL_FEE_BPS");
   const venueFeeBps = num(env.PAPER_VENUE_FEE_BPS, 25, "PAPER_VENUE_FEE_BPS");
   const baseFeeSol = num(env.PAPER_BASE_FEE_SOL, 0.000005, "PAPER_BASE_FEE_SOL");
 
-  if (!(buySizeSol > 0) || buySizeSol > HARD_CAPS.maxBuySol) {
+  if (!(buySizeMinSol > 0) || buySizeMinSol > HARD_CAPS.maxBuySol) {
     throw new ConfigError(
-      `BUY_SIZE_SOL ${buySizeSol} exceeds hard cap ${HARD_CAPS.maxBuySol}`,
+      `BUY_SIZE_MIN_SOL ${buySizeMinSol} exceeds hard cap ${HARD_CAPS.maxBuySol}`,
+    );
+  }
+  if (!(buySizeMaxSol > 0) || buySizeMaxSol > HARD_CAPS.maxBuySol || buySizeMaxSol < buySizeMinSol) {
+    throw new ConfigError(
+      `BUY_SIZE_MAX_SOL ${buySizeMaxSol} exceeds hard cap ${HARD_CAPS.maxBuySol}`,
     );
   }
   if (!(maxSlippagePct > 0) || maxSlippagePct > HARD_CAPS.maxSlippagePct) {
@@ -152,6 +174,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!(maxHoldMinutes > 0)) {
     throw new ConfigError("MAX_HOLD_MINUTES must be positive");
   }
+  if (!(liqDropPct > 0) || !(volumeStallSec > 0) || !(sellPressureRatio > 0) || !(sellPressureWindowSec > 0)) {
+    throw new ConfigError("exit window settings must be positive");
+  }
+  if (!(safetyCheckTimeoutMs > 0)) {
+    throw new ConfigError("SAFETY_CHECK_TIMEOUT_MS must be positive");
+  }
   if (!(paperSlippagePct >= 0) || paperSlippagePct > maxSlippagePct) {
     throw new ConfigError("PAPER_SLIPPAGE_PCT must be between 0 and MAX_SLIPPAGE_PCT");
   }
@@ -170,7 +198,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const dataDir = str(env.DATA_DIR, "./data");
   return {
     mode,
-    buySizeSol,
+    buySizeMinSol,
+    buySizeMaxSol,
     maxSlippagePct,
     takeProfitPct,
     stopLossPct,
@@ -179,6 +208,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     creatorMaxHoldPct,
     maxOpenPositions,
     maxHoldMinutes,
+    liqDropPct,
+    volumeStallSec,
+    sellPressureRatio,
+    sellPressureWindowSec,
+    safetyCheckTimeoutMs,
+    grpcUrl: grpcUrlRaw && grpcTokenPresent ? grpcUrlRaw : null,
     wsUrl: str(env.WS_URL, "wss://pumpdev.io/ws"),
     tradeApiUrl: str(env.TRADE_API_URL, "https://pumpdev.io/api/bundle"),
     rpcUrl: str(env.RPC_URL, "https://api.mainnet-beta.solana.com"),

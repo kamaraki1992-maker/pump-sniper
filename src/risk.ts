@@ -1,4 +1,4 @@
-export type ExitSignal = "tp" | "sl" | "timeout";
+export type ExitSignal = "tp" | "sl" | "timeout" | "liquidity_drop" | "volume_stall" | "sell_pressure";
 
 /** Fraction of the position closed by a take-profit or stop-loss. v1 always closes 100%. */
 export const FULL_EXIT_FRACTION = 1;
@@ -32,9 +32,33 @@ export function decideExit(input: {
   openedAtMs: number;
   nowMs: number;
   maxHoldMs: number;
+  entryVSolSol?: number | null;
+  lastVSolSol?: number | null;
+  liqDropPct?: number;
+  lastTradeAtMs?: number;
+  volumeStallMs?: number;
+  sellsInWindow?: number;
+  buysInWindow?: number;
+  sellPressureRatio?: number;
+  minPressureSells?: number;
 }): ExitSignal | null {
   const priced = exitSignal(input.entryPrice, input.markPrice, input.takeProfitPct, input.stopLossPct);
   if (priced) return priced;
+  const entryV = input.entryVSolSol ?? null;
+  const lastV = input.lastVSolSol ?? null;
+  const liqDropPct = input.liqDropPct ?? 20;
+  if (entryV !== null && lastV !== null && entryV > 0) {
+    const dropPct = ((entryV - lastV) / entryV) * 100;
+    if (dropPct > liqDropPct) return "liquidity_drop";
+  }
+  const sells = input.sellsInWindow ?? 0;
+  const buys = input.buysInWindow ?? 0;
+  const ratio = input.sellPressureRatio ?? 3;
+  const minSells = input.minPressureSells ?? 4;
+  if (sells >= minSells && sells >= ratio * buys) return "sell_pressure";
+  const lastTradeAtMs = input.lastTradeAtMs ?? input.nowMs;
+  const volumeStallMs = input.volumeStallMs ?? Number.POSITIVE_INFINITY;
+  if (input.nowMs - lastTradeAtMs >= volumeStallMs) return "volume_stall";
   if (input.nowMs - input.openedAtMs >= input.maxHoldMs) return "timeout";
   return null;
 }

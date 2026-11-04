@@ -18,6 +18,8 @@ export interface DailySummary {
   failedSells: number;
   /** Filled sells whose reason is `timeout`. Not also counted as wins or losses. */
   timeouts: number;
+  exits: Record<string, number>;
+  buySize: { count: number; minSol: number | null; maxSol: number | null; avgSol: number | null };
 }
 
 export function berlinDay(iso: string): string {
@@ -59,6 +61,8 @@ export function summarizeDay(records: TradeRecord[], day: string): DailySummary 
     failedBuys: rows.filter((row) => row.side === "buy" && row.status === "failed").length,
     failedSells: rows.filter((row) => row.side === "sell" && row.status === "failed").length,
     timeouts: filledSells.filter((row) => row.reason === "timeout").length,
+    exits: countReasons(filledSells),
+    buySize: sizeDistribution(filledBuys),
   };
 }
 
@@ -92,6 +96,27 @@ export class TradeLog {
     }
     return records;
   }
+}
+
+function countReasons(rows: TradeRecord[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const row of rows) {
+    counts[row.reason] = (counts[row.reason] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function sizeDistribution(rows: TradeRecord[]): DailySummary["buySize"] {
+  if (rows.length === 0) return { count: 0, minSol: null, maxSol: null, avgSol: null };
+  let min = rows[0]?.sizeSol ?? 0;
+  let max = min;
+  let sum = 0;
+  for (const row of rows) {
+    min = Math.min(min, row.sizeSol);
+    max = Math.max(max, row.sizeSol);
+    sum += row.sizeSol;
+  }
+  return { count: rows.length, minSol: round(min, 9), maxSol: round(max, 9), avgSol: round(sum / rows.length, 9) };
 }
 
 function round(value: number, digits: number): number {

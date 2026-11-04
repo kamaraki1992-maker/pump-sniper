@@ -1,10 +1,13 @@
+import { confidenceScore, sizeFromConfidence } from "./confidence.js";
 import { requiredBuyBalanceSol, type AppConfig } from "./config.js";
 import type { FilterDecision } from "./filter.js";
 import { holdDecision } from "./filter.js";
 import { Logger } from "./logger.js";
 import type { PositionBook } from "./positions.js";
+import { TOTAL_SUPPLY_TOKENS } from "./pricing.js";
 import type { TradeLog } from "./report.js";
 import { decideExit } from "./risk.js";
+import type { SafetyCheckResult } from "./safety.js";
 import type { Executor, MarketLaunch, MarketTrade, OrderRequest, Position, TradeReason } from "./types.js";
 
 export interface BotDeps {
@@ -20,6 +23,12 @@ export interface BotDeps {
   subscribeMint: (mint: string) => void;
   /** Live mode only. Paper mode does not consult a wallet. */
   walletBalanceSol?: () => Promise<number>;
+  safetyCheck?: (input: {
+    mint: string;
+    vSol: number | null;
+    vTokens: number | null;
+    spendSol: number;
+  }) => Promise<SafetyCheckResult>;
 }
 
 const MAX_OPEN_LOG_MS = 5_000;
@@ -30,6 +39,7 @@ export class SniperBot {
   private readonly selling = new Set<string>();
   private readonly cooldownUntil = new Map<string, number>();
   private lastMaxOpenLogMs = Number.NEGATIVE_INFINITY;
+  private readonly flow = new Map<string, Array<{ at: number; side: "buy" | "sell" }>>();
   private stopped = false;
 
   constructor(private readonly deps: BotDeps) {
@@ -74,6 +84,32 @@ export class SniperBot {
       return;
     }
     if (this.stopped) return;
+    const holdPct = (launch.initialBuyTokens / TOTAL_SUPPLY_TOKENS) * 100;
+    const earlyBuys = launch.initialBuyTokens > 0 ? 1 : 0;
+    const sizeSol = sizeFromConfidence(
+      confidenceScore({ holdPct, buys: earlyBuys, sells: 0, safetyOk: true }),
+      this.deps.config.buySizeMinSol,
+      this.deps.config.buySizeMaxSol,
+    );
+    if (this.deps.safetyCheck) {
+      const safety = await this.deps.safetyCheck({
+        mint: launch.mint,
+        vSol: launch.vSolSol,
+        vTokens: launch.vTokens,
+        spendSol: sizeSol,
+      });
+      this.deps.log.info("safety", {
+        mint: launch.mint,
+        ok: safety.ok,
+        reason: safety.reason,
+        latencyMs: safety.latencyMs,
+      });
+      if (!safety.ok) {
+        this.skip(launch, safety.reason ?? "safety");
+        return;
+      }
+    }
+    if (this.stopped) return;
     if (!this.tryReserve(launch.mint)) {
       this.skipMaxOpen(launch);
       return;
@@ -84,7 +120,7 @@ export class SniperBot {
       name: launch.name,
       symbol: launch.symbol,
       creator: launch.creator,
-      sizeSol: this.deps.config.buySizeSol,
+      sizeSol,
       quotePriceSol: launch.priceSol,
       slippagePct: this.deps.config.maxSlippagePct,
       reason: "entry",
@@ -92,7 +128,11 @@ export class SniperBot {
     try {
       if (this.deps.config.mode === "live") {
         const balance = await this.readBalance();
-        const required = requiredBuyBalanceSol(this.deps.config);
+        const required = requiredBuyBalanceSol(
+          this.deps.config,
+          sizeSol,
+          this.deps.positions.list().length,
+        );
         if (!(balance >= required)) {
           this.skip(launch, "insufficient_balance", { balanceSol: balance, requiredSol: required });
           return;
@@ -138,6 +178,9 @@ export class SniperBot {
         mode: this.deps.config.mode,
         entrySignature: fill.signature,
         lastMarkPriceSol: launch.priceSol,
+        entryVSolSol: launch.vSolSol,
+        lastVSolSol: launch.vSolSol,
+        lastTradeAtMs: this.deps.now().getTime(),
       };
       this.deps.positions.open(position);
       this.deps.subscribeMint(launch.mint);
@@ -148,6 +191,7 @@ export class SniperBot {
         tokenAmount: fill.tokenAmount,
         signature: fill.signature,
         openPositions: this.deps.positions.list().length,
+        sizeSol,
       });
     } finally {
       this.pendingBuys.delete(launch.mint);
@@ -156,9 +200,13 @@ export class SniperBot {
 
   async onTrade(trade: MarketTrade): Promise<void> {
     const position = this.deps.positions.get(trade.mint);
-    if (!position || !(trade.priceSol && trade.priceSol > 0)) return;
-    position.lastMarkPriceSol = trade.priceSol;
-    await this.maybeExit(position, trade.priceSol);
+    if (!position) return;
+    const now = this.deps.now().getTime();
+    this.noteTrade(trade.mint, trade.txType, now);
+    position.lastTradeAtMs = now;
+    if (trade.vSolSol !== null && trade.vSolSol > 0) position.lastVSolSol = trade.vSolSol;
+    if (trade.priceSol !== null && trade.priceSol > 0) position.lastMarkPriceSol = trade.priceSol;
+    await this.maybeExit(position, position.lastMarkPriceSol);
   }
 
   /** Timer entry. Sells a quiet position once max hold elapses, without a new trade. */
@@ -174,6 +222,7 @@ export class SniperBot {
     const cooldown = this.cooldownUntil.get(position.mint) ?? 0;
     if (this.deps.now().getTime() < cooldown) return;
     const openedAtMs = Date.parse(position.openedAt);
+    const counts = this.windowCounts(position.mint, this.deps.now().getTime());
     const signal = decideExit({
       entryPrice: position.entryPriceSol,
       markPrice: quote,
@@ -182,6 +231,15 @@ export class SniperBot {
       openedAtMs,
       nowMs: this.deps.now().getTime(),
       maxHoldMs: this.deps.config.maxHoldMinutes * 60_000,
+      entryVSolSol: position.entryVSolSol ?? null,
+      lastVSolSol: position.lastVSolSol ?? null,
+      liqDropPct: this.deps.config.liqDropPct,
+      lastTradeAtMs: position.lastTradeAtMs ?? openedAtMs,
+      volumeStallMs: this.deps.config.volumeStallSec * 1000,
+      sellsInWindow: counts.sells,
+      buysInWindow: counts.buys,
+      sellPressureRatio: this.deps.config.sellPressureRatio,
+      minPressureSells: 4,
     });
     if (!signal) return;
     await this.sellPosition(position, signal, quote > 0 ? quote : position.lastMarkPriceSol);
@@ -237,6 +295,7 @@ export class SniperBot {
         });
         if (fill.status === "filled") {
           this.deps.positions.close(current.mint);
+          this.flow.delete(current.mint);
           this.deps.log.info("sell filled", {
             mint: current.mint,
             reason,
@@ -257,6 +316,25 @@ export class SniperBot {
     } finally {
       this.selling.delete(position.mint);
     }
+  }
+
+  private noteTrade(mint: string, side: "buy" | "sell", at: number): void {
+    const windowMs = this.deps.config.sellPressureWindowSec * 1000;
+    const rows = this.flow.get(mint) ?? [];
+    rows.push({ at, side });
+    this.flow.set(
+      mint,
+      rows.filter((row) => row.at >= at - windowMs),
+    );
+  }
+
+  private windowCounts(mint: string, now: number): { buys: number; sells: number } {
+    const windowMs = this.deps.config.sellPressureWindowSec * 1000;
+    const rows = (this.flow.get(mint) ?? []).filter((row) => row.at >= now - windowMs);
+    return {
+      buys: rows.filter((row) => row.side === "buy").length,
+      sells: rows.filter((row) => row.side === "sell").length,
+    };
   }
 
   private occupied(): number {
