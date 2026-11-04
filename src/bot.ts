@@ -7,7 +7,7 @@ import type { FilterDecision } from "./filter.js";
 import { holdDecision } from "./filter.js";
 import { Logger } from "./logger.js";
 import type { PositionBook } from "./positions.js";
-import { assessMark, curveSellPrice, poolSellPrice, poolSpot, TOTAL_SUPPLY_TOKENS } from "./pricing.js";
+import { assessMark, curveBuyPrice, curveSellPrice, poolSellPrice, poolSpot, reservesOnCurve, TOTAL_SUPPLY_TOKENS } from "./pricing.js";
 import type { TradeLog } from "./report.js";
 import { decideExit, nextTrailFloor, reservesDropped } from "./risk.js";
 import type { SafetyCheckResult } from "./safety.js";
@@ -43,6 +43,8 @@ export interface BotDeps {
     isLive(mint: string): boolean;
     stop?(): void;
   };
+  /** Live bonding-curve reserves from getAccountInfo. Used only when no trade or curve-watch sample exists. */
+  readCurveReserves?: (mint: string) => Promise<{ vSol: number; vTokens: number } | null>;
 }
 
 const MAX_OPEN_LOG_MS = 5_000;
@@ -67,6 +69,8 @@ export class SniperBot {
   private readonly lastMarketTradeAt = new Map<string, number>();
   private readonly lastMarkLog = new Map<string, { at: number; floor: number | null }>();
   private readonly pendingExit = new Map<string, TradeReason>();
+  /** Latest on-curve reserves from a trade or curve-watch update. Launch snapshots are not stored. */
+  private readonly freshReserves = new Map<string, { vSol: number; vTokens: number }>();
   private stopped = false;
 
   constructor(private readonly deps: BotDeps) {
@@ -149,6 +153,11 @@ export class SniperBot {
       return;
     }
     const { sizeUsd, sizeSol, confidence } = orderSize;
+    const quotePriceSol = await this.entryQuote(launch, sizeSol);
+    if (quotePriceSol == null) {
+      this.skip(launch, "no-fresh-reserves");
+      return;
+    }
     if (!this.tryReserve(launch.mint)) {
       this.skipMaxOpen(launch);
       return;
@@ -163,7 +172,7 @@ export class SniperBot {
       symbol: launch.symbol,
       creator: launch.creator,
       sizeSol,
-      quotePriceSol: launch.priceSol,
+      quotePriceSol,
       slippagePct: this.deps.config.maxSlippagePct,
       reason: "entry",
     };
@@ -256,6 +265,7 @@ export class SniperBot {
   }
 
   async onTrade(trade: MarketTrade): Promise<void> {
+    this.rememberReserves(trade.mint, trade.vSolSol, trade.vTokens ?? null);
     const now = this.deps.now().getTime();
     this.lastMarketTradeAt.set(trade.mint, now);
     this.noteTrade(trade.mint, trade.txType, now);
@@ -301,6 +311,7 @@ export class SniperBot {
     reserves?: { vSol: number; vTokens: number } | null,
     complete?: boolean,
   ): void {
+    if (reserves) this.rememberReserves(mint, reserves.vSol, reserves.vTokens);
     const position = this.deps.positions.get(mint);
     if (!position || this.stopped || !(realSol >= 0)) return;
     if (complete || position.graduated) {
@@ -548,6 +559,39 @@ export class SniperBot {
     if (decision.price != null && decision.price > 0) position.lastMarkPriceSol = decision.price;
     if (decision.vSol != null) position.lastVSolSol = decision.vSol;
     if (decision.vTokens != null) position.lastVTokens = decision.vTokens;
+  }
+
+  /**
+   * Paper buys pay the constant-product impact of `sizeSol` on reserves seen
+   * after the launch. The paper executor adds PAPER_SLIPPAGE_PCT. Launch
+   * reserves are never the quote. Live orders keep the stream price.
+   */
+  private async entryQuote(launch: MarketLaunch, sizeSol: number): Promise<number | null> {
+    if (this.deps.config.mode !== "paper") return launch.priceSol;
+    const reserves = await this.entryReserves(launch.mint);
+    if (!reserves) return null;
+    return curveBuyPrice(reserves.vSol, reserves.vTokens, sizeSol);
+  }
+
+  private async entryReserves(mint: string): Promise<{ vSol: number; vTokens: number } | null> {
+    const cached = this.freshReserves.get(mint);
+    if (cached && reservesOnCurve(cached.vSol, cached.vTokens)) return cached;
+    const read = this.deps.readCurveReserves;
+    if (!read) return null;
+    try {
+      const loaded = await read(mint);
+      if (!loaded || !reservesOnCurve(loaded.vSol, loaded.vTokens)) return null;
+      this.freshReserves.set(mint, { vSol: loaded.vSol, vTokens: loaded.vTokens });
+      return loaded;
+    } catch {
+      return null;
+    }
+  }
+
+  /** A trade or curve-watch sample. Off-curve pairs are ignored so a stale virtual-token field cannot set the price. */
+  private rememberReserves(mint: string, vSol: number | null, vTokens: number | null): void {
+    if (vSol == null || vTokens == null || !reservesOnCurve(vSol, vTokens)) return;
+    this.freshReserves.set(mint, { vSol, vTokens });
   }
 
   /** USD notional clamped to the hard cap, then SOL at the fresh quote. */

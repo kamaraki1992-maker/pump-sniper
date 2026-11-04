@@ -3,7 +3,7 @@ import { Connection, Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 import { BoughtMints } from "./bought.js";
 import { SniperBot } from "./bot.js";
-import { RpcCurveWatch } from "./curve-watch.js";
+import { fetchCurveReserves, RpcCurveWatch } from "./curve-watch.js";
 import { ConfigError, formatTrailTiers, loadConfig, type AppConfig } from "./config.js";
 import { PaperExecutor } from "./executor-paper.js";
 import { createLivePorts, LiveExecutor } from "./executor-live.js";
@@ -118,6 +118,7 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     ...(walletBalanceSol ? { walletBalanceSol } : {}),
     safetyCheck: createRpcSafetyCheck(config),
     ...(curveWatch ? { curveWatch } : {}),
+    readCurveReserves: (mint) => fetchCurveReserves(config.rpcUrl, mint),
   });
   if (curveWatch) {
     botRef.onCurveReserves = (mint, realSol, reserves, complete) =>

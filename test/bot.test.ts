@@ -7,6 +7,8 @@ import { poolSellPrice } from "../src/pricing.js";
 import { BoughtMints } from "../src/bought.js";
 import { SniperBot } from "../src/bot.js";
 import { loadConfig, type AppConfig } from "../src/config.js";
+import { PaperExecutor } from "../src/executor-paper.js";
+import { paperBuy } from "../src/paper-math.js";
 import type { FilterDecision } from "../src/filter.js";
 import { Logger } from "../src/logger.js";
 import { PositionBook } from "../src/positions.js";
@@ -77,6 +79,7 @@ function harness(options: {
     isLive(mint: string): boolean;
   };
   bought?: BoughtMints;
+  readCurveReserves?: (mint: string) => Promise<{ vSol: number; vTokens: number } | null>;
 }) {
   const dir = mkdtempSync(join(tmpdir(), "sniper-bot-"));
   const config = { ...loadConfig({ DATA_DIR: dir }), ...options.config, dataDir: dir };
@@ -122,9 +125,159 @@ function harness(options: {
     ...(options.walletBalanceSol ? { walletBalanceSol: options.walletBalanceSol } : {}),
     ...(options.safetyCheck ? { safetyCheck: options.safetyCheck } : {}),
     ...(options.curveWatch ? { curveWatch: options.curveWatch } : {}),
+    readCurveReserves:
+      options.readCurveReserves ?? (async () => ({ vSol: 30, vTokens: 1_073_000_000 })),
   });
   return { bot, positions, trades, sells, config, log, subscribed, unsubscribed, bought };
 }
+
+test("a paper buy fills from live curve reserves plus impact and slippage, not the launch price", async () => {
+  const launchTokens = 1_073_000_000;
+  const launchSol = 30;
+  const launchPrice = launchSol / launchTokens;
+  const k = launchSol * launchTokens;
+  const vSol = 48;
+  const vTokens = k / vSol;
+  const seen: OrderRequest[] = [];
+  const { bot, config, trades, log } = harness({
+    capture: true,
+    buy: async (order) => {
+      seen.push(order);
+      return new PaperExecutor(config.paper).buy(order);
+    },
+    readCurveReserves: async () => {
+      throw new Error("account read should not run when a trade already has reserves");
+    },
+  });
+  await bot.onTrade({
+    kind: "trade",
+    mint: "Mint111",
+    txType: "buy",
+    trader: "x",
+    signature: "pre",
+    solQuoted: true,
+    priceSol: vSol / vTokens,
+    marketCapSol: (vSol / vTokens) * 1e9,
+    vSolSol: vSol,
+    vTokens,
+  });
+  await bot.onLaunch(
+    launch({
+      priceSol: launchPrice,
+      marketCapSol: launchSol,
+      vSolSol: launchSol,
+      vTokens: launchTokens,
+    }),
+  );
+  const order = seen[0];
+  assert.ok(order);
+  const tokensOut = vTokens - (vSol * vTokens) / (vSol + order.sizeSol);
+  const impact = order.sizeSol / tokensOut;
+  const expected = paperBuy(impact, order.sizeSol, config.paper);
+  const row = trades.readAll().find((entry) => entry.side === "buy" && entry.status === "filled");
+  assert.ok(row);
+  assert.ok(Math.abs(order.quotePriceSol - impact) < 1e-12);
+  assert.ok(Math.abs(row.price - expected.fillPriceSol) < 1e-12);
+  assert.ok(row.price > launchPrice * 1.2);
+  assert.ok(Math.abs(row.price - launchPrice) / launchPrice > 0.2);
+  assert.equal(
+    (log as ListLogger).entries.some((entry) => entry.fields?.reason === "no-fresh-reserves"),
+    false,
+  );
+});
+
+test("a paper buy reads the curve account when no trade or curve-watch sample exists", async () => {
+  const launchTokens = 1_073_000_000;
+  const k = 30 * launchTokens;
+  const vSol = 55;
+  const vTokens = k / vSol;
+  let reads = 0;
+  const seen: OrderRequest[] = [];
+  const { bot, config, trades } = harness({
+    buy: async (order) => {
+      seen.push(order);
+      return new PaperExecutor(config.paper).buy(order);
+    },
+    readCurveReserves: async () => {
+      reads += 1;
+      return { vSol, vTokens };
+    },
+  });
+  await bot.onLaunch(
+    launch({
+      priceSol: 30 / launchTokens,
+      vSolSol: 30,
+      vTokens: launchTokens,
+    }),
+  );
+  assert.equal(reads, 1);
+  const order = seen[0];
+  assert.ok(order);
+  const tokensOut = vTokens - (vSol * vTokens) / (vSol + order.sizeSol);
+  const expected = paperBuy(order.sizeSol / tokensOut, order.sizeSol, config.paper);
+  const row = trades.readAll().find((entry) => entry.side === "buy");
+  assert.ok(row);
+  assert.ok(Math.abs(row.price - expected.fillPriceSol) < 1e-12);
+  assert.ok(row.price > (30 / launchTokens) * 1.2);
+});
+
+test("a paper buy uses curve-watch reserves and skips when nothing fresh is available", async () => {
+  const launchTokens = 1_073_000_000;
+  const k = 30 * launchTokens;
+  const vSol = 60;
+  const vTokens = k / vSol;
+  let reads = 0;
+  const seen: OrderRequest[] = [];
+  const watched = harness({
+    buy: async (order) => {
+      seen.push(order);
+      return new PaperExecutor(watched.config.paper).buy(order);
+    },
+    readCurveReserves: async () => {
+      reads += 1;
+      return null;
+    },
+  });
+  watched.bot.onCurveReserves("Mint111", 4, { vSol, vTokens });
+  await watched.bot.onLaunch(
+    launch({
+      priceSol: 30 / launchTokens,
+      vSolSol: 30,
+      vTokens: launchTokens,
+    }),
+  );
+  assert.equal(reads, 0);
+  const order = seen[0];
+  assert.ok(order);
+  const tokensOut = vTokens - (vSol * vTokens) / (vSol + order.sizeSol);
+  const expected = paperBuy(order.sizeSol / tokensOut, order.sizeSol, watched.config.paper);
+  const row = watched.trades.readAll().find((entry) => entry.side === "buy");
+  assert.ok(row);
+  assert.ok(Math.abs(row.price - expected.fillPriceSol) < 1e-12);
+
+  let buys = 0;
+  const skipped = harness({
+    capture: true,
+    buy: async () => {
+      buys += 1;
+      return fill({});
+    },
+    readCurveReserves: async () => null,
+  });
+  await skipped.bot.onLaunch(
+    launch({
+      mint: "Bare",
+      priceSol: 30 / launchTokens,
+      vSolSol: 30,
+      vTokens: launchTokens,
+    }),
+  );
+  assert.equal(buys, 0);
+  assert.equal(skipped.positions.list().length, 0);
+  assert.ok(
+    (skipped.log as ListLogger).entries.some((entry) => entry.fields?.reason === "no-fresh-reserves"),
+  );
+});
 
 test("a failed buy is logged and does not open a position", async () => {
   const { bot, positions, trades } = harness({

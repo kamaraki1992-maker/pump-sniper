@@ -35,6 +35,35 @@ export function virtualReservesFromCurveData(data: Uint8Array): { vSol: number; 
   return { vSol: vSolLamports / 1e9, vTokens: vTokensRaw / 1e6 };
 }
 
+/** getAccountInfo on the bonding curve. Null when the account or its reserves are missing. */
+export async function fetchCurveReserves(
+  rpcUrl: string,
+  mint: string,
+  fetcher: typeof fetch = fetch,
+): Promise<{ vSol: number; vTokens: number } | null> {
+  const curve = bondingCurveAddress(mint, null);
+  if (!curve) return null;
+  const response = await fetcher(rpcUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getAccountInfo",
+      params: [curve, { encoding: "base64", commitment: "confirmed" }],
+    }),
+  });
+  if (!response.ok) return null;
+  const payload = (await response.json()) as {
+    error?: { message?: string };
+    result?: { value?: { data?: [string, string] } | null };
+  };
+  if (payload.error) return null;
+  const encoded = payload.result?.value?.data?.[0];
+  if (typeof encoded !== "string" || encoded.length === 0) return null;
+  return virtualReservesFromCurveData(Buffer.from(encoded, "base64"));
+}
+
 export function bondingCurveAddress(mint: string, hinted: string | null): string | null {
   if (hinted && hinted.length > 0) return hinted;
   try {

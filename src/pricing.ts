@@ -127,6 +127,21 @@ export function constantProductSellPrice(
   return out / tokenAmount;
 }
 
+/**
+ * Average SOL per token for buying `sizeSol` out of the constant-product curve.
+ * This is the price impact of our own size. Slippage is applied by the paper model.
+ */
+export function curveBuyPrice(
+  vSol: number | null | undefined,
+  vTokens: number | null | undefined,
+  sizeSol: number,
+): number | null {
+  if (vSol == null || vTokens == null || !reservesOnCurve(vSol, vTokens) || !(sizeSol > 0)) return null;
+  const tokensOut = vTokens - (vSol * vTokens) / (vSol + sizeSol);
+  if (!(tokensOut > 0) || !Number.isFinite(tokensOut)) return null;
+  return sizeSol / tokensOut;
+}
+
 /** Average SOL per token for selling `tokenAmount` into the constant-product curve. */
 export function curveSellPrice(vSol: number | null | undefined, vTokens: number | null | undefined, tokenAmount: number): number | null {
   if (vSol == null || vTokens == null || !reservesOnCurve(vSol, vTokens)) return null;

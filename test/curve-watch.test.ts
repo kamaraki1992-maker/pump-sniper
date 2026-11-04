@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { RpcCurveWatch, realSolFromCurveData } from "../src/curve-watch.js";
+import { bondingCurveAddress, fetchCurveReserves, RpcCurveWatch, realSolFromCurveData } from "../src/curve-watch.js";
 import { Logger } from "../src/logger.js";
 import { redactRpcUrl } from "../src/redact.js";
 import { reservesDropped } from "../src/risk.js";
@@ -35,6 +35,29 @@ test("real SOL reserves are the u64 lamports at offset 32", () => {
   assert.equal(realSolFromCurveData(Buffer.alloc(8)), null);
   assert.equal(reservesDropped(10, 7.9, 20), true);
   assert.equal(reservesDropped(10, 8, 20), false);
+});
+
+test("fetchCurveReserves calls getAccountInfo on the bonding curve", async () => {
+  const mint = "6vkymtWzVndBc99q8aZJ5GatxKSBoFHyekP439G7pump";
+  const data = Buffer.alloc(49);
+  data.writeBigUInt64LE(900_000_000_000_000n, 8);
+  data.writeBigUInt64LE(48_000_000_000n, 16);
+  let method = "";
+  let account = "";
+  const reserves = await fetchCurveReserves("https://rpc.example", mint, async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as { method: string; params: [string] };
+    method = body.method;
+    account = body.params[0];
+    return new Response(
+      JSON.stringify({ result: { value: { data: [data.toString("base64"), "base64"] } } }),
+      { status: 200 },
+    );
+  });
+  assert.equal(method, "getAccountInfo");
+  assert.equal(account, bondingCurveAddress(mint, null));
+  assert.ok(reserves);
+  assert.equal(reserves?.vSol, 48);
+  assert.equal(reserves?.vTokens, 900_000_000);
 });
 
 test("closing a position unsubscribes its bonding curve", () => {
