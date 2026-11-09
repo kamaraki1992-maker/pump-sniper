@@ -24,7 +24,9 @@ test("defaults match the risk spec", () => {
   const cfg = loadConfig({});
   assert.equal(cfg.buySizeMinUsd, 5);
   assert.equal(cfg.buySizeMaxUsd, 30);
-  assert.equal(cfg.maxSlippagePct, 3);
+  assert.equal(cfg.buySlippagePct, 5);
+  assert.equal(cfg.sellSlippagePct, 10);
+  assert.equal(cfg.maxSlippagePct, 5);
   assert.equal(cfg.jitoTipSol, 0.002);
   assert.equal(cfg.stopLossPct, 20);
   assert.equal(cfg.trailActivatePct, 50);
@@ -50,8 +52,14 @@ test("buy size, slippage, and tip hard caps refuse startup", () => {
   assert.equal(loadConfig({ BUY_SIZE_MAX_USD: "30" }).buySizeMaxUsd, 30);
   assert.equal(loadConfig({ BUY_SIZE_MIN_USD: "5", BUY_SIZE_MAX_USD: "20" }).buySizeMaxUsd, 20);
   assert.throws(() => loadConfig({ MAX_SLIPPAGE_PCT: "21" }), ConfigError);
-  assert.equal(loadConfig({ MAX_SLIPPAGE_PCT: "20" }).maxSlippagePct, 20);
-  assert.equal(loadConfig({}).maxSlippagePct, 3);
+  assert.throws(() => loadConfig({ BUY_SLIPPAGE_PCT: "21" }), ConfigError);
+  assert.throws(() => loadConfig({ SELL_SLIPPAGE_PCT: "21" }), ConfigError);
+  assert.equal(loadConfig({ MAX_SLIPPAGE_PCT: "20" }).buySlippagePct, 20);
+  assert.equal(loadConfig({ MAX_SLIPPAGE_PCT: "20" }).sellSlippagePct, 20);
+  assert.equal(loadConfig({ MAX_SLIPPAGE_PCT: "3" }).buySlippagePct, 3);
+  assert.equal(loadConfig({ MAX_SLIPPAGE_PCT: "3", BUY_SLIPPAGE_PCT: "5", SELL_SLIPPAGE_PCT: "10" }).sellSlippagePct, 10);
+  assert.equal(loadConfig({}).buySlippagePct, 5);
+  assert.equal(loadConfig({}).sellSlippagePct, 10);
   assert.throws(() => loadConfig({ JITO_TIP_SOL: "0.001" }), ConfigError);
   assert.throws(() => loadConfig({ JITO_TIP_SOL: "0.006" }), ConfigError);
   assert.equal(loadConfig({ JITO_TIP_SOL: "0.002" }).jitoTipSol, 0.002);

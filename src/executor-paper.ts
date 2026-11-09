@@ -17,6 +17,11 @@ function failed(order: OrderRequest, error: string): FillResult {
   };
 }
 
+function capped(model: PaperModel, cap: number): PaperModel {
+  if (!(cap >= 0) || !Number.isFinite(cap)) return model;
+  return { ...model, slippagePct: Math.min(model.slippagePct, cap) };
+}
+
 /** Simulated fills. This executor never signs or broadcasts. */
 export class PaperExecutor implements Executor {
   constructor(private readonly model: PaperModel) {}
@@ -25,7 +30,7 @@ export class PaperExecutor implements Executor {
     if (!(order.quotePriceSol > 0) || !(order.sizeSol > 0)) {
       return failed(order, "no-price");
     }
-    const fill = paperBuy(order.quotePriceSol, order.sizeSol, this.model);
+    const fill = paperBuy(order.quotePriceSol, order.sizeSol, capped(this.model, order.slippagePct));
     return {
       status: "filled",
       signature: "paper",
@@ -45,7 +50,7 @@ export class PaperExecutor implements Executor {
     if (!(order.quotePriceSol > 0) || !(tokens > 0)) {
       return failed(order, "no-price");
     }
-    const fill = paperSell(order.quotePriceSol, tokens, this.model);
+    const fill = paperSell(order.quotePriceSol, tokens, capped(this.model, order.slippagePct));
     return {
       status: "filled",
       signature: "paper",

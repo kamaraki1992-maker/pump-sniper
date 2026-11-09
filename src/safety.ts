@@ -224,7 +224,7 @@ async function simulateTrade(
       mint,
       amount,
       denominatedInSol: action === "buy" ? "true" : "false",
-      slippage: config.maxSlippagePct,
+      slippage: action === "buy" ? config.buySlippagePct : config.sellSlippagePct,
     }),
   });
   const bytes = new Uint8Array(await response.arrayBuffer());

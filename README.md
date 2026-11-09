@@ -29,7 +29,8 @@ These limits are constants in `src/config.ts`. The process exits on startup if t
 
 | Setting | Default | Hard bound |
 | --- | --- | --- |
-| Slippage | 3% | `<= 20%` |
+| Buy slippage | 5% | `<= 20%`. `MAX_SLIPPAGE_PCT` still fills in when `BUY_SLIPPAGE_PCT` is unset |
+| Sell slippage | 10% | `<= 20%`. Same fallback when `SELL_SLIPPAGE_PCT` is unset |
 | Jito tip | 0.002 SOL | `0.002` to `0.005` SOL |
 | Buy size | $5 to $30 | confidence score, hard cap `$30`, converted to SOL at buy time |
 | Stop loss | -20% from the entry fill | `<= 20%`, sells 100% on the mark that crosses it |
@@ -48,7 +49,7 @@ At most `MAX_OPEN_POSITIONS` positions are open at once, and only one position p
 
 The hard stop sells 100% when the mark is at or below 80% of the entry fill (`STOP_LOSS_PCT=20`). It uses that fill, not a later mark. Once the peak reaches +50% (`TRAIL_ACTIVATE_PCT`), the stop becomes `max(entry, peak * 0.8)` (`TRAIL_DISTANCE_PCT=20`). That is break-even until the 20% trail is tighter, and it only ratchets up. A mark at or below that stop sells whatever is left, with reason `trailing_stop`. At +100% (`TP1_PCT`) the bot sells half (`TP1_SELL_FRACTION=0.5`) once and leaves the rest on the trail. Each partial row stores its own realized PnL, and `realizedPnlTotalSol` is the sum so far. `TRAIL_TIERS` and `TAKE_PROFIT_PCT` are ignored, with a deprecation log when they are set. After those price exits, the bot can still exit for a liquidity drop, sell pressure, a volume stall, or the 10 minute hold. Volume stall does not start at entry. `VOLUME_STALL_GRACE_SEC` (default 90) has to elapse first, and the 45 second silence window is then measured from `max(entry + grace, last trade)`. The hold and stall timers run about once a second, so a token with no trades still exits, just not in the first two minutes. The slot frees only after the remaining tokens are sold. Paper and live use the same exit rules, and a paper fill uses the reserves that produced the trigger mark. The log prints that mark next to the fill.
 
-Jito bundles and a 3% default slippage reduce sandwich exposure. They do not guarantee that a fill is protected from MEV, and a bundle can still expire without landing.
+Jito bundles, a 5% buy slippage cap, and a 10% sell slippage cap reduce sandwich exposure. They do not guarantee that a fill is protected from MEV, and a bundle can still expire without landing. Paper fills apply those same caps.
 
 When `RPC_WS_URL` is set, each open position `accountSubscribe`s (commitment `confirmed`) to its pump.fun bonding-curve account. Real SOL reserves are the u64 lamports at offset 32. A drop of more than `LIQ_DROP_PCT` from the first sample sells with `liquidity_drop` immediately. The subscription is removed when the position closes. The socket reconnects with backoff and resubscribes every open curve. If the URL is unset or the socket is down, the same exit uses virtual SOL from the trade stream. Logs strip the `api-key` query parameter and never print the raw URL.
 
@@ -60,7 +61,7 @@ In live mode the bot reads the wallet balance before sending a buy. It skips the
 
 ## Paper and live
 
-Paper fills use the stream price, then apply adverse slippage (`PAPER_SLIPPAGE_PCT`, default 2%, capped by the slippage limit), a 1% protocol fee, a 0.25% venue fee, the priority fee, the base signature fee, and the Jito tip. Unrealized PnL uses the same exit model, in SOL and in USD. USD uses the CoinGecko SOL price, with Jupiter as a fallback.
+Paper fills use the stream price, then apply adverse slippage (`PAPER_SLIPPAGE_PCT`, default 2%, capped at 5% on buys and 10% on sells), a 1% protocol fee, a 0.25% venue fee, the priority fee, the base signature fee, and the Jito tip. Unrealized PnL uses the same exit model, in SOL and in USD. USD uses the CoinGecko SOL price, with Jupiter as a fallback.
 
 Live mode loads `PRIVATE_KEY` from the environment, derives the public key locally, and discards the secret from every log line. The key is not sent to PumpDev. Before a live buy it checks the wallet balance as described above. See the assumptions below for why the live path is the local-sign bundle endpoint rather than server-signed Lightning.
 

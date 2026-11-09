@@ -191,7 +191,7 @@ export class SniperBot {
       creator: launch.creator,
       sizeSol,
       quotePriceSol,
-      slippagePct: this.deps.config.maxSlippagePct,
+      slippagePct: this.deps.config.buySlippagePct,
       reason: "entry",
     };
     try {
@@ -451,7 +451,7 @@ export class SniperBot {
           sizeSol: current.costSol,
           quotePriceSol: execution,
           ...(current.graduated ? { pool: "pump-amm" as const } : {}),
-          slippagePct: this.deps.config.maxSlippagePct,
+          slippagePct: this.deps.config.sellSlippagePct,
           reason,
           tokenAmount: requested,
           sellFraction: portion,

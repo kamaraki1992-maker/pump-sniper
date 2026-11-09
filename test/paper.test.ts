@@ -34,6 +34,57 @@ test("a round trip at an unchanged quote loses the spread, fees, and tips", () =
   assert.ok(Math.abs(unrealizedPnlSol(buy.tokenAmount, buy.costSol, quote, model) - pnl) < 1e-9);
 });
 
+test("paper fills cap buys at 5% and sells at 10%", async () => {
+  const loose: PaperModel = { ...model, slippagePct: 12 };
+  const executor = new PaperExecutor(loose);
+  const buy = await executor.buy({
+    mint: "M",
+    name: "N",
+    symbol: "S",
+    creator: "C",
+    sizeSol: 1,
+    quotePriceSol: 1,
+    slippagePct: 5,
+    reason: "entry",
+  });
+  assert.ok(Math.abs(buy.price - 1.05) < 1e-12);
+  const sell = await executor.sell({
+    mint: "M",
+    name: "N",
+    symbol: "S",
+    creator: "C",
+    sizeSol: 1,
+    quotePriceSol: 1,
+    slippagePct: 10,
+    tokenAmount: 10,
+    reason: "sl",
+  });
+  assert.ok(Math.abs(sell.price - 0.9) < 1e-12);
+  const under = await executor.buy({
+    mint: "M",
+    name: "N",
+    symbol: "S",
+    creator: "C",
+    sizeSol: 1,
+    quotePriceSol: 1,
+    slippagePct: 5,
+    reason: "entry",
+  });
+  const tight = new PaperExecutor(model);
+  const kept = await tight.buy({
+    mint: "M",
+    name: "N",
+    symbol: "S",
+    creator: "C",
+    sizeSol: 1,
+    quotePriceSol: 1,
+    slippagePct: 5,
+    reason: "entry",
+  });
+  assert.ok(Math.abs(kept.price - 1.02) < 1e-12);
+  assert.ok(under.price > kept.price);
+});
+
 test("paper executor reports signature paper and never invents a position on a bad price", async () => {
   const executor = new PaperExecutor(model);
   const missed = await executor.buy({

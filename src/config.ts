@@ -38,7 +38,10 @@ export interface AppConfig {
   mode: Mode;
   buySizeMinUsd: number;
   buySizeMaxUsd: number;
+  /** Buy cap. Also the value used when older code reads a single slippage. */
   maxSlippagePct: number;
+  buySlippagePct: number;
+  sellSlippagePct: number;
   stopLossPct: number;
   /** Peak gain that arms the trail. The stop then sits at break-even or tighter. */
   trailActivatePct: number;
@@ -87,6 +90,11 @@ export interface AppConfig {
   confirmTimeoutMs: number;
   sellMaxAttempts: number;
   paper: PaperModel;
+}
+
+function optionalNum(value: string | undefined, name: string): number | null {
+  if (value === undefined || value.trim() === "") return null;
+  return num(value, 0, name);
 }
 
 function num(value: string | undefined, fallback: number, name: string): number {
@@ -156,7 +164,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const mode: Mode = env.MODE === "live" ? "live" : "paper";
   const buySizeMinUsd = num(env.BUY_SIZE_MIN_USD, 5, "BUY_SIZE_MIN_USD");
   const buySizeMaxUsd = num(env.BUY_SIZE_MAX_USD, HARD_CAPS.maxBuyUsd, "BUY_SIZE_MAX_USD");
-  const maxSlippagePct = num(env.MAX_SLIPPAGE_PCT, 3, "MAX_SLIPPAGE_PCT");
+  const legacySlippage = optionalNum(env.MAX_SLIPPAGE_PCT, "MAX_SLIPPAGE_PCT");
+  const buySlippagePct = optionalNum(env.BUY_SLIPPAGE_PCT, "BUY_SLIPPAGE_PCT") ?? legacySlippage ?? 5;
+  const sellSlippagePct = optionalNum(env.SELL_SLIPPAGE_PCT, "SELL_SLIPPAGE_PCT") ?? legacySlippage ?? 10;
   const jitoTipSol = jitoTipFromEnv(env);
   const stopLossPct = num(env.STOP_LOSS_PCT, HARD_CAPS.maxStopLossPct, "STOP_LOSS_PCT");
   const trailActivatePct = num(env.TRAIL_ACTIVATE_PCT, 50, "TRAIL_ACTIVATE_PCT");
@@ -196,9 +206,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       `BUY_SIZE_MAX_USD ${buySizeMaxUsd} exceeds hard cap ${HARD_CAPS.maxBuyUsd}`,
     );
   }
-  if (!(maxSlippagePct > 0) || maxSlippagePct > HARD_CAPS.maxSlippagePct) {
+  if (!(buySlippagePct > 0) || buySlippagePct > HARD_CAPS.maxSlippagePct) {
     throw new ConfigError(
-      `MAX_SLIPPAGE_PCT ${maxSlippagePct} exceeds hard cap ${HARD_CAPS.maxSlippagePct}`,
+      `BUY_SLIPPAGE_PCT ${buySlippagePct} exceeds hard cap ${HARD_CAPS.maxSlippagePct}`,
+    );
+  }
+  if (!(sellSlippagePct > 0) || sellSlippagePct > HARD_CAPS.maxSlippagePct) {
+    throw new ConfigError(
+      `SELL_SLIPPAGE_PCT ${sellSlippagePct} exceeds hard cap ${HARD_CAPS.maxSlippagePct}`,
     );
   }
   if (jitoTipSol < HARD_CAPS.minJitoTipSol || jitoTipSol > HARD_CAPS.maxJitoTipSol) {
@@ -260,8 +275,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!(safetyCheckTimeoutMs > 0)) {
     throw new ConfigError("SAFETY_CHECK_TIMEOUT_MS must be positive");
   }
-  if (!(paperSlippagePct >= 0) || paperSlippagePct > maxSlippagePct) {
-    throw new ConfigError("PAPER_SLIPPAGE_PCT must be between 0 and MAX_SLIPPAGE_PCT");
+  const slippageCeiling = Math.max(buySlippagePct, sellSlippagePct);
+  if (!(paperSlippagePct >= 0) || paperSlippagePct > slippageCeiling) {
+    throw new ConfigError("PAPER_SLIPPAGE_PCT must be between 0 and the buy or sell slippage cap");
   }
   if (protocolFeeBps < 0 || venueFeeBps < 0 || baseFeeSol < 0) {
     throw new ConfigError("paper fee settings must be >= 0");
@@ -280,7 +296,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     mode,
     buySizeMinUsd,
     buySizeMaxUsd,
-    maxSlippagePct,
+    maxSlippagePct: buySlippagePct,
+    buySlippagePct,
+    sellSlippagePct,
     stopLossPct,
     trailActivatePct,
     trailDistancePct,
