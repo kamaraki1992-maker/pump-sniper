@@ -61,7 +61,7 @@ In live mode the bot reads the wallet balance before sending a buy. It skips the
 
 ## Paper and live
 
-Paper fills use the stream price, then apply adverse slippage (`PAPER_SLIPPAGE_PCT`, default 2%, capped at 5% on buys and 10% on sells), a 1% protocol fee, a 0.25% venue fee, the priority fee, the base signature fee, and the Jito tip. Unrealized PnL uses the same exit model, in SOL and in USD. USD uses the CoinGecko SOL price, with Jupiter as a fallback.
+Paper fills use the stream price, then apply adverse slippage (`PAPER_SLIPPAGE_PCT`, default 2%, capped at 5% on buys and 10% on sells), a 1% protocol fee, a 0.25% venue fee, the estimated priority fee (the same clamped Helius quote, or `PRIORITY_FEE_SOL` when the quote fails), the base signature fee, and the Jito tip. Unrealized PnL uses the same exit model, in SOL and in USD. USD uses the CoinGecko SOL price, with Jupiter as a fallback.
 
 Live mode loads `PRIVATE_KEY` from the environment, derives the public key locally, and discards the secret from every log line. The key is not sent to PumpDev. Before a live buy it checks the wallet balance as described above. See the assumptions below for why the live path is the local-sign bundle endpoint rather than server-signed Lightning.
 
@@ -101,6 +101,7 @@ The day is a calendar date in `Europe/Berlin`. The command prints one JSON objec
 | `src/history.ts` | RPC lookup behind the filter |
 | `src/executor-paper.ts` | Simulated fills |
 | `src/executor-live.ts` | Sign locally, simulate, Jito `sendBundle` |
+| `src/priority-fee.ts` | Helius priority fee, recent-fee percentile, and the lamport clamp |
 | `src/risk.ts` | Stop loss, trailing stop, and the 2x partial |
 | `src/positions.ts` | Open positions and unrealized PnL |
 | `src/report.ts` | JSONL log and daily summary |
@@ -129,7 +130,7 @@ Checked against PumpDev's public docs (`https://pumpdev.io/skill/pumpdev/referen
 
 **Live trading.** `POST /api/trade-lightning` is server-signed. The documented body is `action`, `mint`, `amount`, `denominatedInSol`, and an optional `creator`. It does not take a Jito tip, a compute-unit limit, or a local private key. Auth is a PumpDev API key for a hosted wallet. `POST /api/bundle-lightning` adds `jitoTip` and sends through Jito, and it also signs with that hosted key.
 
-v1 keeps the burner key local, so live orders use `POST /api/bundle` (`TRADE_API_URL`). The body is one account with the Lightning trade fields (`type`, `amount`, `denominatedInSol`, `creator`) plus top-level `mint`, `slippage`, and `jitoTip`, and `publicKey` instead of `apiKey`. The response is an unsigned transaction. The bot simulates it, sets the compute-unit limit from units consumed (20% headroom, plus 10,000, clamped), sets the compute-unit price from `PRIORITY_FEE_SOL`, adds a tip transfer to a random Jito tip account, signs with `PRIVATE_KEY`, and calls Jito `sendBundle` with base64 encoding. Landing is `getSignatureStatuses` until confirmed or `CONFIRM_TIMEOUT_MS` (default 20s). A bundle id by itself is not a fill. A full sell uses amount `100%`. The 2x partial uses `50%`.
+v1 keeps the burner key local, so live orders use `POST /api/bundle` (`TRADE_API_URL`). The body is one account with the Lightning trade fields (`type`, `amount`, `denominatedInSol`, `creator`) plus top-level `mint`, `slippage`, and `jitoTip`, and `publicKey` instead of `apiKey`. The response is an unsigned transaction. The bot simulates it, sets the compute-unit limit from units consumed (20% headroom, plus 10,000, clamped), and sets the compute-unit price from Helius `getPriorityFeeEstimate` with `priorityLevel` `High`. If that method is missing, it uses `getRecentPrioritizationFees` and the 90th percentile of the accounts the transaction touches. The total is clamped to `PRIORITY_FEE_MAX_LAMPORTS` (default 500_000, about 0.0005 SOL) and cached for `PRIORITY_FEE_CACHE_MS` (default 5s). A failed lookup uses `PRIORITY_FEE_SOL`. The price is still `ComputeBudgetProgram.setComputeUnitPrice`, next to the dynamic unit limit. It adds a tip transfer to a random Jito tip account, signs with `PRIVATE_KEY`, and calls Jito `sendBundle` with base64 encoding. Landing is `getSignatureStatuses` until confirmed or `CONFIRM_TIMEOUT_MS` (default 20s). A bundle id by itself is not a fill. A full sell uses amount `100%`. The 2x partial uses `50%`.
 
 PumpDev's own notes say contested launch bundles often need tips above this bot's 0.005 SOL cap (they measured 0.03 SOL). Live bundles at 0.002–0.005 SOL can be accepted by the block engine and still never land. That shows up as `bundle-not-landed`.
 

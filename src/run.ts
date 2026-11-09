@@ -5,8 +5,10 @@ import { BoughtMints } from "./bought.js";
 import { SniperBot } from "./bot.js";
 import { fetchCurveReserves, RpcCurveWatch } from "./curve-watch.js";
 import { ConfigError, loadConfig, type AppConfig } from "./config.js";
+import { cuLimitFromConsumed } from "./compute.js";
 import { PaperExecutor } from "./executor-paper.js";
 import { createLivePorts, LiveExecutor } from "./executor-live.js";
+import { PriorityFeeEstimator } from "./priority-fee.js";
 import { RpcHolderCheck } from "./holders.js";
 import { RpcCreatorHistory } from "./history.js";
 import { createRpcFetch } from "./rpc-limit.js";
@@ -84,6 +86,15 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
         botRef.onCurveReserves(mint, realSol, reserves, complete),
       )
     : undefined;
+  const priorityFees = new PriorityFeeEstimator(
+    config.rpcUrl,
+    config.priorityFeeSol,
+    config.priorityFeeMaxLamports,
+    config.priorityFeeCacheMs,
+    rpcFetch,
+  );
+  const quotePriorityFee = (accountKeys: string[], cuLimit: number) =>
+    priorityFees.quote(accountKeys, cuLimit).then((quote) => quote.sol);
   let executor: Executor;
   let walletBalanceSol: (() => Promise<number>) | undefined;
   if (config.mode === "live") {
@@ -94,14 +105,18 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
       fetch: rpcFetch,
       disableRetryOnRateLimit: true,
     });
-    executor = new LiveExecutor(createLivePorts(config, keypair, connection));
+    const ports = createLivePorts(config, keypair, connection);
+    ports.priorityFee = quotePriorityFee;
+    executor = new LiveExecutor(ports);
     walletBalanceSol = async () => {
       const lamports = await connection.getBalance(keypair.publicKey, "processed");
       return lamports / 1e9;
     };
   } else {
     log.info("paper mode");
-    executor = new PaperExecutor(config.paper);
+    executor = new PaperExecutor(config.paper, (order) =>
+      quotePriorityFee(order.mint ? [order.mint] : [], cuLimitFromConsumed(null)),
+    );
   }
   const subscription: { stream: LiveStream | null } = { stream: null };
   const bot = new SniperBot({

@@ -56,6 +56,10 @@ export interface AppConfig {
   ignoredTakeProfit: boolean;
   jitoTipSol: number;
   priorityFeeSol: number;
+  /** Total priority-fee clamp for one transaction, in lamports. */
+  priorityFeeMaxLamports: number;
+  /** How long a Helius or recent-fee sample is reused. */
+  priorityFeeCacheMs: number;
   creatorMaxHoldPct: number;
   /** Skip a buy when the filtered top 10 own more than this percent of supply. */
   maxTop10Pct: number;
@@ -154,8 +158,13 @@ export function clampBuyUsd(usd: number): number {
   return Math.min(usd, HARD_CAPS.maxBuyUsd);
 }
 
+/** SOL reserved for the priority fee. The dynamic quote can rise to the lamport clamp. */
+export function reservedPriorityFeeSol(config: AppConfig): number {
+  return Math.max(config.priorityFeeSol, config.priorityFeeMaxLamports / 1e9);
+}
+
 export function requiredBuyBalanceSol(config: AppConfig, buySize: number, openPositions = 0): number {
-  const txFee = config.priorityFeeSol + config.paper.baseFeeSol;
+  const txFee = reservedPriorityFeeSol(config) + config.paper.baseFeeSol;
   const exitReserve = txFee + config.jitoTipSol;
   return buySize + txFee + config.jitoTipSol + exitReserve + openPositions * exitReserve;
 }
@@ -176,6 +185,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const ignoredTrailTiers = Boolean(env.TRAIL_TIERS?.trim());
   const ignoredTakeProfit = Boolean(env.TAKE_PROFIT_PCT?.trim());
   const priorityFeeSol = num(env.PRIORITY_FEE_SOL, 0.00005, "PRIORITY_FEE_SOL");
+  const priorityFeeMaxLamports = num(env.PRIORITY_FEE_MAX_LAMPORTS, 500_000, "PRIORITY_FEE_MAX_LAMPORTS");
+  const priorityFeeCacheMs = num(env.PRIORITY_FEE_CACHE_MS, 5_000, "PRIORITY_FEE_CACHE_MS");
   const creatorMaxHoldPct = num(creatorHoldRaw(env), 5, "MAX_CREATOR_HOLD_PCT");
   const maxTop10Pct = num(env.MAX_TOP10_PCT, 25, "MAX_TOP10_PCT");
   const heliusRps = num(env.HELIUS_RPS, 5, "HELIUS_RPS");
@@ -240,6 +251,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   if (!(priorityFeeSol >= 0) || priorityFeeSol > 0.01) {
     throw new ConfigError("PRIORITY_FEE_SOL must be between 0 and 0.01");
+  }
+  if (!(priorityFeeMaxLamports > 0) || priorityFeeMaxLamports > 10_000_000) {
+    throw new ConfigError("PRIORITY_FEE_MAX_LAMPORTS must be between 0 and 10000000");
+  }
+  if (!(priorityFeeCacheMs >= 0)) {
+    throw new ConfigError("PRIORITY_FEE_CACHE_MS must be >= 0");
   }
   if (!(creatorMaxHoldPct > 0) || creatorMaxHoldPct > HARD_CAPS.maxCreatorHoldPct) {
     throw new ConfigError(
@@ -308,6 +325,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ignoredTakeProfit,
     jitoTipSol,
     priorityFeeSol,
+    priorityFeeMaxLamports,
+    priorityFeeCacheMs,
     creatorMaxHoldPct,
     maxTop10Pct,
     heliusRps,

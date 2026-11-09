@@ -8,7 +8,7 @@ import {
 import bs58 from "bs58";
 import { applyDynamicCompute, fetchUnsignedBundle, loadLookupTables } from "./bundle-api.js";
 import type { AppConfig } from "./config.js";
-import { pickTipAccount } from "./compute.js";
+import { cuLimitFromConsumed, pickTipAccount } from "./compute.js";
 import type { Executor, FillResult, OrderRequest } from "./types.js";
 
 export interface ConfirmResult {
@@ -26,6 +26,8 @@ export interface LivePorts {
   lookupTables(tx: VersionedTransaction): Promise<AddressLookupTableAccount[]>;
   sendBundle(tx: VersionedTransaction): Promise<{ bundleId: string; signature: string }>;
   confirm(signature: string): Promise<ConfirmResult>;
+  /** Dynamic priority fee in SOL. A throw or a missing port uses PRIORITY_FEE_SOL. */
+  priorityFee?: (accountKeys: string[], cuLimit: number) => Promise<number>;
   tipAccount: PublicKey;
   config: AppConfig;
 }
@@ -130,12 +132,14 @@ export class LiveExecutor implements Executor {
     const sim = await this.ports.simulate(tx);
     if (sim.err) return blank(order, classifySimError(sim.err));
 
+    const cuLimit = cuLimitFromConsumed(sim.unitsConsumed);
+    const priorityFeeSol = await this.priorityFeeSol(tx, cuLimit);
     let prepared: VersionedTransaction;
     try {
       const tables = await this.ports.lookupTables(tx);
       prepared = applyDynamicCompute(tx, tables, {
         unitsConsumed: sim.unitsConsumed,
-        priorityFeeSol: this.ports.config.priorityFeeSol,
+        priorityFeeSol,
         tipSol: this.ports.config.jitoTipSol,
         tipAccount: this.ports.tipAccount,
         payer: this.ports.publicKey,
@@ -161,14 +165,27 @@ export class LiveExecutor implements Executor {
     const estimate = {
       price: order.quotePriceSol,
       tokenAmount: order.tokenAmount ?? 0,
-      feesSol: this.ports.config.priorityFeeSol + this.ports.config.paper.baseFeeSol,
+      feesSol: priorityFeeSol + this.ports.config.paper.baseFeeSol,
       tipSol: this.ports.config.jitoTipSol,
       cashflowSol:
         order.reason === "entry"
-          ? order.sizeSol + this.ports.config.jitoTipSol + this.ports.config.priorityFeeSol
+          ? order.sizeSol + this.ports.config.jitoTipSol + priorityFeeSol
           : 0,
     };
     return liveFillFromConfirm(order, sent.signature, confirm, estimate);
+  }
+
+  private async priorityFeeSol(tx: VersionedTransaction, cuLimit: number): Promise<number> {
+    const fallback = this.ports.config.priorityFeeSol;
+    if (!this.ports.priorityFee) return fallback;
+    try {
+      const keys = tx.message.staticAccountKeys.map((key) => key.toBase58());
+      const quoted = await this.ports.priorityFee(keys, cuLimit);
+      if (!(quoted >= 0) || !Number.isFinite(quoted)) return fallback;
+      return quoted;
+    } catch {
+      return fallback;
+    }
   }
 }
 

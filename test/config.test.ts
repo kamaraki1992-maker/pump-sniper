@@ -92,7 +92,7 @@ test("open positions cannot be loosened past 5", () => {
 
 test("live buy reserves exit SOL for the USD notional and for positions already open", () => {
   const cfg = loadConfig({});
-  const fee = 0.00005 + 0.000005;
+  const fee = 0.0005 + 0.000005;
   const tip = 0.002;
   const sizeSol = clampBuyUsd(30) / 100;
   const one = requiredBuyBalanceSol(cfg, sizeSol, 0);
