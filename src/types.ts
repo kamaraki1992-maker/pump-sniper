@@ -69,13 +69,15 @@ export interface OrderRequest {
   name: string;
   symbol: string;
   creator: string;
-  /** SOL notionals for buys. Ignored for sells, which close 100%. */
+  /** SOL notionals for buys. Sells use `tokenAmount` and `sellFraction`. */
   sizeSol: number;
   /** Stream mark in SOL per token, before this order's slippage. */
   quotePriceSol: number;
   slippagePct: number;
   reason: TradeReason;
   tokenAmount?: number;
+  /** Share of the remaining position to sell. 1 or omitted closes the position. */
+  sellFraction?: number;
   /** Set on a graduated sell so the bundle is built against PumpSwap. */
   pool?: "pump-amm" | "auto";
 }
@@ -116,8 +118,10 @@ export interface TradeRecord {
   error: string | null;
   solUsd: number | null;
   tokenAmount: number;
-  /** Present on sells. Net proceeds minus the position cost basis. */
+  /** Present on sells. Net proceeds minus the cost allocated to this fill. */
   realizedPnlSol: number | null;
+  /** Present on sells. This fill plus earlier partials on the same position. */
+  realizedPnlTotalSol?: number | null;
   costSol: number | null;
 }
 
@@ -144,10 +148,16 @@ export interface Position {
   lastRealSolSol?: number | null;
   bondingCurve?: string | null;
   lastTradeAtMs?: number;
-  /** Highest mark seen. Drives the profit-lock floor. */
+  /** Highest mark seen. Drives the trailing stop. */
   peakPriceSol?: number | null;
-  /** Locked floor in percent above entry. Only ratchets up. */
+  /** Latched stop in SOL per token. Only ratchets up. Null until the trail arms. */
+  trailStopPriceSol?: number | null;
+  /** Locked floor in percent above entry. Derived from `trailStopPriceSol`. */
   trailFloorPct?: number | null;
+  /** True after the 2x partial has filled. The remainder rides the trail. */
+  tp1Taken?: boolean;
+  /** Realized SOL from partial sells already booked on this position. */
+  realizedPnlSol?: number;
   /** Trades applied to this position. Zero means the trade subscription delivered nothing. */
   tradesSeen?: number;
   /** Bonding curve completed or a PumpSwap pool was observed. */

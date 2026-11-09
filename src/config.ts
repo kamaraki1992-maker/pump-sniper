@@ -1,6 +1,5 @@
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
-import type { TrailTier } from "./risk.js";
 import type { Mode } from "./types.js";
 
 /**
@@ -15,8 +14,8 @@ export const HARD_CAPS = {
   maxCreatorHoldPct: 10,
   maxTop10Pct: 100,
   maxOpenPositions: 5,
-  maxTakeProfitPct: 50,
-  maxStopLossPct: 15,
+  maxTp1Pct: 500,
+  maxStopLossPct: 20,
 } as const;
 
 export class ConfigError extends Error {
@@ -40,8 +39,18 @@ export interface AppConfig {
   buySizeMinUsd: number;
   buySizeMaxUsd: number;
   maxSlippagePct: number;
-  takeProfitPct: number;
   stopLossPct: number;
+  /** Peak gain that arms the trail. The stop then sits at break-even or tighter. */
+  trailActivatePct: number;
+  /** Percent below the peak. The stop is max(entry, peak * (1 - distance)). */
+  trailDistancePct: number;
+  /** Gain that sells `tp1SellFraction` once. The rest rides the trail. */
+  tp1Pct: number;
+  tp1SellFraction: number;
+  /** TRAIL_TIERS was set. It is not applied. */
+  ignoredTrailTiers: boolean;
+  /** TAKE_PROFIT_PCT was set. The full take profit is not applied. */
+  ignoredTakeProfit: boolean;
   jitoTipSol: number;
   priorityFeeSol: number;
   creatorMaxHoldPct: number;
@@ -59,8 +68,6 @@ export interface AppConfig {
   volumeStallSec: number;
   /** No-trade time before this many seconds after entry does not count as a stall. */
   volumeStallGraceSec: number;
-  /** Peak-gain tiers. Each latches a stop floor that only ratchets up. */
-  trailTiers: TrailTier[];
   sellPressureRatio: number;
   sellPressureWindowSec: number;
   safetyCheckTimeoutMs: number;
@@ -89,41 +96,6 @@ function num(value: string | undefined, fallback: number, name: string): number 
     throw new ConfigError(`${name} must be a finite number`);
   }
   return parsed;
-}
-
-const DEFAULT_TRAIL_TIERS = "15:5,30:15,50:35,100:75";
-
-/** "15:5,30:15,50:35,100:75" locks +5% at +15% peak, then +15%, +35%, and +75%. */
-export function parseTrailTiers(value: string | undefined): TrailTier[] {
-  const text = value === undefined || value.trim() === "" ? DEFAULT_TRAIL_TIERS : value.trim();
-  const tiers: TrailTier[] = [];
-  for (const part of text.split(",")) {
-    const piece = part.trim();
-    const splitAt = piece.indexOf(":");
-    if (splitAt <= 0 || splitAt === piece.length - 1) {
-      throw new ConfigError(`TRAIL_TIERS ${text} is invalid`);
-    }
-    const activatePct = Number(piece.slice(0, splitAt));
-    const floorPct = Number(piece.slice(splitAt + 1));
-    if (!Number.isFinite(activatePct) || !Number.isFinite(floorPct) || !(activatePct > 0)) {
-      throw new ConfigError(`TRAIL_TIERS ${text} is invalid`);
-    }
-    tiers.push({ activatePct, floorPct });
-  }
-  if (tiers.length === 0) throw new ConfigError(`TRAIL_TIERS ${text} is invalid`);
-  tiers.sort((a, b) => a.activatePct - b.activatePct);
-  for (let i = 1; i < tiers.length; i += 1) {
-    const prev = tiers[i - 1];
-    const next = tiers[i];
-    if (!prev || !next || next.floorPct < prev.floorPct) {
-      throw new ConfigError(`TRAIL_TIERS ${text} floors must rise with the peak`);
-    }
-  }
-  return tiers;
-}
-
-export function formatTrailTiers(tiers: readonly TrailTier[]): string {
-  return tiers.map((tier) => `${tier.activatePct}:${tier.floorPct}`).join(",");
 }
 
 /** `JITO_TIP_LAMPORTS` wins when it is set. Otherwise `JITO_TIP_SOL`, default 0.002. */
@@ -186,8 +158,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const buySizeMaxUsd = num(env.BUY_SIZE_MAX_USD, HARD_CAPS.maxBuyUsd, "BUY_SIZE_MAX_USD");
   const maxSlippagePct = num(env.MAX_SLIPPAGE_PCT, 3, "MAX_SLIPPAGE_PCT");
   const jitoTipSol = jitoTipFromEnv(env);
-  const takeProfitPct = num(env.TAKE_PROFIT_PCT, 0, "TAKE_PROFIT_PCT");
   const stopLossPct = num(env.STOP_LOSS_PCT, HARD_CAPS.maxStopLossPct, "STOP_LOSS_PCT");
+  const trailActivatePct = num(env.TRAIL_ACTIVATE_PCT, 50, "TRAIL_ACTIVATE_PCT");
+  const trailDistancePct = num(env.TRAIL_DISTANCE_PCT, 20, "TRAIL_DISTANCE_PCT");
+  const tp1Pct = num(env.TP1_PCT, 100, "TP1_PCT");
+  const tp1SellFraction = num(env.TP1_SELL_FRACTION, 0.5, "TP1_SELL_FRACTION");
+  const ignoredTrailTiers = Boolean(env.TRAIL_TIERS?.trim());
+  const ignoredTakeProfit = Boolean(env.TAKE_PROFIT_PCT?.trim());
   const priorityFeeSol = num(env.PRIORITY_FEE_SOL, 0.00005, "PRIORITY_FEE_SOL");
   const creatorMaxHoldPct = num(creatorHoldRaw(env), 5, "MAX_CREATOR_HOLD_PCT");
   const maxTop10Pct = num(env.MAX_TOP10_PCT, 25, "MAX_TOP10_PCT");
@@ -199,7 +176,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const liqDropPct = num(env.LIQ_DROP_PCT, 20, "LIQ_DROP_PCT");
   const volumeStallSec = num(env.VOLUME_STALL_SEC, 45, "VOLUME_STALL_SEC");
   const volumeStallGraceSec = num(env.VOLUME_STALL_GRACE_SEC, 90, "VOLUME_STALL_GRACE_SEC");
-  const trailTiers = parseTrailTiers(env.TRAIL_TIERS);
   const sellPressureRatio = num(env.SELL_PRESSURE_RATIO, 3, "SELL_PRESSURE_RATIO");
   const sellPressureWindowSec = num(env.SELL_PRESSURE_WINDOW_SEC, 30, "SELL_PRESSURE_WINDOW_SEC");
   const safetyCheckTimeoutMs = num(env.SAFETY_CHECK_TIMEOUT_MS, 250, "SAFETY_CHECK_TIMEOUT_MS");
@@ -230,15 +206,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       `JITO_TIP_SOL ${jitoTipSol} is outside hard bounds ${HARD_CAPS.minJitoTipSol}-${HARD_CAPS.maxJitoTipSol}`,
     );
   }
-  if (takeProfitPct < 0 || takeProfitPct > HARD_CAPS.maxTakeProfitPct) {
-    throw new ConfigError(
-      `TAKE_PROFIT_PCT ${takeProfitPct} exceeds hard cap ${HARD_CAPS.maxTakeProfitPct}`,
-    );
-  }
   if (!(stopLossPct > 0) || stopLossPct > HARD_CAPS.maxStopLossPct) {
     throw new ConfigError(
       `STOP_LOSS_PCT ${stopLossPct} exceeds hard cap ${HARD_CAPS.maxStopLossPct}`,
     );
+  }
+  if (!(trailActivatePct > 0) || trailActivatePct > 500) {
+    throw new ConfigError("TRAIL_ACTIVATE_PCT must be between 0 and 500");
+  }
+  if (!(trailDistancePct > 0) || trailDistancePct >= 100) {
+    throw new ConfigError("TRAIL_DISTANCE_PCT must be between 0 and 100");
+  }
+  if (tp1Pct < 0 || tp1Pct > HARD_CAPS.maxTp1Pct) {
+    throw new ConfigError(`TP1_PCT ${tp1Pct} exceeds hard cap ${HARD_CAPS.maxTp1Pct}`);
+  }
+  if (!(tp1SellFraction > 0) || tp1SellFraction > 1) {
+    throw new ConfigError("TP1_SELL_FRACTION must be between 0 and 1");
   }
   if (!(priorityFeeSol >= 0) || priorityFeeSol > 0.01) {
     throw new ConfigError("PRIORITY_FEE_SOL must be between 0 and 0.01");
@@ -298,8 +281,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     buySizeMinUsd,
     buySizeMaxUsd,
     maxSlippagePct,
-    takeProfitPct,
     stopLossPct,
+    trailActivatePct,
+    trailDistancePct,
+    tp1Pct,
+    tp1SellFraction,
+    ignoredTrailTiers,
+    ignoredTakeProfit,
     jitoTipSol,
     priorityFeeSol,
     creatorMaxHoldPct,
@@ -312,7 +300,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     liqDropPct,
     volumeStallSec,
     volumeStallGraceSec,
-    trailTiers,
     sellPressureRatio,
     sellPressureWindowSec,
     safetyCheckTimeoutMs,

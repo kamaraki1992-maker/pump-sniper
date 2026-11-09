@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
-import { clampBuyUsd, ConfigError, formatTrailTiers, loadConfig, requiredBuyBalanceSol } from "../src/config.js";
+import { clampBuyUsd, ConfigError, loadConfig, requiredBuyBalanceSol } from "../src/config.js";
 
 const secret = bs58.encode(Keypair.generate().secretKey);
 
@@ -26,14 +26,18 @@ test("defaults match the risk spec", () => {
   assert.equal(cfg.buySizeMaxUsd, 30);
   assert.equal(cfg.maxSlippagePct, 3);
   assert.equal(cfg.jitoTipSol, 0.002);
-  assert.equal(cfg.takeProfitPct, 0);
-  assert.equal(cfg.stopLossPct, 15);
+  assert.equal(cfg.stopLossPct, 20);
+  assert.equal(cfg.trailActivatePct, 50);
+  assert.equal(cfg.trailDistancePct, 20);
+  assert.equal(cfg.tp1Pct, 100);
+  assert.equal(cfg.tp1SellFraction, 0.5);
+  assert.equal(cfg.ignoredTrailTiers, false);
+  assert.equal(cfg.ignoredTakeProfit, false);
   assert.equal(cfg.maxOpenPositions, 5);
   assert.equal(cfg.maxHoldMinutes, 10);
   assert.equal(cfg.liqDropPct, 20);
   assert.equal(cfg.volumeStallSec, 45);
   assert.equal(cfg.volumeStallGraceSec, 90);
-  assert.equal(formatTrailTiers(cfg.trailTiers), "15:5,30:15,50:35,100:75");
   assert.equal(cfg.sellPressureRatio, 3);
   assert.equal(cfg.safetyCheckTimeoutMs, 250);
   assert.equal(cfg.grpcUrl, null);
@@ -54,21 +58,21 @@ test("buy size, slippage, and tip hard caps refuse startup", () => {
   assert.equal(loadConfig({ JITO_TIP_SOL: "0.005" }).jitoTipSol, 0.005);
 });
 
-test("take profit and stop loss cannot be loosened past 50% and 15%", () => {
-  assert.throws(() => loadConfig({ TAKE_PROFIT_PCT: "51" }), ConfigError);
-  assert.throws(() => loadConfig({ TAKE_PROFIT_PCT: "100" }), ConfigError);
-  assert.equal(loadConfig({ TAKE_PROFIT_PCT: "0" }).takeProfitPct, 0);
-  assert.equal(loadConfig({ TAKE_PROFIT_PCT: "50" }).takeProfitPct, 50);
-  assert.equal(loadConfig({ TAKE_PROFIT_PCT: "40" }).takeProfitPct, 40);
-  assert.throws(() => loadConfig({ TAKE_PROFIT_PCT: "-1" }), ConfigError);
-  assert.throws(() => loadConfig({ TRAIL_TIERS: "50:10,30:40" }), ConfigError);
-  assert.throws(() => loadConfig({ TRAIL_TIERS: "nope" }), ConfigError);
+test("stop loss caps at -20%, the trail replaces TRAIL_TIERS, and take profit is the 2x partial", () => {
+  assert.throws(() => loadConfig({ STOP_LOSS_PCT: "21" }), ConfigError);
+  assert.equal(loadConfig({ STOP_LOSS_PCT: "20" }).stopLossPct, 20);
+  assert.equal(loadConfig({ STOP_LOSS_PCT: "10" }).stopLossPct, 10);
+  assert.equal(loadConfig({ TRAIL_TIERS: "nope" }).ignoredTrailTiers, true);
+  assert.equal(loadConfig({ TRAIL_TIERS: "15:5" }).trailActivatePct, 50);
+  assert.equal(loadConfig({ TAKE_PROFIT_PCT: "40" }).ignoredTakeProfit, true);
+  assert.equal(loadConfig({ TAKE_PROFIT_PCT: "40" }).tp1Pct, 100);
+  assert.throws(() => loadConfig({ TP1_PCT: "501" }), ConfigError);
+  assert.equal(loadConfig({ TP1_PCT: "100", TP1_SELL_FRACTION: "0.5" }).tp1SellFraction, 0.5);
+  assert.throws(() => loadConfig({ TP1_SELL_FRACTION: "1.1" }), ConfigError);
+  assert.throws(() => loadConfig({ TRAIL_DISTANCE_PCT: "0" }), ConfigError);
+  assert.equal(loadConfig({ TRAIL_ACTIVATE_PCT: "50", TRAIL_DISTANCE_PCT: "20" }).trailDistancePct, 20);
   assert.throws(() => loadConfig({ VOLUME_STALL_GRACE_SEC: "-1" }), ConfigError);
   assert.equal(loadConfig({ VOLUME_STALL_GRACE_SEC: "0" }).volumeStallGraceSec, 0);
-  assert.throws(() => loadConfig({ STOP_LOSS_PCT: "16" }), ConfigError);
-  assert.throws(() => loadConfig({ STOP_LOSS_PCT: "20" }), ConfigError);
-  assert.equal(loadConfig({ STOP_LOSS_PCT: "15" }).stopLossPct, 15);
-  assert.equal(loadConfig({ STOP_LOSS_PCT: "10" }).stopLossPct, 10);
 });
 
 test("open positions cannot be loosened past 5", () => {

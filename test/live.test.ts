@@ -77,6 +77,10 @@ test("bundle body matches the Lightning trade fields and omits the private key",
   assert.equal(sell.accounts[0]?.amount, "100%");
   assert.equal(sell.pool, undefined);
 
+  const partial = buildBundleBody("Pubkey111", { ...order(), reason: "tp", sellFraction: 0.5, tokenAmount: 500 }, config);
+  assert.equal(partial.accounts[0]?.amount, "50%");
+  assert.equal(partial.accounts[0]?.denominatedInSol, "false");
+
   const graduated = buildBundleBody("Pubkey111", { ...order(), reason: "tp", pool: "pump-amm" }, config);
   assert.equal(graduated.pool, "pump-amm");
 });

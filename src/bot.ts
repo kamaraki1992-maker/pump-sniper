@@ -10,7 +10,7 @@ import { Logger } from "./logger.js";
 import type { PositionBook } from "./positions.js";
 import { assessMark, curveBuyPrice, curveSellPrice, EARLY_MARK_MS, poolSellPrice, poolSpot, reservesOnCurve, TOTAL_SUPPLY_TOKENS } from "./pricing.js";
 import type { TradeLog } from "./report.js";
-import { decideExit, nextTrailFloor, reservesDropped } from "./risk.js";
+import { decideExit, ratchetStop, reservesDropped, trailStopPrice } from "./risk.js";
 import type { SafetyCheckResult } from "./safety.js";
 import type { Executor, MarketGraduation, MarketLaunch, MarketTrade, OrderRequest, Position, TradeReason } from "./types.js";
 
@@ -71,7 +71,7 @@ export class SniperBot {
   private readonly flow = new Map<string, Array<{ at: number; side: "buy" | "sell" }>>();
   private readonly lastMarketTradeAt = new Map<string, number>();
   private readonly lastMarkLog = new Map<string, { at: number; floor: number | null }>();
-  private readonly pendingExit = new Map<string, TradeReason>();
+  private readonly pendingExit = new Map<string, { reason: TradeReason; fraction: number }>();
   /** Latest on-curve reserves from a trade or curve-watch update. Launch snapshots are not stored. */
   private readonly freshReserves = new Map<string, { vSol: number; vTokens: number }>();
   private stopped = false;
@@ -358,7 +358,7 @@ export class SniperBot {
     const pending = this.pendingExit.get(position.mint);
     if (pending && this.executableQuote(position) != null) {
       this.pendingExit.delete(position.mint);
-      await this.sellPosition(position, pending, position.lastMarkPriceSol);
+      await this.sellPosition(position, pending.reason, position.lastMarkPriceSol, pending.fraction);
       return;
     }
     await this.maybeExit(position, position.lastMarkPriceSol, source);
@@ -378,18 +378,22 @@ export class SniperBot {
     if (mark > 0 && position.entryPriceSol > 0) {
       const peak = Math.max(position.peakPriceSol ?? mark, mark);
       position.peakPriceSol = peak;
-      position.trailFloorPct = nextTrailFloor(
+      const nextStop = trailStopPrice(
         position.entryPriceSol,
         peak,
-        this.deps.config.trailTiers,
-        position.trailFloorPct ?? null,
+        this.deps.config.trailActivatePct,
+        this.deps.config.trailDistancePct,
       );
+      position.trailStopPriceSol = ratchetStop(position.trailStopPriceSol, nextStop);
+      position.trailFloorPct =
+        position.trailStopPriceSol != null
+          ? ((position.trailStopPriceSol / position.entryPriceSol) - 1) * 100
+          : null;
       this.logMark(position, source);
     }
-    const signal = decideExit({
+    const plan = decideExit({
       entryPrice: position.entryPriceSol,
       markPrice: quote,
-      takeProfitPct: this.deps.config.takeProfitPct,
       stopLossPct: this.deps.config.stopLossPct,
       openedAtMs,
       nowMs: this.deps.now().getTime(),
@@ -400,15 +404,18 @@ export class SniperBot {
       lastTradeAtMs: position.lastTradeAtMs ?? openedAtMs,
       volumeStallMs: this.deps.config.volumeStallSec * 1000,
       volumeStallGraceMs: this.deps.config.volumeStallGraceSec * 1000,
-      trailFloorPct: position.trailFloorPct ?? null,
+      trailStopPriceSol: position.trailStopPriceSol ?? null,
+      tp1Pct: this.deps.config.tp1Pct,
+      tp1SellFraction: this.deps.config.tp1SellFraction,
+      tp1Taken: position.tp1Taken === true,
       sellsInWindow: counts.sells,
       buysInWindow: counts.buys,
       sellPressureRatio: this.deps.config.sellPressureRatio,
       minPressureSells: 4,
       useStreamLiquidity: this.deps.curveWatch?.isLive(position.mint) !== true,
     });
-    if (!signal) return;
-    await this.sellPosition(position, signal, quote > 0 ? quote : position.lastMarkPriceSol);
+    if (!plan) return;
+    await this.sellPosition(position, plan.signal, quote > 0 ? quote : position.lastMarkPriceSol, plan.fraction);
   }
 
   async panicSell(): Promise<void> {
@@ -418,18 +425,21 @@ export class SniperBot {
     }
   }
 
-  private async sellPosition(position: Position, reason: TradeReason, quote: number): Promise<void> {
+  private async sellPosition(position: Position, reason: TradeReason, quote: number, fraction = 1): Promise<void> {
     if (this.selling.has(position.mint)) return;
     this.selling.add(position.mint);
     const attempts = Math.max(1, this.deps.config.sellMaxAttempts);
+    const portion = Math.min(1, Math.max(0, fraction));
     try {
       for (let attempt = 1; attempt <= attempts; attempt += 1) {
         const current = this.deps.positions.get(position.mint);
         if (!current) return;
-        const execution = this.sellQuote(current, quote);
+        const before = current.tokenAmount;
+        const requested = portion >= 0.999 ? before : before * portion;
+        const execution = this.sellQuote(current, quote, requested);
         if (execution == null) {
           current.unpriced = true;
-          this.pendingExit.set(current.mint, reason);
+          this.pendingExit.set(current.mint, { reason, fraction: portion });
           this.deps.log.info("unpriced", { mint: current.mint, reason });
           return;
         }
@@ -443,9 +453,15 @@ export class SniperBot {
           ...(current.graduated ? { pool: "pump-amm" as const } : {}),
           slippagePct: this.deps.config.maxSlippagePct,
           reason,
-          tokenAmount: current.tokenAmount,
+          tokenAmount: requested,
+          sellFraction: portion,
         });
-        const realized = fill.status === "filled" ? fill.cashflowSol - current.costSol : null;
+        const reported = fill.tokenAmount > 0 ? fill.tokenAmount : requested;
+        const sold = Math.min(before, reported);
+        const share = before > 0 ? sold / before : 1;
+        const costAllocated = current.costSol * share;
+        const realized = fill.status === "filled" ? fill.cashflowSol - costAllocated : null;
+        const total = fill.status === "filled" ? (current.realizedPnlSol ?? 0) + (realized ?? 0) : null;
         this.deps.trades.append({
           timestamp: this.deps.now().toISOString(),
           mode: this.deps.config.mode,
@@ -463,25 +479,38 @@ export class SniperBot {
           reason,
           error: fill.error,
           solUsd: this.deps.solUsd(),
-          tokenAmount: current.tokenAmount,
+          tokenAmount: fill.status === "filled" ? sold : requested,
           realizedPnlSol: realized,
-          costSol: current.costSol,
+          realizedPnlTotalSol: total,
+          costSol: fill.status === "filled" ? costAllocated : current.costSol,
         });
         if (fill.status === "filled") {
+          const remaining = before - sold;
+          const partial = remaining > 1e-9 && share < 0.999;
+          this.deps.log.info("sell filled", {
+            mint: current.mint,
+            reason,
+            realizedPnlSol: realized,
+            realizedPnlTotalSol: total,
+            signature: fill.signature,
+            triggerMarkSol: quote,
+            fillPriceSol: fill.price,
+            fraction: share,
+            remainingTokenAmount: partial ? remaining : 0,
+            ...(reason === "volume_stall" ? { tradesSeen: current.tradesSeen ?? 0 } : {}),
+          });
+          if (partial) {
+            current.tokenAmount = remaining;
+            current.costSol -= costAllocated;
+            current.realizedPnlSol = total ?? current.realizedPnlSol;
+            if (reason === "tp") current.tp1Taken = true;
+            return;
+          }
           this.deps.positions.close(current.mint);
           this.flow.delete(current.mint);
           this.lastMarketTradeAt.delete(current.mint);
           this.deps.curveWatch?.unwatch(current.mint);
           this.deps.unsubscribeMint(current.mint);
-          this.deps.log.info("sell filled", {
-            mint: current.mint,
-            reason,
-            realizedPnlSol: realized,
-            signature: fill.signature,
-            triggerMarkSol: quote,
-            fillPriceSol: fill.price,
-            ...(reason === "volume_stall" ? { tradesSeen: current.tradesSeen ?? 0 } : {}),
-          });
           return;
         }
         this.deps.log.info("sell failed", {
@@ -502,12 +531,12 @@ export class SniperBot {
    * Paper fills sell into this mint's bonding curve. A stream mark is only a
    * signal; it is not the execution price.
    */
-  private sellQuote(position: Position, mark: number): number | null {
-    if (position.graduated) return poolSellPrice(position.poolBaseTokens, position.poolQuoteSol, position.tokenAmount);
+  private sellQuote(position: Position, mark: number, tokenAmount = position.tokenAmount): number | null {
+    if (position.graduated) return poolSellPrice(position.poolBaseTokens, position.poolQuoteSol, tokenAmount);
     if (this.deps.config.mode !== "paper") return mark > 0 ? mark : position.lastMarkPriceSol;
     const vSol = position.lastVSolSol;
     const vTokens = position.lastVTokens;
-    const curve = curveSellPrice(vSol, vTokens, position.tokenAmount);
+    const curve = curveSellPrice(vSol, vTokens, tokenAmount);
     const spot = vSol != null && vTokens != null && vTokens > 0 ? vSol / vTokens : null;
     const sameReserves = spot != null && mark > 0 && spot / mark >= 0.95 && spot / mark <= 1.05;
     if (curve != null && curve > 0 && sameReserves) return curve;

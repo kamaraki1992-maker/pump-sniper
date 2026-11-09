@@ -36,13 +36,20 @@ export interface BundleBody {
  * `denominatedInSol`, `slippage`), placed on one local-sign bundle account.
  * `jitoTip` is a bundle field. The private key is not part of the body.
  */
+function sellAmount(order: OrderRequest): number | string {
+  const fraction = order.sellFraction ?? 1;
+  if (!(fraction > 0) || fraction >= 0.999) return "100%";
+  const pct = Math.round(fraction * 10_000) / 100;
+  return `${pct}%`;
+}
+
 export function buildBundleBody(publicKey: string, order: OrderRequest, config: AppConfig): BundleBody {
-  const sellAll = order.reason !== "entry";
+  const sell = order.reason !== "entry";
   const account: BundleBody["accounts"][number] = {
     publicKey,
-    type: sellAll ? "sell" : "buy",
-    amount: sellAll ? "100%" : order.sizeSol,
-    denominatedInSol: sellAll ? "false" : "true",
+    type: sell ? "sell" : "buy",
+    amount: sell ? sellAmount(order) : order.sizeSol,
+    denominatedInSol: sell ? "false" : "true",
   };
   if (order.creator) account.creator = order.creator;
   return {

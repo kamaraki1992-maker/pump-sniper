@@ -7,65 +7,53 @@ export type ExitSignal =
   | "sell_pressure"
   | "trailing_stop";
 
-/** Peak-gain threshold and the stop floor it locks in, both in percent above entry. */
-export interface TrailTier {
-  activatePct: number;
-  floorPct: number;
+export interface ExitPlan {
+  signal: ExitSignal;
+  /** Share of the remaining position to sell. Stop, trail, and timer exits are 1. */
+  fraction: number;
 }
 
-/** Fraction of the position closed by a take-profit or stop-loss. v1 always closes 100%. */
+/** Full close used by the stop, the trail, and the timer. The 2x take profit is partial. */
 export const FULL_EXIT_FRACTION = 1;
 
-/**
- * `takeProfitPct` of 50 means the mark is at least 1.5x the entry fill.
- * `stopLossPct` of 15 means the mark is at most 85% of the entry fill.
- */
-export function exitSignal(
-  entryPrice: number,
-  markPrice: number,
-  takeProfitPct: number,
-  stopLossPct: number,
-): ExitSignal | null {
-  if (!(entryPrice > 0) || !(markPrice > 0)) return null;
-  const ratio = markPrice / entryPrice;
-  if (takeProfitPct > 0 && ratio >= 1 + takeProfitPct / 100) return "tp";
-  if (ratio <= 1 - stopLossPct / 100) return "sl";
-  return null;
+/** Hard stop price. `stopLossPct` of 20 is 80% of the entry fill. */
+export function stopLossPrice(entry: number, stopLossPct: number): number | null {
+  if (!(entry > 0) || !(stopLossPct > 0)) return null;
+  return entry * (1 - stopLossPct / 100);
 }
 
 /**
- * Highest profit-lock floor reached by `peak`. The returned floor is never
- * below `current`, so a later dip cannot loosen a floor that already latched.
+ * Once `peak` reaches `activatePct`, the stop is `max(entry, peak * (1 - distance))`.
+ * Entry is break-even. The distance trail is tighter whenever it sits above entry.
+ * Returns null until the peak has armed the trail.
  */
-export function nextTrailFloor(
+export function trailStopPrice(
   entry: number,
   peak: number,
-  tiers: readonly TrailTier[],
-  current: number | null,
+  activatePct: number,
+  distancePct: number,
 ): number | null {
-  if (!(entry > 0) || !(peak > 0)) return current;
-  let floor = current;
-  for (const tier of tiers) {
-    if (!(tier.activatePct > 0) || peak / entry + 1e-9 < 1 + tier.activatePct / 100) continue;
-    floor = floor == null ? tier.floorPct : Math.max(floor, tier.floorPct);
-  }
-  return floor;
+  if (!(entry > 0) || !(peak > 0) || !(activatePct > 0)) return null;
+  if (!(distancePct >= 0) || distancePct >= 100) return null;
+  if (peak + 1e-9 < entry * (1 + activatePct / 100)) return null;
+  return Math.max(entry, peak * (1 - distancePct / 100));
 }
 
-/** True when the mark is at or below entry raised by the locked floor. */
-export function trailHit(entry: number, mark: number, floorPct: number | null | undefined): boolean {
-  if (floorPct == null || !(entry > 0) || !(mark > 0) || !Number.isFinite(floorPct)) return false;
-  return mark / entry <= 1 + floorPct / 100;
+/** A later dip cannot loosen a stop that already latched. */
+export function ratchetStop(current: number | null | undefined, next: number | null): number | null {
+  if (next == null || !(next > 0) || !Number.isFinite(next)) return current ?? null;
+  if (current == null || !(current > 0) || !Number.isFinite(current)) return next;
+  return Math.max(current, next);
 }
 
 /**
  * Price exits win over the hold timer. A missing mark can still time out,
- * because the timer does not require a new trade.
+ * because the timer does not require a new trade. The partial take profit
+ * fires on the same mark that crosses `tp1Pct` and does not repeat.
  */
 export function decideExit(input: {
   entryPrice: number;
   markPrice: number;
-  takeProfitPct: number;
   stopLossPct: number;
   openedAtMs: number;
   nowMs: number;
@@ -83,28 +71,48 @@ export function decideExit(input: {
   useStreamLiquidity?: boolean;
   /** Silence before this many ms after entry does not count toward a volume stall. */
   volumeStallGraceMs?: number;
-  /** Locked profit floor in percent above entry. Null until a tier has armed. */
-  trailFloorPct?: number | null;
-}): ExitSignal | null {
-  const priced = exitSignal(input.entryPrice, input.markPrice, input.takeProfitPct, input.stopLossPct);
-  if (priced === "tp") return "tp";
-  if (trailHit(input.entryPrice, input.markPrice, input.trailFloorPct)) return "trailing_stop";
-  if (priced === "sl") return "sl";
+  /** Latched trail stop in SOL per token. Null until +activate has been seen. */
+  trailStopPriceSol?: number | null;
+  tp1Pct?: number;
+  tp1SellFraction?: number;
+  tp1Taken?: boolean;
+}): ExitPlan | null {
+  const entry = input.entryPrice;
+  const mark = input.markPrice;
+  if (entry > 0 && mark > 0) {
+    const trail = input.trailStopPriceSol;
+    if (trail != null && trail > 0 && mark <= trail) {
+      return { signal: "trailing_stop", fraction: FULL_EXIT_FRACTION };
+    }
+    const sl = stopLossPrice(entry, input.stopLossPct);
+    if (sl != null && mark <= sl) return { signal: "sl", fraction: FULL_EXIT_FRACTION };
+    const tp1Pct = input.tp1Pct ?? 0;
+    const fraction = input.tp1SellFraction ?? 0.5;
+    if (!input.tp1Taken && tp1Pct > 0 && fraction > 0 && mark / entry >= 1 + tp1Pct / 100) {
+      return { signal: "tp", fraction: Math.min(1, fraction) };
+    }
+  }
   const liqDropPct = input.liqDropPct ?? 20;
   if (input.useStreamLiquidity !== false && reservesDropped(input.entryVSolSol, input.lastVSolSol, liqDropPct)) {
-    return "liquidity_drop";
+    return { signal: "liquidity_drop", fraction: FULL_EXIT_FRACTION };
   }
   const sells = input.sellsInWindow ?? 0;
   const buys = input.buysInWindow ?? 0;
   const ratio = input.sellPressureRatio ?? 3;
   const minSells = input.minPressureSells ?? 4;
-  if (sells >= minSells && sells >= ratio * buys) return "sell_pressure";
+  if (sells >= minSells && sells >= ratio * buys) {
+    return { signal: "sell_pressure", fraction: FULL_EXIT_FRACTION };
+  }
   const lastTradeAtMs = input.lastTradeAtMs ?? input.nowMs;
   const volumeStallMs = input.volumeStallMs ?? Number.POSITIVE_INFINITY;
   const graceMs = input.volumeStallGraceMs ?? 0;
   const stallAnchorMs = Math.max(input.openedAtMs + graceMs, lastTradeAtMs);
-  if (input.nowMs - stallAnchorMs >= volumeStallMs) return "volume_stall";
-  if (input.nowMs - input.openedAtMs >= input.maxHoldMs) return "timeout";
+  if (input.nowMs - stallAnchorMs >= volumeStallMs) {
+    return { signal: "volume_stall", fraction: FULL_EXIT_FRACTION };
+  }
+  if (input.nowMs - input.openedAtMs >= input.maxHoldMs) {
+    return { signal: "timeout", fraction: FULL_EXIT_FRACTION };
+  }
   return null;
 }
 

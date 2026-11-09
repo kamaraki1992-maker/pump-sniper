@@ -4,7 +4,7 @@ import bs58 from "bs58";
 import { BoughtMints } from "./bought.js";
 import { SniperBot } from "./bot.js";
 import { fetchCurveReserves, RpcCurveWatch } from "./curve-watch.js";
-import { ConfigError, formatTrailTiers, loadConfig, type AppConfig } from "./config.js";
+import { ConfigError, loadConfig, type AppConfig } from "./config.js";
 import { PaperExecutor } from "./executor-paper.js";
 import { createLivePorts, LiveExecutor } from "./executor-live.js";
 import { RpcHolderCheck } from "./holders.js";
@@ -171,15 +171,22 @@ export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promis
     buySizeMaxUsd: config.buySizeMaxUsd,
     maxSlippagePct: config.maxSlippagePct,
     jitoTipSol: config.jitoTipSol,
-    takeProfitPct: config.takeProfitPct,
     stopLossPct: config.stopLossPct,
+    trailActivatePct: config.trailActivatePct,
+    trailDistancePct: config.trailDistancePct,
+    tp1Pct: config.tp1Pct,
+    tp1SellFraction: config.tp1SellFraction,
     maxOpenPositions: config.maxOpenPositions,
     maxHoldMinutes: config.maxHoldMinutes,
     volumeStallSec: config.volumeStallSec,
     volumeStallGraceSec: config.volumeStallGraceSec,
-    trailTiers: formatTrailTiers(config.trailTiers),
-    takeProfitDisabled: config.takeProfitPct === 0,
   });
+  if (config.ignoredTrailTiers) {
+    log.info("TRAIL_TIERS is ignored; the trail uses TRAIL_ACTIVATE_PCT and TRAIL_DISTANCE_PCT");
+  }
+  if (config.ignoredTakeProfit) {
+    log.info("TAKE_PROFIT_PCT is ignored; the partial take profit uses TP1_PCT");
+  }
   const stream = attachStream(runtime);
   let stopped = false;
   const shutdown = (why: string) => {
