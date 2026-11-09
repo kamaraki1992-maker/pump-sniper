@@ -136,31 +136,156 @@ interface RpcEnvelope<T> {
   error?: { message?: string };
 }
 
-/** On-chain top-10 check. Failures skip the buy; they do not open it. */
+const TOKEN_OWNERS = new Set([TOKEN_PROGRAM_ID.toBase58(), TOKEN_2022_PROGRAM_ID.toBase58()]);
+/** Helius uses this for a mint that is not in the token index yet, including a create_v2 mint. */
+const RETRYABLE_MINT = /not a Token mint|could not find mint|could not find account|mint could not be unpacked/i;
+const HOLDER_COMMITMENT = "processed";
+
+export interface HolderCheckOptions {
+  /** Stop retrying once this many milliseconds have passed. A miss skips the buy. */
+  timeoutMs?: number;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** Decode a getProgramAccounts row into the token account address and its raw amount. */
+export function readProgramAccounts(result: unknown): LargestAccount[] {
+  const record = asRecord(result);
+  const list = Array.isArray(result) ? result : record && Array.isArray(record.value) ? record.value : [];
+  const rows: LargestAccount[] = [];
+  for (const item of list) {
+    const row = asRecord(item);
+    if (!row) continue;
+    const address = typeof row.pubkey === "string" ? row.pubkey : typeof row.address === "string" ? row.address : null;
+    const account = asRecord(row.account);
+    const raw = decodeAccountData(account?.data);
+    if (!address || !raw) continue;
+    const amountBytes = raw.length === 8 ? raw : raw.length >= 72 ? raw.subarray(64, 72) : null;
+    if (!amountBytes || amountBytes.length < 8) continue;
+    const view = new DataView(amountBytes.buffer, amountBytes.byteOffset, amountBytes.byteLength);
+    rows.push({ address, amount: view.getBigUint64(0, true) });
+  }
+  return rows;
+}
+
+function decodeAccountData(data: unknown): Uint8Array | null {
+  if (typeof data === "string" && data.length > 0) return Buffer.from(data, "base64");
+  if (Array.isArray(data) && typeof data[0] === "string" && data[0].length > 0) return Buffer.from(data[0], "base64");
+  return null;
+}
+
+/**
+ * On-chain top-10 check. pump.fun create_v2 mints are Token-2022 and are often
+ * not visible to getTokenLargestAccounts at `confirmed` on the same tick as the
+ * create. The call is retried at `processed` until the budget runs out. A miss
+ * still skips the buy.
+ */
 export class RpcHolderCheck {
+  private readonly timeoutMs: number;
+  private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
+
   constructor(
     private readonly rpcUrl: string,
     private readonly maxPct: number,
     private readonly rpcFetch: typeof fetch,
     private readonly log: Logger,
-  ) {}
+    options: HolderCheckOptions = {},
+  ) {
+    this.timeoutMs = options.timeoutMs ?? 1_500;
+    this.now = options.now ?? Date.now;
+    this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  }
 
   async lookup(mint: string): Promise<HolderDecision> {
+    let mintKey: PublicKey;
     try {
-      const mintKey = new PublicKey(mint);
-      const exclude = new Set(excludedHolderAccounts(mintKey));
-      const largest = await this.rpc<unknown>("getTokenLargestAccounts", [mint, { commitment: "confirmed" }]);
-      const supplyBody = await this.rpc<unknown>("getTokenSupply", [mint, { commitment: "confirmed" }]);
-      const supply = readSupplyAmount(supplyBody);
-      if (supply === null) return { ok: false, reason: "top10-unavailable", pct: null };
-      return top10Decision(readLargestAccounts(largest), supply, exclude, this.maxPct);
-    } catch (error) {
-      this.log.info("top10 check failed", {
-        mint,
-        error: error instanceof Error ? error.message : "rpc-error",
-      });
+      mintKey = new PublicKey(mint);
+    } catch {
       return { ok: false, reason: "top10-unavailable", pct: null };
     }
+    const exclude = new Set(excludedHolderAccounts(mintKey));
+    const deadline = this.now() + this.timeoutMs;
+    let attempt = 0;
+    let lastError = "top10-unavailable";
+    while (this.now() <= deadline && attempt < 6) {
+      attempt += 1;
+      try {
+        const owner = await this.mintOwner(mint);
+        if (owner === null) {
+          lastError = "top10-mint-not-visible";
+        } else if (!TOKEN_OWNERS.has(owner)) {
+          this.log.info("top10 check failed", { mint, error: "not a token mint", owner, attempt });
+          return { ok: false, reason: "top10-unavailable", pct: null };
+        } else {
+          const decision = await this.holders(mint, owner, exclude);
+          if (decision) return decision;
+          lastError = "top10-holders-not-visible";
+        }
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : "rpc-error";
+      }
+      if (attempt >= 6) break;
+      const remaining = deadline - this.now();
+      if (remaining <= 0) break;
+      await this.sleep(Math.min(remaining, 50 * 2 ** Math.min(attempt - 1, 4)));
+    }
+    this.log.info("top10 check failed", { mint, error: lastError, attempt });
+    return { ok: false, reason: "top10-unavailable", pct: null };
+  }
+
+  private async holders(mint: string, owner: string, exclude: Set<string>): Promise<HolderDecision | null> {
+    try {
+      const fromIndex = await this.scored(
+        mint,
+        exclude,
+        await this.rpc<unknown>("getTokenLargestAccounts", [mint, { commitment: HOLDER_COMMITMENT }]),
+      );
+      if (fromIndex) return fromIndex;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "rpc-error";
+      if (!RETRYABLE_MINT.test(message)) throw error;
+    }
+    // The mint account is already a Token or Token-2022 mint, but the largest-account
+    // index still rejects it. Read the token accounts of that program directly.
+    return this.scored(
+      mint,
+      exclude,
+      await this.rpc<unknown>("getProgramAccounts", [
+        owner,
+        {
+          commitment: HOLDER_COMMITMENT,
+          encoding: "base64",
+          dataSlice: { offset: 64, length: 8 },
+          filters: [{ memcmp: { offset: 0, bytes: mint } }],
+        },
+      ]),
+      true,
+    );
+  }
+
+  private async scored(
+    mint: string,
+    exclude: Set<string>,
+    accountsResult: unknown,
+    programAccounts = false,
+  ): Promise<HolderDecision | null> {
+    const rows = programAccounts ? readProgramAccounts(accountsResult) : readLargestAccounts(accountsResult);
+    if (rows.length === 0) return null;
+    const supply = readSupplyAmount(await this.rpc<unknown>("getTokenSupply", [mint, { commitment: HOLDER_COMMITMENT }]));
+    if (supply === null || supply <= 0n) return null;
+    return top10Decision(rows, supply, exclude, this.maxPct);
+  }
+
+  private async mintOwner(mint: string): Promise<string | null> {
+    const result = await this.rpc<unknown>("getAccountInfo", [
+      mint,
+      { encoding: "base64", commitment: HOLDER_COMMITMENT },
+    ]);
+    const record = asRecord(result);
+    const value = record && "value" in record ? asRecord(record.value) : null;
+    if (!value || typeof value.owner !== "string") return null;
+    return value.owner;
   }
 
   private async rpc<T>(method: string, params: unknown[]): Promise<T> {

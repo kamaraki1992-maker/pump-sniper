@@ -79,6 +79,16 @@ function requestUrl(input: RequestInfo | URL): string {
   return input.url;
 }
 
+function rpcBodyHasError(body: string): boolean {
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown } | Array<{ error?: unknown }>;
+    const rows = Array.isArray(parsed) ? parsed : [parsed];
+    return rows.some((row) => row !== null && typeof row === "object" && "error" in row && row.error != null);
+  } catch {
+    return false;
+  }
+}
+
 function isCacheableBody(body: string): boolean {
   try {
     const parsed = JSON.parse(body) as { method?: unknown } | Array<{ method?: unknown }>;
@@ -124,7 +134,11 @@ export function createRpcFetch(options: RpcFetchOptions): typeof fetch {
       if (!retry) {
         if (cacheable && response.ok) {
           const text = await response.text();
-          cache.set(key, { at: now(), status: response.status, body: text });
+          // Helius answers "not a Token mint" with HTTP 200. Caching that hides the mint
+          // for the whole TTL, which is longer than the buy budget.
+          if (!rpcBodyHasError(text)) {
+            cache.set(key, { at: now(), status: response.status, body: text });
+          }
           return new Response(text, {
             status: response.status,
             headers: { "content-type": "application/json" },

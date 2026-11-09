@@ -70,7 +70,9 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
   await sol.refresh();
   const rpcFetch = createRpcFetch({ rps: config.heliusRps, cacheTtlMs: config.rpcCacheTtlMs });
   const history = new RpcCreatorHistory(config, log, Date.now, rpcFetch);
-  const holders = new RpcHolderCheck(config.rpcUrl, config.maxTop10Pct, rpcFetch, log);
+  const holders = new RpcHolderCheck(config.rpcUrl, config.maxTop10Pct, rpcFetch, log, {
+    timeoutMs: config.rugCheckTimeoutMs,
+  });
   const botRef: {
     onCurveReserves: (
       mint: string,

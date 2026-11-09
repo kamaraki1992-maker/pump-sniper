@@ -57,6 +57,37 @@ test("429 responses back off with jitter, then a short cache skips the network",
   assert.equal(((await second.json()) as { result: { amount: string } }).result.amount, "1");
 });
 
+test("an HTTP 200 JSON-RPC error is not cached", async () => {
+  let calls = 0;
+  const fetchImpl: typeof fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "Invalid param: not a Token mint" } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { value: [] } }), { status: 200 });
+  };
+  const rpc = createRpcFetch({
+    rps: 50,
+    cacheTtlMs: 5_000,
+    now: () => 0,
+    sleep: async () => {},
+    random: () => 0,
+    fetchImpl,
+  });
+  const init = {
+    method: "POST",
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getTokenLargestAccounts", params: ["Mint"] }),
+  };
+  const first = (await (await rpc("https://rpc.example", init)).json()) as { error?: { message: string } };
+  assert.match(first.error?.message ?? "", /not a Token mint/);
+  const second = (await (await rpc("https://rpc.example", init)).json()) as { result?: { value: unknown[] } };
+  assert.equal(calls, 2);
+  assert.deepEqual(second.result?.value, []);
+});
+
 test("a failed read is not cached and a simulation is not cached", async () => {
   let calls = 0;
   const fetchImpl: typeof fetch = async () => {
