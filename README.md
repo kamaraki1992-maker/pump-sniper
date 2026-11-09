@@ -35,7 +35,9 @@ These limits are constants in `src/config.ts`. The process exits on startup if t
 | Take profit | off (`0`) | set above 0 to sell 100% at that gain; hard cap `<= 50%`. `0` disables it |
 | Stop loss | -15% | `<= 15%`, sells 100% of the position |
 | Profit lock | `15:5,30:15,50:35,100:75` | floor ratchets up with peak gain and sells 100% with reason `trailing_stop` |
-| Creator hold at launch | under 10% of supply | cannot be configured above 10% |
+| Creator hold at launch | no more than 5% of supply | cannot be configured above 10% (`MAX_CREATOR_HOLD_PCT`) |
+| Top 10 holders | 25% | bonding curve, its token account, and the pump AMM pool are excluded (`MAX_TOP10_PCT`) |
+| Helius rate | 5 requests/second | shared token bucket (`HELIUS_RPS`), short cache, retry with jitter |
 | Open positions | 5 | cannot be configured above 5 |
 | Max hold | 10 min | sells 100% with reason `timeout` |
 | Liquidity drop | 20% | sells 100% when curve SOL reserves fall by more than this from entry |
@@ -93,6 +95,8 @@ The day is a calendar date in `Europe/Berlin`. The command prints one JSON objec
 | `src/yellowstone.ts` | Optional Yellowstone gRPC source for the same events |
 | `src/pricing.ts` | Message adapter. Swap the parser to change data sources |
 | `src/filter.ts` | Creator hold, dev-dump, and floor-rug decisions |
+| `src/holders.ts` | Top-10 holder filter, excluding the curve and pump pool |
+| `src/rpc-limit.ts` | Shared Helius token bucket, cache, and 429 retry |
 | `src/history.ts` | RPC lookup behind the filter |
 | `src/executor-paper.ts` | Simulated fills |
 | `src/executor-live.ts` | Sign locally, simulate, Jito `sendBundle` |
@@ -110,13 +114,17 @@ Checked against PumpDev's public docs (`https://pumpdev.io/skill/pumpdev/referen
 
 **Prices.** SOL-quoted creates observed on the socket carry `marketCapSol` and raw reserves: `vSolInBondingCurve` in lamports (`30000000000` = 30 SOL) and `vTokensInBondingCurve` in base units (`1073000000000000` = 1,073,000,000 tokens). Price is `marketCapSol / 1_000_000_000` when that field is present, otherwise virtual SOL divided by virtual tokens. Non-SOL quote mints are skipped. Sizing is in SOL, and a USDC-quoted curve is a different market.
 
-**Creator hold.** `initialBuy` on the create event is the creator allocation in the launch transaction, in display tokens (the docs' sample of `67062500` is about 6.7% of the 1,000,000,000 supply). The bot skips when that share is 10% or more. A buy the creator sends in a later transaction is not part of this check. Those later buys are visible to the dev-dump check on the creator's *next* launch.
+**Creator hold.** `initialBuy` on the create event is the creator allocation in the launch transaction, in display tokens (the docs' sample of `67062500` is about 6.7% of the 1,000,000,000 supply). The bot skips when that share is more than 5% (`MAX_CREATOR_HOLD_PCT`, hard cap 10). `CREATOR_MAX_HOLD_PCT` is still read when the new name is unset. A buy the creator sends in a later transaction is not part of this check. Those later buys are visible to the dev-dump check on the creator's *next* launch.
+
+**Top 10 holders.** Before every buy the bot calls `getTokenLargestAccounts` and `getTokenSupply`. It drops the bonding-curve account, that account's associated token account (SPL and Token-2022), and the canonical PumpSwap pool plus its token account when that pool address is derivable. If the next 10 accounts own more than `MAX_TOP10_PCT` (default 25) the buy is skipped and the log includes that percentage.
 
 **Creator history.** `frontend-api-v3.pump.fun` answers this host with a Cloudflare challenge, so v1 does not use it. History comes from `getSignaturesForAddress` and `getTransaction` on `RPC_URL` (default public mainnet RPC), last 25 signatures. A prior launch is a transaction whose logs contain `Instruction: Create` or `Instruction: CreateV2`.
 
-- **Dev dump.** The creator's peak balance in the first 2 minutes falls below half of that peak inside 15 minutes.
-- **Rug.** The bonding-curve account (PDA `["bonding-curve", mint]` on `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`) is at least 30 minutes old, virtual reserves price it at or under 32 SOL (the curve opens near 27.96 SOL and cannot trade below that floor), and the creator's balance is at or under 10% of the peak. That is the on-curve version of "went to ~0". Graduated coins that die in the AMM are outside this view.
-- If the RPC call fails, the launch is skipped with `creator-history-unavailable`. HTTP 429 is retried a few times before that. `getMultipleAccounts` returns `{ value: [...] }`, and the client unwraps that.
+- **Dev dump.** The creator's peak balance in the first 2 minutes falls below half of that peak inside 15 minutes. A creator who dumps the previous coin within minutes is skipped here.
+- **Rug.** The bonding-curve account (PDA `["bonding-curve", mint]` on `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`) is at least 3 minutes old, virtual reserves price it at or under 32 SOL (the curve opens near 27.96 SOL and cannot trade below that floor), and the creator's balance is at or under 10% of the peak. A coin that dies and is left at the floor within minutes is a rug. The old half-hour wait is gone. Graduated coins that die in the AMM are outside this view.
+- If the RPC call fails, or the history or top-10 check does not finish inside `RUG_CHECK_TIMEOUT_MS` (default 2s), the launch is skipped. The reason is `creator-history-unavailable`, `creator-history-timeout`, `top10-unavailable`, or `top10-timeout`.
+
+**RPC rate.** History, the holder check, the mint safety read, curve reserve reads, and the live `Connection` share one token bucket (`HELIUS_RPS`, default 5). Successful reads are cached for `RPC_CACHE_TTL_MS` (default 3s). HTTP 429 and 5xx retry with exponential backoff and jitter. Helius returns 429 often enough that the bucket stays conservative.
 
 **Live trading.** `POST /api/trade-lightning` is server-signed. The documented body is `action`, `mint`, `amount`, `denominatedInSol`, and an optional `creator`. It does not take a Jito tip, a compute-unit limit, or a local private key. Auth is a PumpDev API key for a hosted wallet. `POST /api/bundle-lightning` adds `jitoTip` and sends through Jito, and it also signs with that hosted key.
 

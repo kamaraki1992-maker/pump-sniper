@@ -5,6 +5,7 @@ import { clampBuyUsd, requiredBuyBalanceSol, type AppConfig } from "./config.js"
 import { SOL_PRICE_MAX_AGE_MS } from "./sol-price.js";
 import type { FilterDecision } from "./filter.js";
 import { holdDecision } from "./filter.js";
+import type { HolderDecision } from "./holders.js";
 import { Logger } from "./logger.js";
 import type { PositionBook } from "./positions.js";
 import { assessMark, curveBuyPrice, curveSellPrice, EARLY_MARK_MS, poolSellPrice, poolSpot, reservesOnCurve, TOTAL_SUPPLY_TOKENS } from "./pricing.js";
@@ -17,6 +18,8 @@ export interface BotDeps {
   config: AppConfig;
   executor: Executor;
   history: { lookup(creator: string): Promise<FilterDecision> };
+  /** Top-10 holder check. Absent only in tests that do not exercise it. */
+  holders?: { lookup(mint: string): Promise<HolderDecision> };
   positions: PositionBook;
   trades: TradeLog;
   log: Logger;
@@ -117,7 +120,22 @@ export class SniperBot {
       this.skip(launch, hold.reason ?? "creator-hold");
       return;
     }
-    const history = await this.deps.history.lookup(launch.creator);
+    if (this.deps.holders) {
+      const top10 = await this.withinBudget(
+        this.deps.holders.lookup(launch.mint),
+        this.deps.config.rugCheckTimeoutMs,
+        { ok: false, reason: "top10-timeout", pct: null },
+      );
+      if (!top10.ok) {
+        this.skip(launch, top10.reason ?? "top10", top10.pct != null ? { top10Pct: top10.pct } : undefined);
+        return;
+      }
+    }
+    const history = await this.withinBudget(
+      this.deps.history.lookup(launch.creator),
+      this.deps.config.rugCheckTimeoutMs,
+      { ok: false, reason: "creator-history-timeout" },
+    );
     if (!history.ok) {
       this.skip(launch, history.reason ?? "creator-history-unavailable");
       return;
@@ -675,6 +693,17 @@ export class SniperBot {
     this.skip(launch, "max_open_positions", {
       openPositions: this.deps.positions.list().length,
       pendingBuys: this.pendingBuys.size,
+    });
+  }
+
+  /** A check that does not finish inside its budget is a skip, not a buy. */
+  private withinBudget<T>(work: Promise<T>, timeoutMs: number, onTimeout: T): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<T>((resolve) => {
+      timer = setTimeout(() => resolve(onTimeout), timeoutMs);
+    });
+    return Promise.race([work, timeout]).finally(() => {
+      if (timer) clearTimeout(timer);
     });
   }
 

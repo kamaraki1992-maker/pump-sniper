@@ -7,7 +7,9 @@ import { fetchCurveReserves, RpcCurveWatch } from "./curve-watch.js";
 import { ConfigError, formatTrailTiers, loadConfig, type AppConfig } from "./config.js";
 import { PaperExecutor } from "./executor-paper.js";
 import { createLivePorts, LiveExecutor } from "./executor-live.js";
+import { RpcHolderCheck } from "./holders.js";
 import { RpcCreatorHistory } from "./history.js";
+import { createRpcFetch } from "./rpc-limit.js";
 import { Logger } from "./logger.js";
 import { PositionBook } from "./positions.js";
 import { installProcessRedaction, rpcApiKey } from "./redact.js";
@@ -64,7 +66,9 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
   const trades = new TradeLog(config.tradesPath, secrets);
   const sol = new SolPriceFeed(config.solPriceUrl);
   await sol.refresh();
-  const history = new RpcCreatorHistory(config, log);
+  const rpcFetch = createRpcFetch({ rps: config.heliusRps, cacheTtlMs: config.rpcCacheTtlMs });
+  const history = new RpcCreatorHistory(config, log, Date.now, rpcFetch);
+  const holders = new RpcHolderCheck(config.rpcUrl, config.maxTop10Pct, rpcFetch, log);
   const botRef: {
     onCurveReserves: (
       mint: string,
@@ -85,7 +89,11 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
   if (config.mode === "live") {
     const keypair = loadLiveKeypair();
     log.info("live mode", { pubkey: keypair.publicKey.toBase58() });
-    const connection = new Connection(config.rpcUrl, "confirmed");
+    const connection = new Connection(config.rpcUrl, {
+      commitment: "confirmed",
+      fetch: rpcFetch,
+      disableRetryOnRateLimit: true,
+    });
     executor = new LiveExecutor(createLivePorts(config, keypair, connection));
     walletBalanceSol = async () => {
       const lamports = await connection.getBalance(keypair.publicKey, "processed");
@@ -116,9 +124,10 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     unsubscribeMint: (mint) => subscription.stream?.unsubscribeTrades([mint]),
     bought: new BoughtMints(`${config.dataDir}/bought-mints.json`),
     ...(walletBalanceSol ? { walletBalanceSol } : {}),
-    safetyCheck: createRpcSafetyCheck(config),
+    holders,
+    safetyCheck: createRpcSafetyCheck(config, rpcFetch),
     ...(curveWatch ? { curveWatch } : {}),
-    readCurveReserves: (mint) => fetchCurveReserves(config.rpcUrl, mint),
+    readCurveReserves: (mint) => fetchCurveReserves(config.rpcUrl, mint, rpcFetch),
   });
   if (curveWatch) {
     botRef.onCurveReserves = (mint, realSol, reserves, complete) =>

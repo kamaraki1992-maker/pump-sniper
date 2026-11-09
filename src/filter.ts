@@ -5,7 +5,11 @@ export const CURVE_FLOOR_SOL = 27.96;
 export const RUG_FLOOR_MAX_SOL = 32;
 export const LAUNCH_WINDOW_SEC = 120;
 export const DUMP_WINDOW_SEC = 15 * 60;
-export const RUG_MIN_AGE_SEC = 30 * 60;
+/**
+ * A prior coin at the floor is a rug once it is a few minutes old and the
+ * creator has left. Waiting half an hour let a fast rug launch the next coin.
+ */
+export const RUG_MIN_AGE_SEC = 3 * 60;
 /** Remaining at or under this fraction of the launch-window peak means most of the allocation was sold. */
 export const DUMP_REMAINING_FRACTION = 0.5;
 
@@ -19,10 +23,10 @@ export function holdDecision(initialBuyTokens: number, maxPct: number): FilterDe
     return { ok: false, reason: "creator-hold-unknown" };
   }
   const pct = (initialBuyTokens / TOTAL_SUPPLY_TOKENS) * 100;
-  if (pct >= maxPct) {
+  if (pct > maxPct) {
     return {
       ok: false,
-      reason: `creator holds ${pct.toFixed(2)}% of supply (>= ${maxPct}%)`,
+      reason: `creator holds ${pct.toFixed(2)}% of supply (> ${maxPct}%)`,
     };
   }
   return { ok: true };
@@ -91,8 +95,9 @@ function launchWindows(txs: HistoryTx[]): LaunchWindow[] {
 /**
  * Prior launches only. A dev dump is a sale of at least half the tokens the
  * creator accumulated in the first two minutes, inside fifteen minutes of
- * the create. A rug is an older launch that is back at the curve floor after
- * the creator's balance fell to ~0.
+ * the create. A rug is a launch at least a few minutes old that is back at
+ * the curve floor after the creator's balance fell to ~0. That covers a coin
+ * that died within minutes, not only one that has been dead for half an hour.
  */
 export function historyDecision(
   txs: HistoryTx[],

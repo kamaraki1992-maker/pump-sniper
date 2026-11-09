@@ -13,6 +13,7 @@ export const HARD_CAPS = {
   minJitoTipSol: 0.002,
   maxJitoTipSol: 0.005,
   maxCreatorHoldPct: 10,
+  maxTop10Pct: 100,
   maxOpenPositions: 5,
   maxTakeProfitPct: 50,
   maxStopLossPct: 15,
@@ -44,6 +45,14 @@ export interface AppConfig {
   jitoTipSol: number;
   priorityFeeSol: number;
   creatorMaxHoldPct: number;
+  /** Skip a buy when the filtered top 10 own more than this percent of supply. */
+  maxTop10Pct: number;
+  /** Shared Helius token-bucket rate, in requests per second. */
+  heliusRps: number;
+  /** Budget for the top-10 and creator-history checks. A miss skips the buy. */
+  rugCheckTimeoutMs: number;
+  /** Successful read RPCs are reused for this long. */
+  rpcCacheTtlMs: number;
   maxOpenPositions: number;
   maxHoldMinutes: number;
   liqDropPct: number;
@@ -117,6 +126,25 @@ export function formatTrailTiers(tiers: readonly TrailTier[]): string {
   return tiers.map((tier) => `${tier.activatePct}:${tier.floorPct}`).join(",");
 }
 
+/** `JITO_TIP_LAMPORTS` wins when it is set. Otherwise `JITO_TIP_SOL`, default 0.002. */
+function jitoTipFromEnv(env: NodeJS.ProcessEnv): number {
+  const lamports = env.JITO_TIP_LAMPORTS;
+  if (lamports !== undefined && lamports.trim() !== "") {
+    const parsed = Number(lamports);
+    if (!Number.isFinite(parsed)) throw new ConfigError("JITO_TIP_LAMPORTS must be a finite number");
+    return parsed / 1e9;
+  }
+  return num(env.JITO_TIP_SOL, 0.002, "JITO_TIP_SOL");
+}
+
+/** `MAX_CREATOR_HOLD_PCT` wins. `CREATOR_MAX_HOLD_PCT` remains as a fallback. */
+function creatorHoldRaw(env: NodeJS.ProcessEnv): string | undefined {
+  if (env.MAX_CREATOR_HOLD_PCT !== undefined && env.MAX_CREATOR_HOLD_PCT.trim() !== "") {
+    return env.MAX_CREATOR_HOLD_PCT;
+  }
+  return env.CREATOR_MAX_HOLD_PCT;
+}
+
 function str(value: string | undefined, fallback: string): string {
   if (value === undefined || value.trim() === "") return fallback;
   return value.trim();
@@ -157,11 +185,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const buySizeMinUsd = num(env.BUY_SIZE_MIN_USD, 5, "BUY_SIZE_MIN_USD");
   const buySizeMaxUsd = num(env.BUY_SIZE_MAX_USD, HARD_CAPS.maxBuyUsd, "BUY_SIZE_MAX_USD");
   const maxSlippagePct = num(env.MAX_SLIPPAGE_PCT, 3, "MAX_SLIPPAGE_PCT");
-  const jitoTipSol = num(env.JITO_TIP_SOL, 0.002, "JITO_TIP_SOL");
+  const jitoTipSol = jitoTipFromEnv(env);
   const takeProfitPct = num(env.TAKE_PROFIT_PCT, 0, "TAKE_PROFIT_PCT");
   const stopLossPct = num(env.STOP_LOSS_PCT, HARD_CAPS.maxStopLossPct, "STOP_LOSS_PCT");
   const priorityFeeSol = num(env.PRIORITY_FEE_SOL, 0.00005, "PRIORITY_FEE_SOL");
-  const creatorMaxHoldPct = num(env.CREATOR_MAX_HOLD_PCT, 10, "CREATOR_MAX_HOLD_PCT");
+  const creatorMaxHoldPct = num(creatorHoldRaw(env), 5, "MAX_CREATOR_HOLD_PCT");
+  const maxTop10Pct = num(env.MAX_TOP10_PCT, 25, "MAX_TOP10_PCT");
+  const heliusRps = num(env.HELIUS_RPS, 5, "HELIUS_RPS");
+  const rugCheckTimeoutMs = num(env.RUG_CHECK_TIMEOUT_MS, 2_000, "RUG_CHECK_TIMEOUT_MS");
+  const rpcCacheTtlMs = num(env.RPC_CACHE_TTL_MS, 3_000, "RPC_CACHE_TTL_MS");
   const maxOpenPositions = num(env.MAX_OPEN_POSITIONS, HARD_CAPS.maxOpenPositions, "MAX_OPEN_POSITIONS");
   const maxHoldMinutes = num(env.MAX_HOLD_MINUTES, 10, "MAX_HOLD_MINUTES");
   const liqDropPct = num(env.LIQ_DROP_PCT, 20, "LIQ_DROP_PCT");
@@ -213,8 +245,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   if (!(creatorMaxHoldPct > 0) || creatorMaxHoldPct > HARD_CAPS.maxCreatorHoldPct) {
     throw new ConfigError(
-      `CREATOR_MAX_HOLD_PCT ${creatorMaxHoldPct} exceeds hard cap ${HARD_CAPS.maxCreatorHoldPct}`,
+      `MAX_CREATOR_HOLD_PCT ${creatorMaxHoldPct} exceeds hard cap ${HARD_CAPS.maxCreatorHoldPct}`,
     );
+  }
+  if (!(maxTop10Pct > 0) || maxTop10Pct > HARD_CAPS.maxTop10Pct) {
+    throw new ConfigError(`MAX_TOP10_PCT ${maxTop10Pct} exceeds hard cap ${HARD_CAPS.maxTop10Pct}`);
+  }
+  if (!(heliusRps > 0) || heliusRps > 100) {
+    throw new ConfigError("HELIUS_RPS must be between 0 and 100");
+  }
+  if (!(rugCheckTimeoutMs > 0)) {
+    throw new ConfigError("RUG_CHECK_TIMEOUT_MS must be positive");
+  }
+  if (!(rpcCacheTtlMs >= 0)) {
+    throw new ConfigError("RPC_CACHE_TTL_MS must be >= 0");
   }
   if (!Number.isInteger(maxOpenPositions) || maxOpenPositions < 1 || maxOpenPositions > HARD_CAPS.maxOpenPositions) {
     throw new ConfigError(
@@ -259,6 +303,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     jitoTipSol,
     priorityFeeSol,
     creatorMaxHoldPct,
+    maxTop10Pct,
+    heliusRps,
+    rugCheckTimeoutMs,
+    rpcCacheTtlMs,
     maxOpenPositions,
     maxHoldMinutes,
     liqDropPct,

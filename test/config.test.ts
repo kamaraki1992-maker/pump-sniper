@@ -90,9 +90,33 @@ test("live buy reserves exit SOL for the USD notional and for positions already 
   assert.ok(Math.abs(withOpen - (one + 2 * (fee + tip))) < 1e-12);
 });
 
-test("creator hold cannot be loosened past 10%", () => {
+test("creator hold defaults to 5% and cannot be loosened past 10%", () => {
+  assert.equal(loadConfig({}).creatorMaxHoldPct, 5);
+  assert.equal(loadConfig({ MAX_CREATOR_HOLD_PCT: "5" }).creatorMaxHoldPct, 5);
+  assert.equal(loadConfig({ CREATOR_MAX_HOLD_PCT: "8" }).creatorMaxHoldPct, 8);
+  assert.equal(loadConfig({ MAX_CREATOR_HOLD_PCT: "4", CREATOR_MAX_HOLD_PCT: "9" }).creatorMaxHoldPct, 4);
+  assert.throws(() => loadConfig({ MAX_CREATOR_HOLD_PCT: "11" }), ConfigError);
   assert.throws(() => loadConfig({ CREATOR_MAX_HOLD_PCT: "11" }), ConfigError);
   assert.equal(loadConfig({ CREATOR_MAX_HOLD_PCT: "10" }).creatorMaxHoldPct, 10);
+});
+
+test("Jito tip accepts lamports and still defaults to 0.002 SOL", () => {
+  assert.equal(loadConfig({}).jitoTipSol, 0.002);
+  assert.equal(loadConfig({ JITO_TIP_LAMPORTS: "3000000" }).jitoTipSol, 0.003);
+  assert.equal(loadConfig({ JITO_TIP_SOL: "0.004", JITO_TIP_LAMPORTS: "3000000" }).jitoTipSol, 0.003);
+  assert.throws(() => loadConfig({ JITO_TIP_LAMPORTS: "1000000" }), ConfigError);
+});
+
+test("top-10 cap and Helius rate use conservative defaults", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.maxTop10Pct, 25);
+  assert.equal(cfg.heliusRps, 5);
+  assert.equal(cfg.rugCheckTimeoutMs, 2_000);
+  assert.equal(cfg.rpcCacheTtlMs, 3_000);
+  assert.equal(loadConfig({ MAX_TOP10_PCT: "25" }).maxTop10Pct, 25);
+  assert.throws(() => loadConfig({ MAX_TOP10_PCT: "0" }), ConfigError);
+  assert.throws(() => loadConfig({ HELIUS_RPS: "0" }), ConfigError);
+  assert.throws(() => loadConfig({ RUG_CHECK_TIMEOUT_MS: "0" }), ConfigError);
 });
 
 test("live mode requires a usable key and errors do not echo it", () => {

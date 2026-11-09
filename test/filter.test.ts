@@ -12,13 +12,14 @@ function tx(partial: Partial<HistoryTx> & Pick<HistoryTx, "blockTimeSec">): Hist
   };
 }
 
-test("creator must hold under 10% of supply at launch", () => {
-  assert.equal(holdDecision(99_999_999, 10).ok, true);
-  const atCap = holdDecision(100_000_000, 10);
-  assert.equal(atCap.ok, false);
-  assert.match(atCap.reason ?? "", /10\.00%/);
-  assert.equal(holdDecision(0, 10).ok, true);
-  assert.equal(holdDecision(Number.NaN, 10).ok, false);
+test("creator must hold no more than 5% of supply at launch", () => {
+  assert.equal(holdDecision(50_000_000, 5).ok, true);
+  const over = holdDecision(50_000_001, 5);
+  assert.equal(over.ok, false);
+  assert.match(over.reason ?? "", /5\.00%/);
+  assert.match(over.reason ?? "", /> 5%/);
+  assert.equal(holdDecision(0, 5).ok, true);
+  assert.equal(holdDecision(Number.NaN, 5).ok, false);
 });
 
 test("a creator who sold most of the launch allocation early is skipped", () => {
@@ -110,6 +111,58 @@ test("a prior coin back at the curve floor after the creator left is a rug", () 
     ],
     [{ mint: "MintRug", marketCapSol: 28 }],
     created + 4_000,
+  );
+  assert.equal(decision.ok, false);
+  assert.match(decision.reason ?? "", /creator-rug/);
+});
+
+test("a previous token that rugged within minutes is skipped", () => {
+  const created = 10_000;
+  const decision = historyDecision(
+    [
+      tx({
+        blockTimeSec: created,
+        logs: ["Program log: Instruction: CreateV2"],
+        createdMint: "MintFast",
+      }),
+      tx({
+        blockTimeSec: created + 30,
+        balances: [{ mint: "MintFast", preUi: 0, postUi: 4_000_000 }],
+      }),
+      tx({
+        blockTimeSec: created + 90,
+        logs: ["Program log: Instruction: SellV2"],
+        balances: [{ mint: "MintFast", preUi: 4_000_000, postUi: 0 }],
+      }),
+    ],
+    [{ mint: "MintFast", marketCapSol: 28 }],
+    created + 180,
+  );
+  assert.equal(decision.ok, false);
+  assert.match(decision.reason ?? "", /creator-dev-dump|creator-rug/);
+});
+
+test("a coin back at the floor after the creator left is a rug before the old half-hour wait", () => {
+  const created = 10_000;
+  const decision = historyDecision(
+    [
+      tx({
+        blockTimeSec: created,
+        logs: ["Program log: Instruction: CreateV2"],
+        createdMint: "MintSoon",
+      }),
+      tx({
+        blockTimeSec: created + 40,
+        balances: [{ mint: "MintSoon", preUi: 0, postUi: 2_000_000 }],
+      }),
+      tx({
+        blockTimeSec: created + 16 * 60,
+        logs: ["Program log: Instruction: SellV2"],
+        balances: [{ mint: "MintSoon", preUi: 2_000_000, postUi: 0 }],
+      }),
+    ],
+    [{ mint: "MintSoon", marketCapSol: 28.4 }],
+    created + 20 * 60,
   );
   assert.equal(decision.ok, false);
   assert.match(decision.reason ?? "", /creator-rug/);

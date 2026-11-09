@@ -10,6 +10,7 @@ import { loadConfig, type AppConfig } from "../src/config.js";
 import { PaperExecutor } from "../src/executor-paper.js";
 import { paperBuy } from "../src/paper-math.js";
 import type { FilterDecision } from "../src/filter.js";
+import type { HolderDecision } from "../src/holders.js";
 import { Logger } from "../src/logger.js";
 import { PositionBook } from "../src/positions.js";
 import { TradeLog } from "../src/report.js";
@@ -60,6 +61,8 @@ class ListLogger extends Logger {
 
 function harness(options: {
   history?: FilterDecision;
+  historyLookup?: () => Promise<FilterDecision>;
+  holders?: { lookup(mint: string): Promise<HolderDecision> };
   buy?: (order: OrderRequest) => Promise<FillResult>;
   sell?: (order: OrderRequest) => Promise<FillResult>;
   config?: Partial<AppConfig>;
@@ -102,7 +105,10 @@ function harness(options: {
   const bot = new SniperBot({
     config,
     executor,
-    history: { async lookup() { return options.history ?? { ok: true }; } },
+    history: {
+      lookup: () => options.historyLookup?.() ?? Promise.resolve(options.history ?? { ok: true }),
+    },
+    ...(options.holders ? { holders: options.holders } : {}),
     positions,
     trades,
     log,
@@ -364,6 +370,67 @@ test("a creator hold or history skip is logged and not bought", async () => {
   assert.equal(buys, 0);
   assert.equal(heavy.positions.list().length, 1);
   assert.ok(trades.readAll().every((row) => row.side !== "buy" || row.mint === "never"));
+});
+
+test("a creator above 5% or a slow rug check is skipped, and exactly 5% can buy", async () => {
+  let buys = 0;
+  const over = harness({
+    capture: true,
+    buy: async () => {
+      buys += 1;
+      return fill({});
+    },
+  });
+  await over.bot.onLaunch(launch({ mint: "Heavy", initialBuyTokens: 60_000_000 }));
+  assert.equal(buys, 0);
+  assert.equal(over.positions.list().length, 0);
+  const holdSkip = (over.log as ListLogger).entries.find((entry) => entry.message === "skip");
+  assert.match(String(holdSkip?.fields?.reason), /6\.00%/);
+
+  const exact = harness({});
+  await exact.bot.onLaunch(launch({ mint: "Exact", initialBuyTokens: 50_000_000, priceSol: 1 }));
+  assert.equal(exact.positions.list().length, 1);
+
+  let slowBuys = 0;
+  const slow = harness({
+    capture: true,
+    config: { rugCheckTimeoutMs: 20 },
+    holders: { lookup: () => new Promise(() => {}) },
+    buy: async () => {
+      slowBuys += 1;
+      return fill({});
+    },
+  });
+  await slow.bot.onLaunch(launch({ mint: "SlowTop", initialBuyTokens: 1, priceSol: 1 }));
+  assert.equal(slowBuys, 0);
+  assert.ok((slow.log as ListLogger).entries.some((entry) => entry.fields?.reason === "top10-timeout"));
+
+  const concentrated = harness({
+    capture: true,
+    holders: {
+      lookup: async () => ({
+        ok: false,
+        reason: "top10 holders own 40.00% of supply (> 25%)",
+        pct: 40,
+      }),
+    },
+  });
+  await concentrated.bot.onLaunch(launch({ mint: "Packed", initialBuyTokens: 1, priceSol: 1 }));
+  assert.equal(concentrated.positions.list().length, 0);
+  const topSkip = (concentrated.log as ListLogger).entries.find((entry) => entry.fields?.reason?.toString().includes("top10"));
+  assert.equal(topSkip?.fields?.top10Pct, 40);
+
+  const slowHistory = harness({
+    capture: true,
+    config: { rugCheckTimeoutMs: 20 },
+    holders: { lookup: async () => ({ ok: true, pct: 1 }) },
+    historyLookup: () => new Promise(() => {}),
+  });
+  await slowHistory.bot.onLaunch(launch({ mint: "SlowHist", initialBuyTokens: 1, priceSol: 1 }));
+  assert.equal(slowHistory.positions.list().length, 0);
+  assert.ok(
+    (slowHistory.log as ListLogger).entries.some((entry) => entry.fields?.reason === "creator-history-timeout"),
+  );
 });
 
 test("two launches in the same tick reserve one slot", async () => {

@@ -150,16 +150,20 @@ const SIM_PAYER = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
  * the mint yet is not a rejection: the buy has not landed. Other simulation
  * errors reject the token.
  */
-export function createRpcSafetyCheck(config: AppConfig): (input: {
+export function createRpcSafetyCheck(config: AppConfig, rpcFetch: typeof fetch = fetch): (input: {
   mint: string;
   vSol: number | null;
   vTokens: number | null;
   spendSol: number;
 }) => Promise<SafetyCheckResult> {
-  const connection = new Connection(config.rpcUrl, "processed");
+  const connection = new Connection(config.rpcUrl, {
+    commitment: "processed",
+    fetch: rpcFetch,
+    disableRetryOnRateLimit: true,
+  });
   return (input) =>
     runSafetyCheck(async () => {
-      const account = await fetchMint(config.rpcUrl, input.mint);
+      const account = await fetchMint(config.rpcUrl, input.mint, rpcFetch);
       const simulate = async () => {
         const buy = await simulateTrade(connection, config, input.mint, input.spendSol, "buy");
         const sell = await simulateTrade(connection, config, input.mint, "100%", "sell");
@@ -176,8 +180,12 @@ export function createRpcSafetyCheck(config: AppConfig): (input: {
     }, config.safetyCheckTimeoutMs);
 }
 
-async function fetchMint(rpcUrl: string, mint: string): Promise<{ owner: string; data: Uint8Array }> {
-  const response = await fetch(rpcUrl, {
+async function fetchMint(
+  rpcUrl: string,
+  mint: string,
+  rpcFetch: typeof fetch,
+): Promise<{ owner: string; data: Uint8Array }> {
+  const response = await rpcFetch(rpcUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({

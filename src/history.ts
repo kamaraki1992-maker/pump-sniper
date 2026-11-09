@@ -43,6 +43,7 @@ export class RpcCreatorHistory {
     private readonly config: AppConfig,
     private readonly log: Logger,
     private readonly now: () => number = Date.now,
+    private readonly rpcFetch: typeof fetch = fetch,
   ) {}
 
   async lookup(creator: string): Promise<FilterDecision> {
@@ -144,21 +145,13 @@ export class RpcCreatorHistory {
   }
 
   private async post(body: unknown): Promise<Response> {
-    let status = 0;
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      const response = await fetch(this.config.rpcUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      status = response.status;
-      if (status !== 429) {
-        if (!response.ok) throw new Error(`rpc HTTP ${status}`);
-        return response;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
-    }
-    throw new Error(`rpc HTTP ${status}`);
+    const response = await this.rpcFetch(this.config.rpcUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(`rpc HTTP ${response.status}`);
+    return response;
   }
 }
 
