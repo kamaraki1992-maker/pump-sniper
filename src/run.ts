@@ -10,6 +10,7 @@ import { PaperExecutor } from "./executor-paper.js";
 import { createLivePorts, LiveExecutor } from "./executor-live.js";
 import { PriorityFeeEstimator } from "./priority-fee.js";
 import { RpcHolderCheck } from "./holders.js";
+import { installProcessGuards } from "./guards.js";
 import { RpcCreatorHistory } from "./history.js";
 import { createRpcFetch, createRpcStats, startRpcPressureLog } from "./rpc-limit.js";
 import { Logger } from "./logger.js";
@@ -171,16 +172,19 @@ export function attachStream(runtime: Runtime): LiveStream {
     runtime.log.info("stream", { source: "pumpdev-ws" });
   }
   runtime.subscription.stream = stream;
+  const fail = (error: unknown) => {
+    runtime.log.error("event failed", { error: error instanceof Error ? error.message : "event-error" });
+  };
   stream.start((event) => {
     if (event.kind === "launch") {
-      void runtime.bot.onLaunch(event);
+      void runtime.bot.onLaunch(event).catch(fail);
       return;
     }
     if (event.kind === "graduation") {
-      void runtime.bot.onGraduation(event);
+      void runtime.bot.onGraduation(event).catch(fail);
       return;
     }
-    void runtime.bot.onTrade(event);
+    void runtime.bot.onTrade(event).catch(fail);
   });
   for (const position of runtime.positions.list()) stream.subscribeTrades([position.mint]);
   return stream;
@@ -189,6 +193,7 @@ export function attachStream(runtime: Runtime): LiveStream {
 export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promise<void> {
   const runtime = await buildRuntime();
   const { config, log, bot, positions, sol } = runtime;
+  const removeGuards = installProcessGuards(log);
   log.info("sniper start", {
     mode: config.mode,
     buySizeMinUsd: config.buySizeMinUsd,
@@ -221,6 +226,7 @@ export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promis
     log.info("shutdown", { why });
     stream.stop();
     runtime.stopRpcPressure();
+    removeGuards();
     positions.save(sol.price(), config.paper, new Date().toISOString());
     process.exit(0);
   };

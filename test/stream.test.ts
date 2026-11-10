@@ -112,6 +112,35 @@ test("a held mint is subscribed on open, acked, and dropped on unsubscribe", () 
   stream.stop();
 });
 
+test("a throwing trade handler does not kill the socket loop", () => {
+  const sockets: FakeSocket[] = [];
+  const stream = new PumpDevStream(
+    "wss://pumpdev.io/ws",
+    new Logger(),
+    () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    () => 1_000,
+  );
+  stream.start(() => {
+    throw new Error("handler blew up");
+  });
+  sockets[0]?.emit("open");
+  assert.doesNotThrow(() => {
+    sockets[0]?.emit("message", JSON.stringify({
+      txType: "buy",
+      mint: "MintA",
+      signature: "sig",
+      traderPublicKey: "trader",
+      quoteMint: "So11111111111111111111111111111111111111112",
+      marketCapSol: 30,
+    }));
+  });
+  stream.stop();
+});
+
 test("reconnect resubscribes only mints still held", () => {
   const sockets: FakeSocket[] = [];
   const stream = new PumpDevStream(

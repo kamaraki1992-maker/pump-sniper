@@ -119,17 +119,23 @@ export class PumpDevStream {
     });
     ws.on("message", (data) => {
       if (this.ws !== ws) return;
-      const text = payloadText(data);
-      if (!text) return;
-      let parsed: unknown;
       try {
-        parsed = JSON.parse(text);
-      } catch {
-        return;
+        const text = payloadText(data);
+        if (!text) return;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          return;
+        }
+        if (this.onControl(parsed)) return;
+        const event = parsePumpDevMessage(parsed);
+        if (event) this.onEvent(event);
+      } catch (error) {
+        this.log.info("ws message failed", {
+          error: error instanceof Error ? error.message : "ws-message",
+        });
       }
-      if (this.onControl(parsed)) return;
-      const event = parsePumpDevMessage(parsed);
-      if (event) this.onEvent(event);
     });
     ws.on("error", (error) => {
       this.log.info("ws error", { error: error instanceof Error ? error.message : "ws-error" });
@@ -180,6 +186,10 @@ export class PumpDevStream {
 
   private send(payload: unknown): void {
     if (!this.opened) return;
-    this.ws?.send(JSON.stringify(payload));
+    try {
+      this.ws?.send(JSON.stringify(payload));
+    } catch (error) {
+      this.log.info("ws send failed", { error: error instanceof Error ? error.message : "ws-send" });
+    }
   }
 }

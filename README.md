@@ -23,6 +23,8 @@ Logs are JSON lines on stdout. Skipped launches include a `reason`. Filled and f
 
 Stop with `SIGTERM`, `SIGINT`, or by creating the `STOP` file (`touch STOP`). That shuts the socket and flushes state. It does not sell. Selling open positions is `npm run panic-sell`.
 
+A websocket error, a gRPC error, or a rejected trade handler is logged. PumpDev and the Helius account socket reconnect with backoff. An unhandled rejection does not exit the process. Open positions stay in `data/positions.json` across a restart. Paper mode is unchanged by a restart.
+
 ## Risk caps
 
 These limits are constants in `src/config.ts`. The process exits on startup if the environment asks for more room. Changing the numbers means editing that file.

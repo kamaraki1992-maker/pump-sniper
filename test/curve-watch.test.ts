@@ -126,6 +126,32 @@ test("reconnect resubscribes every open curve", () => {
   });
 });
 
+test("an rpc websocket error reconnects once even if close follows", () => {
+  const sockets: FakeSocket[] = [];
+  const watch = new RpcCurveWatch(
+    "wss://example.test/?api-key=supersecretkey123",
+    new Logger(),
+    () => {},
+    () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    () => 5,
+  );
+  watch.start();
+  sockets[0]?.emit("open");
+  sockets[0]?.emit("error", new Error("socket reset"));
+  sockets[0]?.emit("close");
+  return new Promise<void>((resolve) => {
+    setTimeout(() => {
+      assert.equal(sockets.length, 2);
+      watch.stop();
+      resolve();
+    }, 30);
+  });
+});
+
 test("api-key query values never appear in logs", () => {
   const url = "wss://mainnet.helius-rpc.com/?api-key=supersecretkey123";
   const cleaned = redactRpcUrl(`connect failed ${url}`);

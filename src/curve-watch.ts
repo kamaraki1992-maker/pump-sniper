@@ -183,7 +183,9 @@ export class RpcCurveWatch {
       this.schedule();
     }) as never);
     socket.on("error", ((error: unknown) => {
+      this.opened = false;
       this.log.info("rpc ws error", { error: this.safe(error) });
+      this.schedule();
     }) as never);
   }
 
@@ -239,10 +241,13 @@ export class RpcCurveWatch {
   }
 
   private schedule(): void {
-    if (this.stopped || !this.url) return;
+    if (this.stopped || !this.url || this.timer) return;
     const delay = this.backoff(this.attempt);
     this.attempt += 1;
-    this.timer = setTimeout(() => this.connect(), delay);
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.connect();
+    }, delay);
   }
 
   private safe(error: unknown): string {
