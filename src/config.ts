@@ -9,7 +9,7 @@ import type { Mode } from "./types.js";
 export const HARD_CAPS = {
   maxBuyUsd: 30,
   maxSlippagePct: 20,
-  minJitoTipSol: 0.002,
+  minJitoTipSol: 0.0005,
   maxJitoTipSol: 0.005,
   maxCreatorHoldPct: 10,
   maxTop10Pct: 100,
@@ -54,7 +54,28 @@ export interface AppConfig {
   ignoredTrailTiers: boolean;
   /** TAKE_PROFIT_PCT was set. The full take profit is not applied. */
   ignoredTakeProfit: boolean;
+  /** Fixed tip when `tipMode` is `fixed`. Dynamic mode still stores the minimum. */
   jitoTipSol: number;
+  tipMode: "dynamic" | "fixed";
+  jitoTipPct: number;
+  jitoTipMinSol: number;
+  jitoTipMaxSol: number;
+  /** Set when BUY_SIZE_SOL is set. Overrides USD confidence sizing. */
+  buySizeSol: number | null;
+  entryWatchMinSec: number;
+  entryWatchMaxSec: number;
+  entryMinBuys: number;
+  entryMinUniqueBuyers: number;
+  entryMinNetBuySol: number;
+  entryMinBuyRatio: number;
+  entryMaxRunupPct: number;
+  entryMaxWatched: number;
+  /** A print this far below the previous mark exits immediately. */
+  stopFastDropPct: number;
+  devSellExit: boolean;
+  earlyExitMinGainPct: number;
+  /** 0 disables the early-momentum exit. */
+  earlyExitWindowSec: number;
   priorityFeeSol: number;
   /** Total priority-fee clamp for one transaction, in lamports. */
   priorityFeeMaxLamports: number;
@@ -163,10 +184,16 @@ export function reservedPriorityFeeSol(config: AppConfig): number {
   return Math.max(config.priorityFeeSol, config.priorityFeeMaxLamports / 1e9);
 }
 
+/** Worst-case tip reserved for a live buy. Dynamic mode reserves the configured maximum. */
+export function reservedTipSol(config: AppConfig): number {
+  return config.tipMode === "dynamic" ? config.jitoTipMaxSol : config.jitoTipSol;
+}
+
 export function requiredBuyBalanceSol(config: AppConfig, buySize: number, openPositions = 0): number {
   const txFee = reservedPriorityFeeSol(config) + config.paper.baseFeeSol;
-  const exitReserve = txFee + config.jitoTipSol;
-  return buySize + txFee + config.jitoTipSol + exitReserve + openPositions * exitReserve;
+  const tip = reservedTipSol(config);
+  const exitReserve = txFee + tip;
+  return buySize + txFee + tip + exitReserve + openPositions * exitReserve;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -176,7 +203,34 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const legacySlippage = optionalNum(env.MAX_SLIPPAGE_PCT, "MAX_SLIPPAGE_PCT");
   const buySlippagePct = optionalNum(env.BUY_SLIPPAGE_PCT, "BUY_SLIPPAGE_PCT") ?? legacySlippage ?? 5;
   const sellSlippagePct = optionalNum(env.SELL_SLIPPAGE_PCT, "SELL_SLIPPAGE_PCT") ?? legacySlippage ?? 10;
-  const jitoTipSol = jitoTipFromEnv(env);
+  const legacyTip = jitoTipFromEnv(env);
+  const tipKeysSet =
+    (env.JITO_TIP_PCT !== undefined && env.JITO_TIP_PCT.trim() !== "") ||
+    (env.JITO_TIP_MIN_SOL !== undefined && env.JITO_TIP_MIN_SOL.trim() !== "") ||
+    (env.JITO_TIP_MAX_SOL !== undefined && env.JITO_TIP_MAX_SOL.trim() !== "");
+  const legacyExplicit =
+    (env.JITO_TIP_SOL !== undefined && env.JITO_TIP_SOL.trim() !== "") ||
+    (env.JITO_TIP_LAMPORTS !== undefined && env.JITO_TIP_LAMPORTS.trim() !== "");
+  const tipMode: "dynamic" | "fixed" = tipKeysSet || !legacyExplicit ? "dynamic" : "fixed";
+  const jitoTipPct = num(env.JITO_TIP_PCT, 0.01, "JITO_TIP_PCT");
+  const jitoTipMinSol = num(env.JITO_TIP_MIN_SOL, HARD_CAPS.minJitoTipSol, "JITO_TIP_MIN_SOL");
+  const jitoTipMaxSol = num(env.JITO_TIP_MAX_SOL, 0.0015, "JITO_TIP_MAX_SOL");
+  const jitoTipSol = tipMode === "fixed" ? legacyTip : jitoTipMinSol;
+  const buySizeSol = optionalNum(env.BUY_SIZE_SOL, "BUY_SIZE_SOL");
+  const entryWatchMinSec = num(env.ENTRY_WATCH_MIN_SEC, 15, "ENTRY_WATCH_MIN_SEC");
+  const entryWatchMaxSec = num(env.ENTRY_WATCH_MAX_SEC, 30, "ENTRY_WATCH_MAX_SEC");
+  const entryMinBuys = num(env.ENTRY_MIN_BUYS, 8, "ENTRY_MIN_BUYS");
+  const entryMinUniqueBuyers = num(env.ENTRY_MIN_UNIQUE_BUYERS, 5, "ENTRY_MIN_UNIQUE_BUYERS");
+  const entryMinNetBuySol = num(env.ENTRY_MIN_NET_BUY_SOL, 1, "ENTRY_MIN_NET_BUY_SOL");
+  const entryMinBuyRatio = num(env.ENTRY_MIN_BUY_RATIO, 0.6, "ENTRY_MIN_BUY_RATIO");
+  const entryMaxRunupPct = num(env.ENTRY_MAX_RUNUP_PCT, 60, "ENTRY_MAX_RUNUP_PCT");
+  const entryMaxWatched = num(env.ENTRY_MAX_WATCHED, 30, "ENTRY_MAX_WATCHED");
+  const stopFastDropPct = num(env.STOP_FAST_DROP_PCT, 12, "STOP_FAST_DROP_PCT");
+  const devSellExit = env.DEV_SELL_EXIT === undefined || env.DEV_SELL_EXIT.trim() === ""
+    ? true
+    : env.DEV_SELL_EXIT.trim() !== "false" && env.DEV_SELL_EXIT.trim() !== "0";
+  const earlyExitMinGainPct = num(env.EARLY_EXIT_MIN_GAIN_PCT, 10, "EARLY_EXIT_MIN_GAIN_PCT");
+  const earlyExitWindowSec = num(env.EARLY_EXIT_WINDOW_SEC, 5, "EARLY_EXIT_WINDOW_SEC");
   const stopLossPct = num(env.STOP_LOSS_PCT, HARD_CAPS.maxStopLossPct, "STOP_LOSS_PCT");
   const trailActivatePct = num(env.TRAIL_ACTIVATE_PCT, 50, "TRAIL_ACTIVATE_PCT");
   const trailDistancePct = num(env.TRAIL_DISTANCE_PCT, 20, "TRAIL_DISTANCE_PCT");
@@ -227,10 +281,50 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       `SELL_SLIPPAGE_PCT ${sellSlippagePct} exceeds hard cap ${HARD_CAPS.maxSlippagePct}`,
     );
   }
-  if (jitoTipSol < HARD_CAPS.minJitoTipSol || jitoTipSol > HARD_CAPS.maxJitoTipSol) {
+  if (tipMode === "fixed" && (jitoTipSol < HARD_CAPS.minJitoTipSol || jitoTipSol > HARD_CAPS.maxJitoTipSol)) {
     throw new ConfigError(
       `JITO_TIP_SOL ${jitoTipSol} is outside hard bounds ${HARD_CAPS.minJitoTipSol}-${HARD_CAPS.maxJitoTipSol}`,
     );
+  }
+  if (!(jitoTipPct > 0) || jitoTipPct > 0.05) {
+    throw new ConfigError("JITO_TIP_PCT must be between 0 and 0.05");
+  }
+  if (jitoTipMinSol < HARD_CAPS.minJitoTipSol || jitoTipMinSol > HARD_CAPS.maxJitoTipSol) {
+    throw new ConfigError(
+      `JITO_TIP_MIN_SOL ${jitoTipMinSol} is outside hard bounds ${HARD_CAPS.minJitoTipSol}-${HARD_CAPS.maxJitoTipSol}`,
+    );
+  }
+  if (jitoTipMaxSol < jitoTipMinSol || jitoTipMaxSol > HARD_CAPS.maxJitoTipSol) {
+    throw new ConfigError(
+      `JITO_TIP_MAX_SOL ${jitoTipMaxSol} is above the hard cap ${HARD_CAPS.maxJitoTipSol}`,
+    );
+  }
+  if (buySizeSol != null && !(buySizeSol > 0)) {
+    throw new ConfigError("BUY_SIZE_SOL must be positive");
+  }
+  if (entryWatchMinSec < 0 || entryWatchMaxSec < 0 || entryWatchMaxSec < entryWatchMinSec) {
+    throw new ConfigError("ENTRY_WATCH_MAX_SEC must be >= ENTRY_WATCH_MIN_SEC and both must be >= 0");
+  }
+  if (!Number.isInteger(entryMinBuys) || entryMinBuys < 1) {
+    throw new ConfigError("ENTRY_MIN_BUYS must be an integer >= 1");
+  }
+  if (!Number.isInteger(entryMinUniqueBuyers) || entryMinUniqueBuyers < 1) {
+    throw new ConfigError("ENTRY_MIN_UNIQUE_BUYERS must be an integer >= 1");
+  }
+  if (!(entryMinNetBuySol > 0) || !(entryMinBuyRatio > 0) || entryMinBuyRatio > 1) {
+    throw new ConfigError("ENTRY_MIN_NET_BUY_SOL and ENTRY_MIN_BUY_RATIO must be positive, and the ratio at most 1");
+  }
+  if (!(entryMaxRunupPct > 0)) {
+    throw new ConfigError("ENTRY_MAX_RUNUP_PCT must be positive");
+  }
+  if (!Number.isInteger(entryMaxWatched) || entryMaxWatched < 1) {
+    throw new ConfigError("ENTRY_MAX_WATCHED must be an integer >= 1");
+  }
+  if (!(stopFastDropPct > 0) || stopFastDropPct > 100) {
+    throw new ConfigError("STOP_FAST_DROP_PCT must be between 0 and 100");
+  }
+  if (earlyExitMinGainPct < 0 || earlyExitWindowSec < 0) {
+    throw new ConfigError("EARLY_EXIT settings must be >= 0");
   }
   if (!(stopLossPct > 0) || stopLossPct > HARD_CAPS.maxStopLossPct) {
     throw new ConfigError(
@@ -324,6 +418,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ignoredTrailTiers,
     ignoredTakeProfit,
     jitoTipSol,
+    tipMode,
+    jitoTipPct,
+    jitoTipMinSol,
+    jitoTipMaxSol,
+    buySizeSol,
+    entryWatchMinSec,
+    entryWatchMaxSec,
+    entryMinBuys,
+    entryMinUniqueBuyers,
+    entryMinNetBuySol,
+    entryMinBuyRatio,
+    entryMaxRunupPct,
+    entryMaxWatched,
+    stopFastDropPct,
+    devSellExit,
+    earlyExitMinGainPct,
+    earlyExitWindowSec,
     priorityFeeSol,
     priorityFeeMaxLamports,
     priorityFeeCacheMs,
@@ -365,7 +476,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       venueFeeBps,
       priorityFeeSol,
       baseFeeSol,
-      jitoTipSol,
+      jitoTipSol: tipMode === "dynamic" ? jitoTipMinSol : jitoTipSol,
     },
   };
 }

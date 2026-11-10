@@ -83,9 +83,18 @@ function harness(options: {
   };
   bought?: BoughtMints;
   readCurveReserves?: (mint: string) => Promise<{ vSol: number; vTokens: number } | null>;
+  readCreatorBalance?: (mint: string, creator: string) => Promise<number | null>;
+  entryWindow?: boolean;
+  sleep?: (ms: number) => Promise<void>;
 }) {
   const dir = mkdtempSync(join(tmpdir(), "sniper-bot-"));
   const config = { ...loadConfig({ DATA_DIR: dir }), ...options.config, dataDir: dir };
+  if (options.entryWindow !== true) {
+    config.entryWatchMinSec = 0;
+    config.entryWatchMaxSec = 0;
+  }
+  if (options.config?.earlyExitWindowSec === undefined) config.earlyExitWindowSec = 0;
+  if (options.config?.stopFastDropPct === undefined) config.stopFastDropPct = 100;
   config.tradesPath = join(dir, "trades.jsonl");
   config.positionsPath = join(dir, "positions.json");
   const positions = new PositionBook(config.positionsPath);
@@ -127,7 +136,7 @@ function harness(options: {
         updatedAtMs: (options.now ?? (() => new Date("2026-11-04T12:00:00.000Z")))().getTime(),
       })),
     now: options.now ?? (() => new Date("2026-11-04T12:00:00.000Z")),
-    sleep: async () => {},
+    sleep: options.sleep ?? (async () => {}),
     subscribeMint: (mint) => {
       subscribed.push(mint);
     },
@@ -140,6 +149,7 @@ function harness(options: {
     ...(options.curveWatch ? { curveWatch: options.curveWatch } : {}),
     readCurveReserves:
       options.readCurveReserves ?? (async () => ({ vSol: 30, vTokens: 1_073_000_000 })),
+    ...(options.readCreatorBalance ? { readCreatorBalance: options.readCreatorBalance } : {}),
   });
   return { bot, positions, trades, sells, config, log, subscribed, unsubscribed, bought };
 }
@@ -1147,4 +1157,132 @@ test("a graduated position waits for a pool quote and does not fill at the curve
   assert.ok(expected != null);
   assert.equal(sells[0]?.quotePriceSol, expected);
   assert.ok((sells[0]?.quotePriceSol ?? 0) > 1e-6);
+});
+
+test("a launch buys only after organic confirmation and logs the dynamic tip", async () => {
+  let now = 0;
+  const orders: OrderRequest[] = [];
+  let botRef: { onTrade: (trade: MarketTrade) => Promise<void> } | null = null;
+  const times = [1_000, 2_000, 3_000, 6_000, 7_000, 8_000, 12_000, 13_000];
+  const wallets = ["a", "b", "c", "d", "e"];
+  const fed = new Set<number>();
+  const { bot, positions, log } = harness({
+    entryWindow: true,
+    capture: true,
+    now: () => new Date(now),
+    config: { entryWatchMinSec: 15, entryWatchMaxSec: 30, buySizeSol: 0.15 },
+    buy: async (order) => {
+      orders.push(order);
+      return fill({ price: order.quotePriceSol, sizeSol: order.sizeSol, jitoTipSol: order.tipSol ?? 0 });
+    },
+    sleep: async (ms) => {
+      const next = now + ms;
+      for (const at of times) {
+        if (at > now && at <= next && !fed.has(at)) {
+          fed.add(at);
+          now = at;
+          const index = times.indexOf(at);
+          await botRef?.onTrade({
+            kind: "trade",
+            mint: "Mint111",
+            txType: "buy",
+            trader: wallets[index % wallets.length] ?? "a",
+            signature: `b${at}`,
+            solQuoted: true,
+            priceSol: 1.1,
+            marketCapSol: 1.1,
+            vSolSol: 31,
+            solAmount: 0.2,
+            slot: 9,
+          });
+        }
+      }
+      now = next;
+    },
+  });
+  botRef = bot;
+  await bot.onLaunch(launch({ priceSol: 1, slot: 1, signature: "create" }));
+  assert.equal(orders.length, 1);
+  assert.equal(orders[0]?.sizeSol, 0.15);
+  assert.equal(orders[0]?.tipSol, 0.0015);
+  assert.equal(positions.list().length, 1);
+  assert.equal(
+    (log as ListLogger).entries.some((entry) => String(entry.fields?.reason ?? "").startsWith("entry_")),
+    false,
+  );
+});
+
+test("a creator sell, a fast drop, and a quiet open each exit immediately", async () => {
+  const dev = harness({
+    capture: true,
+    buy: async () => fill({ price: 1 }),
+  });
+  await dev.bot.onLaunch(launch({ mint: "Dev", priceSol: 1, creator: "Creator" }));
+  await dev.bot.onTrade({
+    kind: "trade",
+    mint: "Dev",
+    txType: "sell",
+    trader: "Creator",
+    signature: "dump",
+    solQuoted: true,
+    priceSol: 2,
+    marketCapSol: 2,
+    vSolSol: 40,
+  });
+  assert.equal(dev.trades.readAll().find((row) => row.side === "sell")?.reason, "dev_sell");
+  assert.equal(dev.sells[0]?.tipSol, dev.config.jitoTipMaxSol);
+  assert.equal(dev.sells[0]?.useQuotedSlippage, true);
+  assert.equal(dev.sells[0]?.hot, true);
+  assert.equal(dev.trades.readAll().find((row) => row.side === "sell")?.bundle, "jito");
+
+  const drop = harness({
+    buy: async () => fill({ price: 1 }),
+    config: { stopFastDropPct: 12 },
+  });
+  await drop.bot.onLaunch(launch({ mint: "Drop", priceSol: 1 }));
+  await drop.bot.onTrade({
+    kind: "trade",
+    mint: "Drop",
+    txType: "sell",
+    trader: "x",
+    signature: "s",
+    solQuoted: true,
+    priceSol: 0.85,
+    marketCapSol: 0.85,
+    vSolSol: 28,
+  });
+  assert.equal(drop.trades.readAll().find((row) => row.side === "sell")?.reason, "fast_drop");
+  assert.equal(drop.trades.readAll().find((row) => row.side === "sell")?.triggerPriceSol, 0.85);
+
+  let now = Date.parse("2026-11-04T12:00:00.000Z");
+  const quiet = harness({
+    now: () => new Date(now),
+    config: { earlyExitWindowSec: 5, volumeStallSec: 100_000 },
+    buy: async () => fill({ price: 1 }),
+  });
+  await quiet.bot.onLaunch(launch({ mint: "Quiet2", priceSol: 1 }));
+  now += 5_000;
+  await quiet.bot.checkHolds();
+  assert.equal(quiet.trades.readAll().find((row) => row.side === "sell")?.reason, "early_no_momentum");
+});
+
+test("BUY_SIZE_SOL above $30 is refused and a missed creator balance drop still exits", async () => {
+  const capped = harness({
+    capture: true,
+    config: { buySizeSol: 2 },
+  });
+  await capped.bot.onLaunch(launch({ priceSol: 1 }));
+  assert.equal(capped.positions.list().length, 0);
+  assert.equal(
+    (capped.log as ListLogger).entries.some((entry) => entry.fields?.reason === "buy_size_cap"),
+    true,
+  );
+
+  const missed = harness({
+    buy: async () => fill({ price: 1 }),
+    readCreatorBalance: async () => 0,
+  });
+  await missed.bot.onLaunch(launch({ mint: "Bal", priceSol: 1, initialBuyTokens: 1_000_000 }));
+  await missed.bot.checkHolds();
+  assert.equal(missed.trades.readAll().find((row) => row.side === "sell")?.reason, "dev_sell");
 });

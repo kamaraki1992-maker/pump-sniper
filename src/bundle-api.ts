@@ -55,7 +55,7 @@ export function buildBundleBody(publicKey: string, order: OrderRequest, config: 
   return {
     accounts: [account],
     mint: order.mint,
-    jitoTip: config.jitoTipSol,
+    jitoTip: order.tipSol != null && order.tipSol >= 0 ? order.tipSol : config.jitoTipSol,
     slippage: order.slippagePct,
     // Compute price is rewritten locally after simulation.
     priorityFee: 0,
@@ -138,6 +138,7 @@ export function applyDynamicCompute(
     tipSol: number;
     tipAccount: PublicKey;
     payer: PublicKey;
+    recentBlockhash?: string;
   },
 ): VersionedTransaction {
   const decompiled = TransactionMessage.decompile(tx.message, {
@@ -151,5 +152,6 @@ export function applyDynamicCompute(
     tipAccount: opts.tipAccount,
     payer: opts.payer,
     addressLookupTableAccounts: tables,
+    ...(opts.recentBlockhash ? { recentBlockhash: opts.recentBlockhash } : {}),
   });
 }

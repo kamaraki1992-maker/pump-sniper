@@ -96,9 +96,10 @@ export function rewriteTransaction(
     tipAccount: PublicKey;
     payer: PublicKey;
     addressLookupTableAccounts: AddressLookupTableAccount[];
+    recentBlockhash?: string;
   },
 ): VersionedTransaction {
-  const blockhash = tx.message.recentBlockhash;
+  const blockhash = opts.recentBlockhash || tx.message.recentBlockhash;
   decompiled.instructions = withComputeBudgetAndTip(decompiled.instructions, opts);
   const message = decompiled.compileToV0Message(opts.addressLookupTableAccounts ?? []);
   message.recentBlockhash = blockhash;

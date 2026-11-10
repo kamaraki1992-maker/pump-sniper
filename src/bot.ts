@@ -1,7 +1,9 @@
 import type { BoughtMints } from "./bought.js";
 import { bondingCurveAddress } from "./curve-watch.js";
 import { confidenceBreakdown, sizeFromConfidence, type ConfidenceBreakdown } from "./confidence.js";
-import { clampBuyUsd, requiredBuyBalanceSol, type AppConfig } from "./config.js";
+import { clampBuyUsd, HARD_CAPS, requiredBuyBalanceSol, type AppConfig } from "./config.js";
+import { evaluateEntry, type EntryPrint } from "./entry.js";
+import { isEmergencyExit, tipForTrade } from "./tip.js";
 import { SOL_PRICE_MAX_AGE_MS } from "./sol-price.js";
 import type { FilterDecision } from "./filter.js";
 import { holdDecision } from "./filter.js";
@@ -10,7 +12,7 @@ import { Logger } from "./logger.js";
 import type { PositionBook } from "./positions.js";
 import { assessMark, curveBuyPrice, curveSellPrice, EARLY_MARK_MS, poolSellPrice, poolSpot, reservesOnCurve, TOTAL_SUPPLY_TOKENS } from "./pricing.js";
 import type { TradeLog } from "./report.js";
-import { decideExit, ratchetStop, reservesDropped, trailStopPrice } from "./risk.js";
+import { decideExit, FULL_EXIT_FRACTION, ratchetStop, reservesDropped, trailStopPrice, type ExitPlan } from "./risk.js";
 import type { SafetyCheckResult } from "./safety.js";
 import type { Executor, MarketGraduation, MarketLaunch, MarketTrade, OrderRequest, Position, TradeReason } from "./types.js";
 
@@ -48,6 +50,22 @@ export interface BotDeps {
   };
   /** Live bonding-curve reserves from getAccountInfo. Used only when no trade or curve-watch sample exists. */
   readCurveReserves?: (mint: string) => Promise<{ vSol: number; vTokens: number } | null>;
+  /** Creator token balance in display tokens. A drop while a position is open is a dev sell. */
+  readCreatorBalance?: (mint: string, creator: string) => Promise<number | null>;
+}
+
+interface EntryWatch {
+  launch: MarketLaunch;
+  startedAtMs: number;
+  startPrice: number;
+  price: number;
+  slot: number | null;
+  signature: string;
+  bundled: Set<string>;
+  prints: EntryPrint[];
+  creatorSold: boolean;
+  prevVSol: number | null;
+  rugs: Promise<{ ok: boolean; reason: string }>;
 }
 
 const MAX_OPEN_LOG_MS = 5_000;
@@ -74,6 +92,7 @@ export class SniperBot {
   private readonly pendingExit = new Map<string, { reason: TradeReason; fraction: number }>();
   /** Latest on-curve reserves from a trade or curve-watch update. Launch snapshots are not stored. */
   private readonly freshReserves = new Map<string, { vSol: number; vTokens: number }>();
+  private readonly watched = new Map<string, EntryWatch>();
   private stopped = false;
 
   constructor(private readonly deps: BotDeps) {
@@ -90,60 +109,75 @@ export class SniperBot {
   }
 
   async onLaunch(launch: MarketLaunch): Promise<void> {
+    if (this.deps.config.entryWatchMaxSec > 0) {
+      await this.watchLaunch(launch);
+      return;
+    }
+    await this.buyAtLaunch(launch);
+  }
+
+  private async buyAtLaunch(launch: MarketLaunch, fromWatch = false): Promise<void> {
     if (this.stopped) return;
-    if (this.deps.bought?.has(launch.mint)) {
-      this.skip(launch, "already_bought");
-      return;
-    }
-    if (this.seen.has(launch.mint) || this.deps.positions.get(launch.mint) || this.pendingBuys.has(launch.mint)) {
-      return;
-    }
-    this.seen.add(launch.mint);
-    if (this.occupied() >= this.deps.config.maxOpenPositions) {
-      this.skipMaxOpen(launch);
-      return;
-    }
-    if (!launch.solQuoted) {
-      this.skip(launch, "non-sol quote");
-      return;
-    }
-    if (!launch.creator) {
-      this.skip(launch, "missing-creator");
-      return;
-    }
-    if (!(launch.priceSol && launch.priceSol > 0)) {
-      this.skip(launch, "no-price");
-      return;
-    }
-    const hold = holdDecision(launch.initialBuyTokens, this.deps.config.creatorMaxHoldPct);
-    if (!hold.ok) {
-      this.skip(launch, hold.reason ?? "creator-hold");
-      return;
-    }
-    if (this.deps.holders) {
-      const top10 = await this.withinBudget(
-        this.deps.holders.lookup(launch.mint),
+    if (!fromWatch) {
+      if (this.deps.bought?.has(launch.mint)) {
+        this.skip(launch, "already_bought");
+        return;
+      }
+      if (this.seen.has(launch.mint) || this.deps.positions.get(launch.mint) || this.pendingBuys.has(launch.mint)) {
+        return;
+      }
+      this.seen.add(launch.mint);
+      if (this.occupied() >= this.deps.config.maxOpenPositions) {
+        this.skipMaxOpen(launch);
+        return;
+      }
+      if (!launch.solQuoted) {
+        this.skip(launch, "non-sol quote");
+        return;
+      }
+      if (!launch.creator) {
+        this.skip(launch, "missing-creator");
+        return;
+      }
+      if (!(launch.priceSol && launch.priceSol > 0)) {
+        this.skip(launch, "no-price");
+        return;
+      }
+      const hold = holdDecision(launch.initialBuyTokens, this.deps.config.creatorMaxHoldPct);
+      if (!hold.ok) {
+        this.skip(launch, hold.reason ?? "creator-hold");
+        return;
+      }
+      if (this.deps.holders) {
+        const top10 = await this.withinBudget(
+          this.deps.holders.lookup(launch.mint),
+          this.deps.config.rugCheckTimeoutMs,
+          { ok: false, reason: "top10-timeout", pct: null },
+        );
+        if (!top10.ok) {
+          this.skip(launch, top10.reason ?? "top10", top10.pct != null ? { top10Pct: top10.pct } : undefined);
+          return;
+        }
+      }
+      const history = await this.withinBudget(
+        this.deps.history.lookup(launch.creator),
         this.deps.config.rugCheckTimeoutMs,
-        { ok: false, reason: "top10-timeout", pct: null },
+        { ok: false, reason: "creator-history-timeout" },
       );
-      if (!top10.ok) {
-        this.skip(launch, top10.reason ?? "top10", top10.pct != null ? { top10Pct: top10.pct } : undefined);
+      if (!history.ok) {
+        this.skip(launch, history.reason ?? "creator-history-unavailable");
         return;
       }
     }
-    const history = await this.withinBudget(
-      this.deps.history.lookup(launch.creator),
-      this.deps.config.rugCheckTimeoutMs,
-      { ok: false, reason: "creator-history-timeout" },
-    );
-    if (!history.ok) {
-      this.skip(launch, history.reason ?? "creator-history-unavailable");
+    if (this.stopped) return;
+    if (fromWatch && (this.deps.positions.get(launch.mint) || this.pendingBuys.has(launch.mint))) return;
+    if (fromWatch && this.occupied() >= this.deps.config.maxOpenPositions) {
+      this.skipMaxOpen(launch);
       return;
     }
-    if (this.stopped) return;
     const sized = this.quoteBuySize(launch);
-    if (!sized) {
-      this.skip(launch, "no_price");
+    if (!sized.ok) {
+      this.skip(launch, sized.reason);
       return;
     }
     if (this.deps.safetyCheck) {
@@ -166,8 +200,8 @@ export class SniperBot {
     }
     if (this.stopped) return;
     const orderSize = this.quoteBuySize(launch);
-    if (!orderSize) {
-      this.skip(launch, "no_price");
+    if (!orderSize.ok) {
+      this.skip(launch, orderSize.reason);
       return;
     }
     const { sizeUsd, sizeSol, confidence } = orderSize;
@@ -193,6 +227,7 @@ export class SniperBot {
       quotePriceSol,
       slippagePct: this.deps.config.buySlippagePct,
       reason: "entry",
+      tipSol: tipForTrade(this.deps.config, sizeSol, false),
     };
     try {
       if (this.deps.config.mode === "live") {
@@ -255,16 +290,30 @@ export class SniperBot {
         openedAt: this.deps.now().toISOString(),
         mode: this.deps.config.mode,
         entrySignature: fill.signature,
-        lastMarkPriceSol: launch.priceSol,
+        lastMarkPriceSol: launch.priceSol ?? fill.price,
         entryVSolSol: launch.vSolSol,
         lastVSolSol: launch.vSolSol,
         lastVTokens: launch.vTokens,
         bondingCurve: bondingCurveAddress(launch.mint, launch.bondingCurveKey),
         lastTradeAtMs: this.lastMarketTradeAt.get(launch.mint) ?? this.deps.now().getTime(),
         tradesSeen: 0,
+        creatorTokens: launch.initialBuyTokens,
       };
       this.deps.positions.open(position);
       if (position.bondingCurve) this.deps.curveWatch?.watch(launch.mint, position.bondingCurve);
+      void this.deps.executor.arm?.({
+        mint: position.mint,
+        name: position.name,
+        symbol: position.symbol,
+        creator: position.creator,
+        sizeSol: position.costSol,
+        quotePriceSol: position.lastMarkPriceSol,
+        slippagePct: this.deps.config.sellSlippagePct,
+        reason: "sl",
+        tokenAmount: position.tokenAmount,
+        sellFraction: 1,
+        tipSol: tipForTrade(this.deps.config, position.costSol, true),
+      });
       this.deps.log.info("buy filled", {
         mint: launch.mint,
         name: launch.name,
@@ -274,6 +323,7 @@ export class SniperBot {
         openPositions: this.deps.positions.list().length,
         sizeUsd,
         sizeSol,
+        jitoTipSol: fill.jitoTipSol,
         ...confidenceFields(confidence),
       });
     } finally {
@@ -287,8 +337,36 @@ export class SniperBot {
     const now = this.deps.now().getTime();
     this.lastMarketTradeAt.set(trade.mint, now);
     this.noteTrade(trade.mint, trade.txType, now);
+    const watch = this.watched.get(trade.mint);
+    if (watch) this.noteEntryPrint(watch, trade);
     const position = this.deps.positions.get(trade.mint);
     if (!position) return;
+    if (
+      this.deps.config.devSellExit &&
+      trade.txType === "sell" &&
+      trade.trader !== "" &&
+      trade.trader === position.creator
+    ) {
+      const px = trade.priceSol != null && trade.priceSol > 0 ? trade.priceSol : position.lastMarkPriceSol;
+      this.applyMark(position, trade.priceSol, trade.vSolSol, trade.vTokens ?? null);
+      position.creatorTokens = 0;
+      await this.sellPosition(position, "dev_sell", px);
+      return;
+    }
+    const prevMark = position.lastMarkPriceSol;
+    const printPx = trade.priceSol;
+    if (
+      trade.venue !== "pumpswap" &&
+      !position.graduated &&
+      prevMark > 0 &&
+      printPx != null &&
+      printPx > 0 &&
+      ((prevMark - printPx) / prevMark) * 100 >= this.deps.config.stopFastDropPct
+    ) {
+      this.applyMark(position, printPx, trade.vSolSol, trade.vTokens ?? null);
+      await this.sellPosition(position, "fast_drop", printPx);
+      return;
+    }
     position.tradesSeen = (position.tradesSeen ?? 0) + 1;
     position.lastTradeAtMs = now;
     if (trade.venue === "pumpswap") {
@@ -320,6 +398,7 @@ export class SniperBot {
   async checkHolds(): Promise<void> {
     if (this.stopped) return;
     for (const position of this.deps.positions.list()) {
+      if (await this.creatorBalanceDropped(position)) continue;
       await this.maybeExit(position, position.lastMarkPriceSol);
     }
   }
@@ -370,8 +449,6 @@ export class SniperBot {
     source: "trade" | "curve" | "pool" = "trade",
   ): Promise<void> {
     if (this.selling.has(position.mint)) return;
-    const cooldown = this.cooldownUntil.get(position.mint) ?? 0;
-    if (this.deps.now().getTime() < cooldown) return;
     const openedAtMs = Date.parse(position.openedAt);
     const counts = this.windowCounts(position.mint, this.deps.now().getTime());
     const mark = quote > 0 ? quote : 0;
@@ -414,8 +491,26 @@ export class SniperBot {
       minPressureSells: 4,
       useStreamLiquidity: this.deps.curveWatch?.isLive(position.mint) !== true,
     });
-    if (!plan) return;
-    await this.sellPosition(position, plan.signal, quote > 0 ? quote : position.lastMarkPriceSol, plan.fraction);
+    const early =
+      !plan && this.deps.config.earlyExitWindowSec > 0 && position.entryPriceSol > 0
+        ? this.earlyMomentum(position, openedAtMs)
+        : null;
+    const exit = plan ?? early;
+    if (!exit) return;
+    const hot = isEmergencyExit(exit.signal) || exit.signal === "early_no_momentum";
+    const cooldown = this.cooldownUntil.get(position.mint) ?? 0;
+    if (!hot && this.deps.now().getTime() < cooldown) return;
+    await this.sellPosition(position, exit.signal, quote > 0 ? quote : position.lastMarkPriceSol, exit.fraction);
+  }
+
+  private earlyMomentum(position: Position, openedAtMs: number): ExitPlan | null {
+    const windowMs = this.deps.config.earlyExitWindowSec * 1000;
+    if (!(windowMs > 0) || this.deps.now().getTime() - openedAtMs < windowMs) return null;
+    const peak = position.peakPriceSol ?? position.lastMarkPriceSol;
+    if (!(peak > 0) || !(position.entryPriceSol > 0)) return null;
+    const gain = ((peak / position.entryPriceSol) - 1) * 100;
+    if (gain + 1e-9 >= this.deps.config.earlyExitMinGainPct) return null;
+    return { signal: "early_no_momentum", fraction: FULL_EXIT_FRACTION };
   }
 
   async panicSell(): Promise<void> {
@@ -436,13 +531,19 @@ export class SniperBot {
         if (!current) return;
         const before = current.tokenAmount;
         const requested = portion >= 0.999 ? before : before * portion;
-        const execution = this.sellQuote(current, quote, requested);
+        const stopLike = isEmergencyExit(reason) || reason === "early_no_momentum";
+        const execution = stopLike
+          ? quote > 0
+            ? quote
+            : current.lastMarkPriceSol
+          : this.sellQuote(current, quote, requested);
         if (execution == null) {
           current.unpriced = true;
           this.pendingExit.set(current.mint, { reason, fraction: portion });
           this.deps.log.info("unpriced", { mint: current.mint, reason });
           return;
         }
+        const proceeds = execution * requested;
         const fill = await this.deps.executor.sell({
           mint: current.mint,
           name: current.name,
@@ -455,6 +556,9 @@ export class SniperBot {
           reason,
           tokenAmount: requested,
           sellFraction: portion,
+          tipSol: tipForTrade(this.deps.config, proceeds, isEmergencyExit(reason)),
+          useQuotedSlippage: stopLike,
+          hot: attempt === 1 && isEmergencyExit(reason),
         });
         const reported = fill.tokenAmount > 0 ? fill.tokenAmount : requested;
         const sold = Math.min(before, reported);
@@ -483,6 +587,8 @@ export class SniperBot {
           realizedPnlSol: realized,
           realizedPnlTotalSol: total,
           costSol: fill.status === "filled" ? costAllocated : current.costSol,
+          triggerPriceSol: quote,
+          bundle: "jito",
         });
         if (fill.status === "filled") {
           const remaining = before - sold;
@@ -495,6 +601,8 @@ export class SniperBot {
             signature: fill.signature,
             triggerMarkSol: quote,
             fillPriceSol: fill.price,
+            jitoTipSol: fill.jitoTipSol,
+            bundle: "jito",
             fraction: share,
             remainingTokenAmount: partial ? remaining : 0,
             ...(reason === "volume_stall" ? { tradesSeen: current.tradesSeen ?? 0 } : {}),
@@ -519,7 +627,7 @@ export class SniperBot {
           attempt,
           error: fill.error,
         });
-        if (attempt < attempts) await this.deps.sleep(250 * 2 ** (attempt - 1));
+        if (attempt < attempts && !stopLike) await this.deps.sleep(250 * 2 ** (attempt - 1));
       }
       this.cooldownUntil.set(position.mint, this.deps.now().getTime() + 5_000);
     } finally {
@@ -652,13 +760,201 @@ export class SniperBot {
     this.freshReserves.set(mint, { vSol, vTokens });
   }
 
-  /** USD notional clamped to the hard cap, then SOL at the fresh quote. */
+  private async watchLaunch(launch: MarketLaunch): Promise<void> {
+    if (this.stopped) return;
+    if (this.deps.bought?.has(launch.mint)) {
+      this.skip(launch, "already_bought");
+      return;
+    }
+    if (this.seen.has(launch.mint) || this.deps.positions.get(launch.mint) || this.pendingBuys.has(launch.mint)) {
+      return;
+    }
+    if (!launch.solQuoted) {
+      this.seen.add(launch.mint);
+      this.skip(launch, "non-sol quote");
+      return;
+    }
+    if (!launch.creator) {
+      this.seen.add(launch.mint);
+      this.skip(launch, "missing-creator");
+      return;
+    }
+    if (!(launch.priceSol && launch.priceSol > 0)) {
+      this.seen.add(launch.mint);
+      this.skip(launch, "no-price");
+      return;
+    }
+    const hold = holdDecision(launch.initialBuyTokens, this.deps.config.creatorMaxHoldPct);
+    if (!hold.ok) {
+      this.seen.add(launch.mint);
+      this.skip(launch, hold.reason ?? "creator-hold");
+      return;
+    }
+    if (this.watched.size >= this.deps.config.entryMaxWatched) {
+      this.seen.add(launch.mint);
+      this.skip(launch, "entry_watch_full");
+      return;
+    }
+    this.seen.add(launch.mint);
+    this.deps.subscribeMint(launch.mint);
+    const startedAtMs = this.deps.now().getTime();
+    const watch: EntryWatch = {
+      launch,
+      startedAtMs,
+      startPrice: launch.priceSol,
+      price: launch.priceSol,
+      slot: launch.slot ?? null,
+      signature: launch.signature,
+      bundled: new Set<string>(),
+      prints: [],
+      creatorSold: false,
+      prevVSol: launch.vSolSol,
+      rugs: this.rugChecks(launch),
+    };
+    this.watched.set(launch.mint, watch);
+    const minMs = this.deps.config.entryWatchMinSec * 1000;
+    const maxMs = this.deps.config.entryWatchMaxSec * 1000;
+    try {
+      while (!this.stopped && this.watched.has(launch.mint)) {
+        const now = this.deps.now().getTime();
+        if (watch.creatorSold) {
+          this.skip(launch, "entry_creator_sold");
+          return;
+        }
+        const elapsed = now - startedAtMs;
+        if (elapsed >= minMs) {
+          const rug = await this.rugReady(watch.rugs);
+          if (rug && !rug.ok) {
+            this.skip(launch, rug.reason);
+            return;
+          }
+          const verdict = evaluateEntry(this.entrySample(watch, now));
+          if (verdict.ok && rug?.ok) {
+            this.watched.delete(launch.mint);
+            await this.buyAtLaunch(launch, true);
+            return;
+          }
+        }
+        if (elapsed >= maxMs) {
+          const rug = await watch.rugs;
+          if (!rug.ok) {
+            this.skip(launch, rug.reason);
+            return;
+          }
+          const verdict = evaluateEntry(this.entrySample(watch, now));
+          this.skip(launch, verdict.ok ? "entry_timeout" : verdict.reason);
+          return;
+        }
+        const before = now;
+        await this.deps.sleep(200);
+        if (this.deps.now().getTime() === before) {
+          this.skip(launch, "entry_timeout");
+          return;
+        }
+      }
+    } finally {
+      this.watched.delete(launch.mint);
+      if (!this.deps.positions.get(launch.mint) && !this.pendingBuys.has(launch.mint)) {
+        this.deps.unsubscribeMint(launch.mint);
+      }
+    }
+  }
+
+  private rugChecks(launch: MarketLaunch): Promise<{ ok: boolean; reason: string }> {
+    return (async () => {
+      if (this.deps.holders) {
+        const top10 = await this.withinBudget(
+          this.deps.holders.lookup(launch.mint),
+          this.deps.config.rugCheckTimeoutMs,
+          { ok: false, reason: "top10-timeout", pct: null },
+        );
+        if (!top10.ok) return { ok: false, reason: top10.reason ?? "top10" };
+      }
+      const history = await this.withinBudget(
+        this.deps.history.lookup(launch.creator),
+        this.deps.config.rugCheckTimeoutMs,
+        { ok: false, reason: "creator-history-timeout" },
+      );
+      if (!history.ok) return { ok: false, reason: history.reason ?? "creator-history-unavailable" };
+      return { ok: true, reason: "" };
+    })();
+  }
+
+  /** Resolved rug result, or null when the checks are still running. */
+  private async rugReady(work: Promise<{ ok: boolean; reason: string }>): Promise<{ ok: boolean; reason: string } | null> {
+    return Promise.race([
+      work,
+      new Promise<null>((resolve) => {
+        setTimeout(() => resolve(null), 0);
+      }),
+    ]);
+  }
+
+  private entrySample(watch: EntryWatch, nowMs: number) {
+    const config = this.deps.config;
+    return {
+      startedAtMs: watch.startedAtMs,
+      nowMs,
+      startPrice: watch.startPrice,
+      price: watch.price,
+      creator: watch.launch.creator,
+      bundled: watch.bundled,
+      prints: watch.prints,
+      minBuys: config.entryMinBuys,
+      minUniqueBuyers: config.entryMinUniqueBuyers,
+      minNetBuySol: config.entryMinNetBuySol,
+      minBuyRatio: config.entryMinBuyRatio,
+      maxRunupPct: config.entryMaxRunupPct,
+    };
+  }
+
+  private noteEntryPrint(watch: EntryWatch, trade: MarketTrade): void {
+    const sameSlot = watch.slot != null && trade.slot != null && trade.slot === watch.slot;
+    const sameCreate = trade.signature !== "" && trade.signature === watch.signature;
+    if (sameSlot || sameCreate) {
+      if (trade.trader) watch.bundled.add(trade.trader);
+      return;
+    }
+    let sol = trade.solAmount != null && trade.solAmount > 0 ? trade.solAmount : 0;
+    if (!(sol > 0) && trade.vSolSol != null && watch.prevVSol != null) {
+      sol = Math.abs(trade.vSolSol - watch.prevVSol);
+    }
+    if (trade.vSolSol != null && trade.vSolSol > 0) watch.prevVSol = trade.vSolSol;
+    if (trade.txType === "sell" && trade.trader === watch.launch.creator) watch.creatorSold = true;
+    if (trade.priceSol != null && trade.priceSol > 0) watch.price = trade.priceSol;
+    watch.prints.push({
+      atMs: this.deps.now().getTime(),
+      side: trade.txType,
+      trader: trade.trader,
+      sol,
+    });
+  }
+
+  private async creatorBalanceDropped(position: Position): Promise<boolean> {
+    if (!this.deps.config.devSellExit || !this.deps.readCreatorBalance) return false;
+    if (position.creatorTokens == null) return false;
+    try {
+      const balance = await this.deps.readCreatorBalance(position.mint, position.creator);
+      if (balance == null) return false;
+      if (balance + 1e-6 < position.creatorTokens) {
+        position.creatorTokens = balance;
+        await this.sellPosition(position, "dev_sell", position.lastMarkPriceSol);
+        return true;
+      }
+      position.creatorTokens = balance;
+    } catch {
+      return false;
+    }
+    return false;
+  }
+
+  /** USD notional clamped to the hard cap, then SOL at the fresh quote. BUY_SIZE_SOL wins when set. */
   private quoteBuySize(
     launch: MarketLaunch,
-  ): { sizeUsd: number; sizeSol: number; confidence: ConfidenceBreakdown } | null {
+  ): { ok: true; sizeUsd: number; sizeSol: number; confidence: ConfidenceBreakdown } | { ok: false; reason: string } {
     const quote = this.deps.solQuote();
-    if (!quote || !(quote.usd > 0) || !Number.isFinite(quote.usd)) return null;
-    if (this.deps.now().getTime() - quote.updatedAtMs > SOL_PRICE_MAX_AGE_MS) return null;
+    if (!quote || !(quote.usd > 0) || !Number.isFinite(quote.usd)) return { ok: false, reason: "no_price" };
+    if (this.deps.now().getTime() - quote.updatedAtMs > SOL_PRICE_MAX_AGE_MS) return { ok: false, reason: "no_price" };
     const holdPct = (launch.initialBuyTokens / TOTAL_SUPPLY_TOKENS) * 100;
     const counts = this.windowCounts(launch.mint, this.deps.now().getTime());
     const confidence = confidenceBreakdown({
@@ -667,11 +963,17 @@ export class SniperBot {
       sells: counts.sells,
       safetyOk: true,
     });
+    const fixed = this.deps.config.buySizeSol;
+    if (fixed != null) {
+      const sizeUsd = fixed * quote.usd;
+      if (!(sizeUsd > 0) || sizeUsd > HARD_CAPS.maxBuyUsd) return { ok: false, reason: "buy_size_cap" };
+      return { ok: true, sizeUsd, sizeSol: fixed, confidence };
+    }
     const sizeUsd = clampBuyUsd(
       sizeFromConfidence(confidence.score, this.deps.config.buySizeMinUsd, this.deps.config.buySizeMaxUsd),
     );
-    if (!(sizeUsd > 0)) return null;
-    return { sizeUsd, sizeSol: sizeUsd / quote.usd, confidence };
+    if (!(sizeUsd > 0)) return { ok: false, reason: "no_price" };
+    return { ok: true, sizeUsd, sizeSol: sizeUsd / quote.usd, confidence };
   }
 
   private noteTrade(mint: string, side: "buy" | "sell", at: number): void {

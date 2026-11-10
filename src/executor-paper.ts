@@ -17,9 +17,11 @@ function failed(order: OrderRequest, error: string): FillResult {
   };
 }
 
-function capped(model: PaperModel, cap: number): PaperModel {
-  if (!(cap >= 0) || !Number.isFinite(cap)) return model;
-  return { ...model, slippagePct: Math.min(model.slippagePct, cap) };
+function capped(model: PaperModel, order: OrderRequest): PaperModel {
+  const cap = order.slippagePct;
+  const slip = order.useQuotedSlippage || !(cap >= 0) || !Number.isFinite(cap) ? cap : Math.min(model.slippagePct, cap);
+  const tip = order.tipSol != null && order.tipSol >= 0 && Number.isFinite(order.tipSol) ? order.tipSol : model.jitoTipSol;
+  return { ...model, slippagePct: slip, jitoTipSol: tip };
 }
 
 /** Simulated fills. This executor never signs or broadcasts. */
@@ -69,7 +71,7 @@ export class PaperExecutor implements Executor {
   }
 
   private async priced(order: OrderRequest): Promise<PaperModel> {
-    const base = capped(this.model, order.slippagePct);
+    const base = capped(this.model, order);
     if (!this.feeSol) return base;
     try {
       const sol = await this.feeSol(order);

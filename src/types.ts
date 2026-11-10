@@ -14,7 +14,10 @@ export type TradeReason =
   | "liquidity_drop"
   | "volume_stall"
   | "sell_pressure"
-  | "trailing_stop";
+  | "trailing_stop"
+  | "dev_sell"
+  | "fast_drop"
+  | "early_no_momentum";
 
 export interface MarketLaunch {
   kind: "launch";
@@ -34,6 +37,8 @@ export interface MarketLaunch {
   /** Virtual token reserves, in display tokens. */
   vTokens: number | null;
   bondingCurveKey: string | null;
+  slot?: number | null;
+  solAmount?: number | null;
 }
 
 export interface MarketTrade {
@@ -51,6 +56,9 @@ export interface MarketTrade {
   venue?: "curve" | "pumpswap";
   poolBaseTokens?: number | null;
   poolQuoteSol?: number | null;
+  slot?: number | null;
+  /** SOL this print swapped. Absent when the feed did not include it. */
+  solAmount?: number | null;
 }
 
 /** Curve `complete` or PumpSwap `create_pool`. Pricing leaves the bonding curve. */
@@ -80,6 +88,12 @@ export interface OrderRequest {
   sellFraction?: number;
   /** Set on a graduated sell so the bundle is built against PumpSwap. */
   pool?: "pump-amm" | "auto";
+  /** Computed Jito tip for this order. Falls back to the config tip when omitted. */
+  tipSol?: number;
+  /** Stop-like exits use this order's slippage instead of the smaller paper default. */
+  useQuotedSlippage?: boolean;
+  /** First attempt of an emergency sell. The live path uses the cached blockhash and fee. */
+  hot?: boolean;
 }
 
 export interface FillResult {
@@ -123,6 +137,10 @@ export interface TradeRecord {
   /** Present on sells. This fill plus earlier partials on the same position. */
   realizedPnlTotalSol?: number | null;
   costSol: number | null;
+  /** Mark that triggered a sell, before slippage. */
+  triggerPriceSol?: number | null;
+  /** Paper and live sells go out as a Jito bundle. */
+  bundle?: "jito" | null;
 }
 
 export interface Position {
@@ -169,9 +187,13 @@ export interface Position {
   poolQuoteSol?: number | null;
   /** Graduated, but no pool reserves yet. Sells wait for the next pool quote. */
   unpriced?: boolean;
+  /** Creator token balance last observed, in display tokens. A drop is a dev sell. */
+  creatorTokens?: number | null;
 }
 
 export interface Executor {
   buy(order: OrderRequest): Promise<FillResult>;
   sell(order: OrderRequest): Promise<FillResult>;
+  /** Build a sell ahead of the stop so the hot path does not wait on RPC. */
+  arm?(order: OrderRequest): Promise<void>;
 }

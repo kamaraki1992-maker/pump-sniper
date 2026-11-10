@@ -253,6 +253,8 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
       vSolSol,
       vTokens,
       bondingCurveKey: asString(record.bondingCurveKey),
+      slot: asNumber(record.slot),
+      solAmount: asNumber(record.solAmount),
     };
     return launch;
   }
@@ -283,6 +285,8 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
       vSolSol,
       vTokens,
       ...(pumpswap ? { venue: "pumpswap" as const, poolBaseTokens: pool.baseTokens, poolQuoteSol: pool.quoteSol } : {}),
+      slot: asNumber(record.slot),
+      solAmount: asNumber(record.solAmount),
     };
     return trade;
   }

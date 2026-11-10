@@ -5,7 +5,10 @@ export type ExitSignal =
   | "liquidity_drop"
   | "volume_stall"
   | "sell_pressure"
-  | "trailing_stop";
+  | "trailing_stop"
+  | "dev_sell"
+  | "fast_drop"
+  | "early_no_momentum";
 
 export interface ExitPlan {
   signal: ExitSignal;

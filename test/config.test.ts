@@ -27,7 +27,19 @@ test("defaults match the risk spec", () => {
   assert.equal(cfg.buySlippagePct, 5);
   assert.equal(cfg.sellSlippagePct, 10);
   assert.equal(cfg.maxSlippagePct, 5);
-  assert.equal(cfg.jitoTipSol, 0.002);
+  assert.equal(cfg.tipMode, "dynamic");
+  assert.equal(cfg.jitoTipPct, 0.01);
+  assert.equal(cfg.jitoTipMinSol, 0.0005);
+  assert.equal(cfg.jitoTipMaxSol, 0.0015);
+  assert.equal(cfg.jitoTipSol, 0.0005);
+  assert.equal(cfg.buySizeSol, null);
+  assert.equal(cfg.entryWatchMinSec, 15);
+  assert.equal(cfg.entryWatchMaxSec, 30);
+  assert.equal(cfg.entryMinBuys, 8);
+  assert.equal(cfg.entryMinUniqueBuyers, 5);
+  assert.equal(cfg.devSellExit, true);
+  assert.equal(cfg.earlyExitWindowSec, 5);
+  assert.equal(cfg.stopFastDropPct, 12);
   assert.equal(cfg.stopLossPct, 20);
   assert.equal(cfg.trailActivatePct, 50);
   assert.equal(cfg.trailDistancePct, 20);
@@ -60,10 +72,13 @@ test("buy size, slippage, and tip hard caps refuse startup", () => {
   assert.equal(loadConfig({ MAX_SLIPPAGE_PCT: "3", BUY_SLIPPAGE_PCT: "5", SELL_SLIPPAGE_PCT: "10" }).sellSlippagePct, 10);
   assert.equal(loadConfig({}).buySlippagePct, 5);
   assert.equal(loadConfig({}).sellSlippagePct, 10);
-  assert.throws(() => loadConfig({ JITO_TIP_SOL: "0.001" }), ConfigError);
+  assert.throws(() => loadConfig({ JITO_TIP_SOL: "0.0004" }), ConfigError);
   assert.throws(() => loadConfig({ JITO_TIP_SOL: "0.006" }), ConfigError);
-  assert.equal(loadConfig({ JITO_TIP_SOL: "0.002" }).jitoTipSol, 0.002);
+  assert.equal(loadConfig({ JITO_TIP_SOL: "0.001" }).jitoTipSol, 0.001);
+  assert.equal(loadConfig({ JITO_TIP_SOL: "0.002" }).tipMode, "fixed");
   assert.equal(loadConfig({ JITO_TIP_SOL: "0.005" }).jitoTipSol, 0.005);
+  assert.throws(() => loadConfig({ JITO_TIP_MAX_SOL: "0.006" }), ConfigError);
+  assert.equal(loadConfig({ JITO_TIP_PCT: "0.01", JITO_TIP_MAX_SOL: "0.0015" }).tipMode, "dynamic");
 });
 
 test("stop loss caps at -20%, the trail replaces TRAIL_TIERS, and take profit is the 2x partial", () => {
@@ -93,7 +108,7 @@ test("open positions cannot be loosened past 5", () => {
 test("live buy reserves exit SOL for the USD notional and for positions already open", () => {
   const cfg = loadConfig({});
   const fee = 0.0005 + 0.000005;
-  const tip = 0.002;
+  const tip = 0.0015;
   const sizeSol = clampBuyUsd(30) / 100;
   const one = requiredBuyBalanceSol(cfg, sizeSol, 0);
   assert.equal(clampBuyUsd(40), 30);
@@ -112,11 +127,14 @@ test("creator hold defaults to 5% and cannot be loosened past 10%", () => {
   assert.equal(loadConfig({ CREATOR_MAX_HOLD_PCT: "10" }).creatorMaxHoldPct, 10);
 });
 
-test("Jito tip accepts lamports and still defaults to 0.002 SOL", () => {
-  assert.equal(loadConfig({}).jitoTipSol, 0.002);
+test("Jito tip is dynamic unless a legacy tip is set on its own", () => {
+  assert.equal(loadConfig({}).tipMode, "dynamic");
+  assert.equal(loadConfig({}).jitoTipMinSol, 0.0005);
   assert.equal(loadConfig({ JITO_TIP_LAMPORTS: "3000000" }).jitoTipSol, 0.003);
   assert.equal(loadConfig({ JITO_TIP_SOL: "0.004", JITO_TIP_LAMPORTS: "3000000" }).jitoTipSol, 0.003);
-  assert.throws(() => loadConfig({ JITO_TIP_LAMPORTS: "1000000" }), ConfigError);
+  assert.equal(loadConfig({ JITO_TIP_LAMPORTS: "1000000" }).jitoTipSol, 0.001);
+  assert.throws(() => loadConfig({ JITO_TIP_LAMPORTS: "400000" }), ConfigError);
+  assert.equal(loadConfig({ JITO_TIP_SOL: "0.002", JITO_TIP_PCT: "0.01" }).tipMode, "dynamic");
 });
 
 test("top-10 cap and Helius rate use conservative defaults", () => {

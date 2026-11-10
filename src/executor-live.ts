@@ -28,6 +28,8 @@ export interface LivePorts {
   confirm(signature: string): Promise<ConfirmResult>;
   /** Dynamic priority fee in SOL. A throw or a missing port uses PRIORITY_FEE_SOL. */
   priorityFee?: (accountKeys: string[], cuLimit: number) => Promise<number>;
+  /** Fresh blockhash for a rebuilt bundle. The hot path uses the cached one. */
+  blockhash?: () => Promise<string>;
   tipAccount: PublicKey;
   config: AppConfig;
 }
@@ -103,7 +105,17 @@ export function liveFillFromConfirm(
  * dynamic compute-unit limit and price, signs locally, and submits one
  * transaction as a Jito bundle. A returned bundle id is not a fill.
  */
+interface ArmedSell {
+  raw: Uint8Array;
+  units: number | null;
+  priorityFeeSol: number;
+  blockhash: string;
+  tables: AddressLookupTableAccount[];
+}
+
 export class LiveExecutor implements Executor {
+  private readonly armed = new Map<string, ArmedSell>();
+
   constructor(private readonly ports: LivePorts) {}
 
   async buy(order: OrderRequest): Promise<FillResult> {
@@ -111,7 +123,58 @@ export class LiveExecutor implements Executor {
   }
 
   async sell(order: OrderRequest): Promise<FillResult> {
+    if (order.hot) {
+      const cached = this.armed.get(order.mint);
+      if (cached) return this.executeHot(order, cached);
+    }
     return this.execute(order);
+  }
+
+  /** Simulate and quote a full sell while the position is open. */
+  async arm(order: OrderRequest): Promise<void> {
+    try {
+      const raw = await this.ports.buildUnsignedTx(order);
+      const tx = VersionedTransaction.deserialize(raw);
+      const sim = await this.ports.simulate(tx);
+      if (sim.err) return;
+      const cuLimit = cuLimitFromConsumed(sim.unitsConsumed);
+      const priorityFeeSol = await this.priorityFeeSol(tx, cuLimit);
+      const tables = await this.ports.lookupTables(tx);
+      const blockhash = this.ports.blockhash ? await this.ports.blockhash() : tx.message.recentBlockhash;
+      this.armed.set(order.mint, { raw, units: sim.unitsConsumed, priorityFeeSol, blockhash, tables });
+    } catch {
+      this.armed.delete(order.mint);
+    }
+  }
+
+  private tipSol(order: OrderRequest): number {
+    return order.tipSol != null && order.tipSol >= 0 && Number.isFinite(order.tipSol)
+      ? order.tipSol
+      : this.ports.config.jitoTipSol;
+  }
+
+  private async executeHot(order: OrderRequest, cached: ArmedSell): Promise<FillResult> {
+    const tip = this.tipSol(order);
+    let tx: VersionedTransaction;
+    try {
+      tx = VersionedTransaction.deserialize(cached.raw);
+    } catch {
+      return this.execute(order);
+    }
+    let prepared: VersionedTransaction;
+    try {
+      prepared = applyDynamicCompute(tx, cached.tables, {
+        unitsConsumed: cached.units,
+        priorityFeeSol: cached.priorityFeeSol,
+        tipSol: tip,
+        tipAccount: this.ports.tipAccount,
+        payer: this.ports.publicKey,
+        recentBlockhash: cached.blockhash,
+      });
+    } catch (error) {
+      return blank(order, error instanceof Error ? error.message : "tx-prepare-failed");
+    }
+    return this.submit(order, prepared, cached.priorityFeeSol, tip);
   }
 
   private async execute(order: OrderRequest): Promise<FillResult> {
@@ -137,17 +200,28 @@ export class LiveExecutor implements Executor {
     let prepared: VersionedTransaction;
     try {
       const tables = await this.ports.lookupTables(tx);
+      const blockhash = this.ports.blockhash ? await this.ports.blockhash() : undefined;
       prepared = applyDynamicCompute(tx, tables, {
         unitsConsumed: sim.unitsConsumed,
         priorityFeeSol,
-        tipSol: this.ports.config.jitoTipSol,
+        tipSol: this.tipSol(order),
         tipAccount: this.ports.tipAccount,
         payer: this.ports.publicKey,
+        ...(blockhash ? { recentBlockhash: blockhash } : {}),
       });
     } catch (error) {
       return blank(order, error instanceof Error ? error.message : "tx-prepare-failed");
     }
 
+    return this.submit(order, prepared, priorityFeeSol, this.tipSol(order));
+  }
+
+  private async submit(
+    order: OrderRequest,
+    prepared: VersionedTransaction,
+    priorityFeeSol: number,
+    tip: number,
+  ): Promise<FillResult> {
     try {
       this.ports.sign(prepared);
     } catch {
@@ -166,11 +240,8 @@ export class LiveExecutor implements Executor {
       price: order.quotePriceSol,
       tokenAmount: order.tokenAmount ?? 0,
       feesSol: priorityFeeSol + this.ports.config.paper.baseFeeSol,
-      tipSol: this.ports.config.jitoTipSol,
-      cashflowSol:
-        order.reason === "entry"
-          ? order.sizeSol + this.ports.config.jitoTipSol + priorityFeeSol
-          : 0,
+      tipSol: tip,
+      cashflowSol: order.reason === "entry" ? order.sizeSol + tip + priorityFeeSol : 0,
     };
     return liveFillFromConfirm(order, sent.signature, confirm, estimate);
   }
@@ -198,6 +269,10 @@ export function createLivePorts(
     publicKey: keypair.publicKey,
     config,
     tipAccount: pickTipAccount(),
+    blockhash: async () => {
+      const latest = await connection.getLatestBlockhash("processed");
+      return latest.blockhash;
+    },
     sign: (tx) => {
       tx.sign([keypair]);
     },
