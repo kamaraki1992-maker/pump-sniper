@@ -73,9 +73,12 @@ interface EntryWatch {
   creatorSold: boolean;
   prevVSol: number | null;
   rugs: Promise<{ ok: boolean; reason: string }>;
+  socials: Promise<SocialDecision>;
 }
 
 const MAX_OPEN_LOG_MS = 5_000;
+/** Leave this much of the watch so the entry decision is not held past it. */
+const METADATA_DECISION_MARGIN_MS = 300;
 
 function confidenceFields(confidence: ConfidenceBreakdown): Record<string, number> {
   return {
@@ -167,7 +170,7 @@ export class SniperBot {
         this.skip(launch, hold.reason ?? "creator-hold");
         return;
       }
-      const socialP = this.socialCheck(launch);
+      const socialP = this.socialCheck(launch, this.deps.now().getTime());
       if (this.deps.holders) {
         const top10 = await this.withinBudget(
           this.deps.holders.lookup(launch.mint),
@@ -845,6 +848,7 @@ export class SniperBot {
       creatorSold: false,
       prevVSol: launch.vSolSol,
       rugs: this.rugChecks(launch),
+      socials: this.socialCheck(launch, startedAtMs),
     };
     this.watched.set(launch.mint, watch);
     const minMs = this.deps.config.entryWatchMinSec * 1000;
@@ -867,8 +871,13 @@ export class SniperBot {
             this.skip(launch, rug.reason);
             return;
           }
+          const social = await this.rugReady(watch.socials);
+          if (social && !social.ok) {
+            this.skip(launch, social.reason ?? "metadata_unavailable");
+            return;
+          }
           const verdict = evaluateEntry(this.entrySample(watch, now));
-          if (verdict.ok && rug?.ok) {
+          if (verdict.ok && rug?.ok && social?.ok) {
             this.watched.delete(launch.mint);
             await this.buyAtLaunch(launch, true);
             return;
@@ -878,6 +887,11 @@ export class SniperBot {
           const rug = await watch.rugs;
           if (!rug.ok) {
             this.skip(launch, rug.reason);
+            return;
+          }
+          const social = await watch.socials;
+          if (!social.ok) {
+            this.skip(launch, social.reason ?? "metadata_unavailable");
             return;
           }
           const verdict = evaluateEntry(this.entrySample(watch, now));
@@ -900,7 +914,6 @@ export class SniperBot {
   }
 
   private rugChecks(launch: MarketLaunch): Promise<{ ok: boolean; reason: string }> {
-    const socialP = this.socialCheck(launch);
     const top10P = this.deps.holders
       ? this.withinBudget(this.deps.holders.lookup(launch.mint), this.deps.config.rugCheckTimeoutMs, {
           ok: false,
@@ -913,15 +926,23 @@ export class SniperBot {
       this.deps.config.rugCheckTimeoutMs,
       { ok: false, reason: "creator-history-timeout" },
     );
-    return Promise.all([socialP, top10P, historyP]).then(([social, top10, history]) => {
-      if (!social.ok) return { ok: false, reason: social.reason ?? "metadata_unavailable" };
+    return Promise.all([top10P, historyP]).then(([top10, history]) => {
       if (!top10.ok) return { ok: false, reason: top10.reason ?? "top10" };
       if (!history.ok) return { ok: false, reason: history.reason ?? "creator-history-unavailable" };
       return { ok: true, reason: "" };
     });
   }
 
-  private socialCheck(launch: MarketLaunch): Promise<SocialDecision> {
+  /** Retry budget for this watch. Ends a margin before the entry decision. */
+  private socialDeadline(startedAtMs: number): number {
+    const config = this.deps.config;
+    const windowMs = config.entryWatchMaxSec * 1000;
+    const budgetMs = (config.metadataRetryDeadlineSec ?? config.entryWatchMaxSec) * 1000;
+    if (windowMs <= 0) return startedAtMs + budgetMs;
+    return Math.min(startedAtMs + budgetMs, startedAtMs + windowMs - METADATA_DECISION_MARGIN_MS);
+  }
+
+  private socialCheck(launch: MarketLaunch, startedAtMs: number): Promise<SocialDecision> {
     if (!this.deps.config.requireSocials) {
       return Promise.resolve({ ok: true, reason: null, twitter: null, telegram: null });
     }
@@ -933,17 +954,22 @@ export class SniperBot {
         reason: decision.reason,
         twitter: decision.twitter,
         telegram: decision.telegram,
+        latency_ms: decision.latencyMs ?? 0,
+        attempts: decision.attempts ?? 0,
+        gateway: decision.gateway ?? null,
       });
       return decision;
     };
     if (!uri || !this.deps.metadataSocials) {
-      return Promise.resolve(finish({ ok: false, reason: "metadata_unavailable", twitter: null, telegram: null }));
+      return Promise.resolve(
+        finish({ ok: false, reason: "metadata_unavailable", twitter: null, telegram: null, attempts: 0, latencyMs: 0, gateway: null }),
+      );
     }
-    return this.deps.metadataSocials.lookup(uri).then(finish);
+    return this.deps.metadataSocials.lookup(uri, { deadlineAtMs: this.socialDeadline(startedAtMs) }).then(finish);
   }
 
-  /** Resolved rug result, or null when the checks are still running. */
-  private async rugReady(work: Promise<{ ok: boolean; reason: string }>): Promise<{ ok: boolean; reason: string } | null> {
+  /** Resolved check, or null when it is still running. */
+  private async rugReady<T>(work: Promise<T>): Promise<T | null> {
     return Promise.race([
       work,
       new Promise<null>((resolve) => {

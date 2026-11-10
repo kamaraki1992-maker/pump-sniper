@@ -79,6 +79,12 @@ export interface AppConfig {
   /** `any` accepts either network. `both` requires each. */
   requireSocialsMode: "any" | "both";
   metadataTimeoutMs: number;
+  /** Retry metadata until the watch deadline. A loaded JSON body is never retried. */
+  metadataRetry: boolean;
+  /** Per-attempt metadata timeout. */
+  metadataAttemptTimeoutMs: number;
+  /** Retry budget. Null uses the entry watch window. */
+  metadataRetryDeadlineSec: number | null;
   /** Unset means the profit lock is off. */
   profitLockTriggerPct: number | null;
   profitLockFloorPct: number | null;
@@ -251,6 +257,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new ConfigError("REQUIRE_SOCIALS_MODE must be any or both");
   }
   const metadataTimeoutMs = num(env.METADATA_TIMEOUT_MS, 2_500, "METADATA_TIMEOUT_MS");
+  const metadataRetry = env.METADATA_RETRY === undefined || env.METADATA_RETRY.trim() === ""
+    ? true
+    : env.METADATA_RETRY.trim() !== "false" && env.METADATA_RETRY.trim() !== "0";
+  const metadataAttemptTimeoutMs = num(env.METADATA_ATTEMPT_TIMEOUT_MS, 1_200, "METADATA_ATTEMPT_TIMEOUT_MS");
+  const metadataRetryDeadlineSec = optionalNum(env.METADATA_RETRY_DEADLINE_SEC, "METADATA_RETRY_DEADLINE_SEC");
   const profitLockTriggerPct = optionalNum(env.PROFIT_LOCK_TRIGGER_PCT, "PROFIT_LOCK_TRIGGER_PCT");
   const profitLockFloorPct = optionalNum(env.PROFIT_LOCK_FLOOR_PCT, "PROFIT_LOCK_FLOOR_PCT");
   const stopFastDropPct = num(env.STOP_FAST_DROP_PCT, 12, "STOP_FAST_DROP_PCT");
@@ -366,6 +377,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   if (!(metadataTimeoutMs > 0)) {
     throw new ConfigError("METADATA_TIMEOUT_MS must be positive");
+  }
+  if (!(metadataAttemptTimeoutMs > 0)) {
+    throw new ConfigError("METADATA_ATTEMPT_TIMEOUT_MS must be positive");
+  }
+  if (metadataRetryDeadlineSec != null && metadataRetryDeadlineSec < 0) {
+    throw new ConfigError("METADATA_RETRY_DEADLINE_SEC must be >= 0");
   }
   if ((profitLockTriggerPct == null) !== (profitLockFloorPct == null)) {
     throw new ConfigError("PROFIT_LOCK_TRIGGER_PCT and PROFIT_LOCK_FLOOR_PCT must be set together");
@@ -485,6 +502,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     requireSocials,
     requireSocialsMode,
     metadataTimeoutMs,
+    metadataRetry,
+    metadataAttemptTimeoutMs,
+    metadataRetryDeadlineSec,
     profitLockTriggerPct,
     profitLockFloorPct,
     stopFastDropPct,

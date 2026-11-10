@@ -167,7 +167,8 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     ...(walletBalanceSol ? { walletBalanceSol } : {}),
     holders,
     metadataSocials: new MetadataSocials({
-      timeoutMs: config.metadataTimeoutMs,
+      attemptTimeoutMs: config.metadataAttemptTimeoutMs,
+      retry: config.metadataRetry,
       mode: config.requireSocialsMode,
     }),
     safetyCheck: createRpcSafetyCheck(config, rpcFetch),

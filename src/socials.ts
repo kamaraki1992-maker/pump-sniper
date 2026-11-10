@@ -6,6 +6,12 @@ export interface SocialHit {
 export interface SocialDecision extends SocialHit {
   ok: boolean;
   reason: "no_socials" | "metadata_unavailable" | null;
+  /** Fetch attempts used for this result. A cache hit repeats the stored count. */
+  attempts?: number;
+  /** Milliseconds from the first attempt to this result. */
+  latencyMs?: number;
+  /** Host that returned JSON. Null when every attempt failed. */
+  gateway?: string | null;
 }
 
 const IPFS_GATEWAYS = ["https://ipfs.io/ipfs/", "https://dweb.link/ipfs/", "https://pump.mypinata.cloud/ipfs/"];
@@ -69,57 +75,125 @@ export function metadataUrls(uri: string): string[] {
   return urls;
 }
 
+export interface MetadataLookupLimits {
+  /** Stop starting new attempts at this clock time. The first attempt still runs. */
+  deadlineAtMs?: number;
+}
+
 export interface MetadataSocialOptions {
   fetchImpl?: typeof fetch;
+  /** Per-attempt timeout. `timeoutMs` is the same knob, kept for existing callers. */
+  attemptTimeoutMs?: number;
   timeoutMs?: number;
+  /** When false, a failed attempt is not retried. Default true. */
+  retry?: boolean;
+  /** Fixed backoff. Unset picks 300–500ms. */
+  backoffMs?: number;
   cacheTtlMs?: number;
   now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
   mode?: "any" | "both";
 }
 
-const UNAVAILABLE: SocialDecision = { ok: false, reason: "metadata_unavailable", twitter: null, telegram: null };
+const MAX_ATTEMPTS = 24;
 
-/** Fetch token metadata. The whole attempt, including gateway fallbacks, stops at `timeoutMs`. */
+function gatewayHost(url: string): string {
+  try {
+    const host = new URL(url).host;
+    return host || url;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Fetch token metadata. Each attempt hits one gateway and gives up after
+ * `attemptTimeoutMs`. Failures rotate gateways until the deadline. A JSON
+ * body is final: valid links succeed, and a body with no valid links is
+ * `no_socials` and is not retried. Timeouts and HTTP errors are not cached.
+ */
 export class MetadataSocials {
   private readonly cache = new Map<string, { at: number; decision: SocialDecision }>();
   private readonly fetchImpl: typeof fetch;
-  private readonly timeoutMs: number;
+  private readonly attemptTimeoutMs: number;
+  private readonly retry: boolean;
+  private readonly backoffMs: number | null;
   private readonly cacheTtlMs: number;
   private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly mode: "any" | "both";
 
   constructor(options: MetadataSocialOptions = {}) {
     this.fetchImpl = options.fetchImpl ?? fetch;
-    this.timeoutMs = options.timeoutMs ?? 2_500;
+    this.attemptTimeoutMs = options.attemptTimeoutMs ?? options.timeoutMs ?? 1_200;
+    this.retry = options.retry ?? true;
+    this.backoffMs = options.backoffMs ?? null;
     this.cacheTtlMs = options.cacheTtlMs ?? 5 * 60_000;
     this.now = options.now ?? Date.now;
+    this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.mode = options.mode ?? "any";
   }
 
-  async lookup(uri: string): Promise<SocialDecision> {
+  async lookup(uri: string, limits?: MetadataLookupLimits): Promise<SocialDecision> {
+    const started = this.now();
     const key = uri.trim();
-    if (!key) return UNAVAILABLE;
+    const unavailable = (attempts: number): SocialDecision => ({
+      ok: false,
+      reason: "metadata_unavailable",
+      twitter: null,
+      telegram: null,
+      attempts,
+      latencyMs: Math.max(0, this.now() - started),
+      gateway: null,
+    });
+    if (!key) return unavailable(0);
     const cached = this.cache.get(key);
-    if (cached && this.now() - cached.at < this.cacheTtlMs) return cached.decision;
-    const decision = await this.fetchAll(key);
-    this.cache.set(key, { at: this.now(), decision });
-    return decision;
+    if (cached && started - cached.at < this.cacheTtlMs) return cached.decision;
+    const deadlineAt = limits?.deadlineAtMs ?? started;
+    const urls = metadataUrls(key);
+    let attempts = 0;
+    while (attempts < MAX_ATTEMPTS) {
+      if (attempts > 0) {
+        if (!this.retry || this.now() >= deadlineAt) break;
+        const wait = Math.min(this.nextBackoff(), deadlineAt - this.now());
+        if (!(wait > 0)) break;
+        const before = this.now();
+        await this.sleep(wait);
+        if (this.now() <= before || this.now() >= deadlineAt) break;
+      }
+      const remaining = deadlineAt - this.now();
+      const timeout = attempts === 0 && remaining <= 0 ? this.attemptTimeoutMs : Math.min(this.attemptTimeoutMs, remaining);
+      if (!(timeout > 0)) break;
+      const url = urls[attempts % urls.length] ?? key;
+      attempts += 1;
+      const body = await this.fetchBody(url, timeout);
+      if (body === undefined) continue;
+      const hit = socialDecision(socialsFromMetadata(body), this.mode);
+      const decision: SocialDecision = {
+        ...hit,
+        attempts,
+        latencyMs: Math.max(0, this.now() - started),
+        gateway: gatewayHost(url),
+      };
+      this.cache.set(key, { at: this.now(), decision });
+      return decision;
+    }
+    return unavailable(attempts);
   }
 
-  private async fetchAll(uri: string): Promise<SocialDecision> {
-    const deadline = this.now() + this.timeoutMs;
-    for (const url of metadataUrls(uri)) {
-      const left = deadline - this.now();
-      if (left <= 0) return UNAVAILABLE;
-      try {
-        const response = await this.fetchImpl(url, { signal: AbortSignal.timeout(left) });
-        if (!response.ok) continue;
-        const body = (await response.json()) as unknown;
-        return socialDecision(socialsFromMetadata(body), this.mode);
-      } catch {
-        continue;
-      }
+  private nextBackoff(): number {
+    if (this.backoffMs != null) return this.backoffMs;
+    return 300 + Math.floor(Math.random() * 201);
+  }
+
+  /** JSON body, or undefined when this gateway did not answer. */
+  private async fetchBody(url: string, timeoutMs: number): Promise<unknown | undefined> {
+    try {
+      const response = await this.fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) });
+      if (!response.ok) return undefined;
+      return (await response.json()) as unknown;
+    } catch {
+      return undefined;
     }
-    return UNAVAILABLE;
   }
 }

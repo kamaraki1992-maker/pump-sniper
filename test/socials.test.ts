@@ -33,39 +33,108 @@ test("twitter and telegram variants are accepted and website is ignored", () => 
   assert.ok(urls.includes("https://pump.mypinata.cloud/ipfs/QmCID123/meta.json"));
 });
 
-test("a metadata timeout fails closed and a result is cached", async () => {
+test("metadata retries later gateways, then caches only a loaded result", async () => {
   let now = 0;
-  let calls = 0;
-  const slow: typeof fetch = (_url, init) => {
-    calls += 1;
-    return new Promise((_resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("slow")), 1_000);
-      init?.signal?.addEventListener("abort", () => {
-        clearTimeout(timer);
-        reject(new Error("aborted"));
-      });
-    });
-  };
-  const timed = new MetadataSocials({ fetchImpl: slow, timeoutMs: 20, now: () => now });
-  const missed = await timed.lookup("https://example.test/meta.json");
-  assert.equal(missed.ok, false);
-  assert.equal(missed.reason, "metadata_unavailable");
-  const again = await timed.lookup("https://example.test/meta.json");
-  assert.equal(again.reason, "metadata_unavailable");
-  assert.equal(calls, 1);
-
-  let fetched = 0;
-  const ok: typeof fetch = async () => {
-    fetched += 1;
+  const urls: string[] = [];
+  const flaky: typeof fetch = async (url) => {
+    urls.push(String(url));
+    if (urls.length < 3) return new Response("missing", { status: 404 });
     return new Response(JSON.stringify({ twitter: "https://x.com/alpha" }), { status: 200 });
   };
-  const cached = new MetadataSocials({ fetchImpl: ok, now: () => now, cacheTtlMs: 1_000 });
-  const first = await cached.lookup("ipfs://QmCache/meta.json");
+  const retried = new MetadataSocials({
+    fetchImpl: flaky,
+    now: () => now,
+    sleep: async (ms) => {
+      now += ms;
+    },
+    backoffMs: 400,
+    attemptTimeoutMs: 1_200,
+  });
+  const hit = await retried.lookup("ipfs://QmCID123/meta.json", { deadlineAtMs: 10_000 });
+  assert.equal(hit.ok, true);
+  assert.equal(hit.attempts, 3);
+  assert.equal(hit.gateway, "dweb.link");
+  assert.ok((hit.latencyMs ?? 0) >= 800);
+  assert.equal(urls[1], "https://ipfs.io/ipfs/QmCID123/meta.json");
+  assert.equal(urls[2], "https://dweb.link/ipfs/QmCID123/meta.json");
+  const again = await retried.lookup("ipfs://QmCID123/meta.json", { deadlineAtMs: now + 10_000 });
+  assert.equal(again.twitter, "https://x.com/alpha");
+  assert.equal(urls.length, 3);
+
+  now = 0;
+  let secondAttempt = 0;
+  const second: typeof fetch = async () => {
+    secondAttempt += 1;
+    if (secondAttempt === 1) return new Response("missing", { status: 503 });
+    return new Response(JSON.stringify({ extensions: { x: "https://x.com/beta" } }), { status: 200 });
+  };
+  const onSecond = new MetadataSocials({
+    fetchImpl: second,
+    now: () => now,
+    sleep: async (ms) => {
+      now += ms;
+    },
+    backoffMs: 300,
+    attemptTimeoutMs: 1_200,
+  });
+  const later = await onSecond.lookup("https://example.test/meta.json", { deadlineAtMs: 5_000 });
+  assert.equal(later.ok, true);
+  assert.equal(later.attempts, 2);
+  assert.equal(later.gateway, "example.test");
+});
+
+test("a metadata deadline fails closed and is not cached", async () => {
+  let now = 0;
+  let calls = 0;
+  const missing: typeof fetch = async () => {
+    calls += 1;
+    return new Response("no", { status: 404 });
+  };
+  const timed = new MetadataSocials({
+    fetchImpl: missing,
+    now: () => now,
+    sleep: async (ms) => {
+      now += ms;
+    },
+    backoffMs: 400,
+    attemptTimeoutMs: 1_200,
+  });
+  const missed = await timed.lookup("https://example.test/meta.json", { deadlineAtMs: 900 });
+  assert.equal(missed.ok, false);
+  assert.equal(missed.reason, "metadata_unavailable");
+  assert.ok((missed.attempts ?? 0) >= 2);
+  assert.equal(missed.gateway, null);
+  const after = calls;
   now += 10;
-  const second = await cached.lookup("ipfs://QmCache/meta.json");
-  assert.equal(first.ok, true);
-  assert.equal(second.twitter, "https://x.com/alpha");
-  assert.equal(fetched, 1);
+  const again = await timed.lookup("https://example.test/meta.json", { deadlineAtMs: now + 900 });
+  assert.equal(again.reason, "metadata_unavailable");
+  assert.ok(calls > after);
+});
+
+test("no_socials is final and is not retried", async () => {
+  let now = 0;
+  let calls = 0;
+  const empty: typeof fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ website: "https://x.com/ignored" }), { status: 200 });
+  };
+  const socials = new MetadataSocials({
+    fetchImpl: empty,
+    now: () => now,
+    sleep: async (ms) => {
+      now += ms;
+    },
+    backoffMs: 400,
+    attemptTimeoutMs: 1_200,
+  });
+  const decision = await socials.lookup("https://example.test/meta.json", { deadlineAtMs: 10_000 });
+  assert.equal(decision.reason, "no_socials");
+  assert.equal(decision.attempts, 1);
+  assert.equal(calls, 1);
+  now += 50;
+  const cached = await socials.lookup("https://example.test/meta.json", { deadlineAtMs: now + 10_000 });
+  assert.equal(cached.reason, "no_socials");
+  assert.equal(calls, 1);
 });
 
 test("a create without socials is skipped and does not buy", async () => {
@@ -139,5 +208,90 @@ test("a create without socials is skipped and does not buy", async () => {
   };
   await bot.onLaunch(launch);
   assert.equal(bought, 0);
-  assert.match(lines.join("\n"), /no_socials/);
+  const logged = lines.join("\n");
+  assert.match(logged, /no_socials/);
+  assert.match(logged, /"latency_ms":/);
+  assert.match(logged, /"attempts":1/);
 });
+
+test("a watch keeps retrying metadata and logs the attempt that answered", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "socials-retry-"));
+  const config = loadConfig({ DATA_DIR: dir, REQUIRE_SOCIALS: "true" });
+  config.dataDir = dir;
+  config.tradesPath = join(dir, "trades.jsonl");
+  config.positionsPath = join(dir, "positions.json");
+  config.entryWatchMinSec = 0;
+  config.entryWatchMaxSec = 5;
+  let now = Date.parse("2026-11-10T12:00:00.000Z");
+  const started = now;
+  let fetches = 0;
+  const lines: string[] = [];
+  const log = new Logger();
+  log.info = (message, fields) => {
+    lines.push(JSON.stringify({ message, fields }));
+  };
+  const bot = new SniperBot({
+    config,
+    executor: {
+      buy: async () => {
+        throw new Error("no buy");
+      },
+      sell: async () => {
+        throw new Error("no sell");
+      },
+    },
+    history: { lookup: async () => ({ ok: true }) },
+    positions: new PositionBook(config.positionsPath),
+    trades: new TradeLog(config.tradesPath),
+    log,
+    solUsd: () => 100,
+    solQuote: () => ({ usd: 100, updatedAtMs: started }),
+    now: () => new Date(now),
+    sleep: async (ms) => {
+      now += ms;
+    },
+    subscribeMint: () => {},
+    unsubscribeMint: () => {},
+    readCurveReserves: async () => ({ vSol: 30, vTokens: 1_073_000_000 }),
+    metadataSocials: new MetadataSocials({
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+      backoffMs: 100,
+      attemptTimeoutMs: 1_200,
+      fetchImpl: async () => {
+        fetches += 1;
+        if (fetches < 2) return new Response("missing", { status: 404 });
+        return new Response(JSON.stringify({ twitter: "https://x.com/alpha" }), { status: 200 });
+      },
+    }),
+  });
+  const launch: MarketLaunch = {
+    kind: "launch",
+    mint: "MintRetry",
+    name: "N",
+    symbol: "S",
+    creator: "Creator",
+    signature: "sig",
+    initialBuyTokens: 1_000_000,
+    quoteMint: null,
+    solQuoted: true,
+    priceSol: 1,
+    marketCapSol: 30,
+    vSolSol: 30,
+    vTokens: 1_073_000_000,
+    bondingCurveKey: null,
+    metadataUri: "https://example.test/meta.json",
+  };
+  await bot.onLaunch(launch);
+  const logged = lines.join("\n");
+  assert.equal(fetches, 2);
+  assert.match(logged, /"attempts":2/);
+  assert.match(logged, /"latency_ms":/);
+  assert.match(logged, /example\.test/);
+  assert.doesNotMatch(logged, /metadata_unavailable/);
+  assert.ok(now - started <= 5_000 + METADATA_OVERSHOOT_MS);
+});
+
+const METADATA_OVERSHOOT_MS = 400;
