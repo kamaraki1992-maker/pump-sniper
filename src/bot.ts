@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 import type { BoughtMints } from "./bought.js";
 import { bondingCurveAddress } from "./curve-watch.js";
 import { confidenceBreakdown, sizeFromConfidence, type ConfidenceBreakdown } from "./confidence.js";
-import { clampBuyUsd, HARD_CAPS, requiredBuyBalanceSol, type AppConfig } from "./config.js";
+import { clampBuyUsd, HARD_CAPS, requiredBuyBalanceSol, reservedPriorityFeeSol, type AppConfig } from "./config.js";
 import { DailyLossBook } from "./daily-loss.js";
 import type { MetadataSocials, SocialDecision } from "./socials.js";
 import { evaluateEntry, entryBucketMs, type EntryPrint } from "./entry.js";
@@ -14,6 +14,7 @@ import type { FilterDecision } from "./filter.js";
 import { holdDecision } from "./filter.js";
 import type { HolderDecision } from "./holders.js";
 import { Logger } from "./logger.js";
+import { PaperBalance } from "./paper-balance.js";
 import type { PositionBook } from "./positions.js";
 import { assessMark, curveBuyPrice, curveSellPrice, EARLY_MARK_MS, poolSellPrice, poolSpot, reservesOnCurve, TOTAL_SUPPLY_TOKENS } from "./pricing.js";
 import type { TradeLog } from "./report.js";
@@ -41,6 +42,8 @@ export interface BotDeps {
   bought?: BoughtMints;
   /** Live mode only. Paper mode does not consult a wallet. */
   walletBalanceSol?: () => Promise<number>;
+  /** Paper cash ledger used when BUY_SIZE_PCT_OF_BALANCE is set. */
+  paperBalance?: PaperBalance;
   safetyCheck?: (input: {
     mint: string;
     vSol: number | null;
@@ -74,9 +77,12 @@ interface EntryWatch {
   prevVSol: number | null;
   rugs: Promise<{ ok: boolean; reason: string }>;
   socials: Promise<SocialDecision>;
+  earlyTried: boolean;
 }
 
 const MAX_OPEN_LOG_MS = 5_000;
+const MIN_PCT_BUY_SOL = 0.005;
+const WALLET_BALANCE_CACHE_MS = 10_000;
 /** Leave this much of the watch so the entry decision is not held past it. */
 const METADATA_DECISION_MARGIN_MS = 300;
 
@@ -106,6 +112,7 @@ export class SniperBot {
   private readonly daily: DailyLossBook;
   private dailyStopWritten = false;
   private stopped = false;
+  private walletCache: { at: number; sol: number } | null = null;
 
   constructor(private readonly deps: BotDeps) {
     this.daily = new DailyLossBook(`${deps.config.dataDir}/daily-pnl.json`);
@@ -134,7 +141,11 @@ export class SniperBot {
     await this.buyAtLaunch(launch);
   }
 
-  private async buyAtLaunch(launch: MarketLaunch, fromWatch = false): Promise<void> {
+  private async buyAtLaunch(
+    launch: MarketLaunch,
+    fromWatch = false,
+    entryStage?: "early" | "full",
+  ): Promise<void> {
     if (this.stopped) return;
     if (this.entriesHalted()) {
       this.skip(launch, "daily_stop");
@@ -203,9 +214,9 @@ export class SniperBot {
       this.skipMaxOpen(launch);
       return;
     }
-    const sized = this.quoteBuySize(launch);
+    const sized = await this.quoteBuySize(launch);
     if (!sized.ok) {
-      this.skip(launch, sized.reason);
+      this.skip(launch, sized.reason, sized.extra);
       return;
     }
     if (this.deps.safetyCheck) {
@@ -227,9 +238,9 @@ export class SniperBot {
       }
     }
     if (this.stopped) return;
-    const orderSize = this.quoteBuySize(launch);
+    const orderSize = await this.quoteBuySize(launch);
     if (!orderSize.ok) {
-      this.skip(launch, orderSize.reason);
+      this.skip(launch, orderSize.reason, orderSize.extra);
       return;
     }
     const { sizeUsd, sizeSol, confidence } = orderSize;
@@ -258,7 +269,7 @@ export class SniperBot {
       tipSol: tipForTrade(this.deps.config, sizeSol, false),
     };
     try {
-      if (this.deps.config.mode === "live") {
+      if (this.deps.config.mode === "live" && this.deps.config.buySizePctOfBalance == null) {
         const balance = await this.readBalance();
         const required = requiredBuyBalanceSol(
           this.deps.config,
@@ -294,6 +305,7 @@ export class SniperBot {
         costSol: fill.status === "filled" ? fill.cashflowSol : null,
         confidence: confidence.score,
       });
+      if (fill.status === "filled") this.notePaperCash(-fill.cashflowSol);
       if (fill.status !== "filled") {
         this.deps.log.info("buy failed", {
           mint: launch.mint,
@@ -351,6 +363,8 @@ export class SniperBot {
         openPositions: this.deps.positions.list().length,
         sizeUsd,
         sizeSol,
+        ...(orderSize.balanceSol != null ? { balanceSol: orderSize.balanceSol, pct: orderSize.pct } : {}),
+        ...(entryStage ? { entryStage } : {}),
         jitoTipSol: fill.jitoTipSol,
         ...confidenceFields(confidence),
       });
@@ -627,6 +641,7 @@ export class SniperBot {
           bundle: "jito",
         });
         if (fill.status === "filled") {
+          this.notePaperCash(fill.cashflowSol);
           if (realized !== null) this.noteRealized(realized);
           const remaining = before - sold;
           const partial = remaining > 1e-9 && share < 0.999;
@@ -849,6 +864,7 @@ export class SniperBot {
       prevVSol: launch.vSolSol,
       rugs: this.rugChecks(launch),
       socials: this.socialCheck(launch, startedAtMs),
+      earlyTried: false,
     };
     this.watched.set(launch.mint, watch);
     const minMs = this.deps.config.entryWatchMinSec * 1000;
@@ -865,6 +881,22 @@ export class SniperBot {
           return;
         }
         const elapsed = now - startedAtMs;
+        const earlyMs = this.deps.config.entryEarlySec != null ? this.deps.config.entryEarlySec * 1000 : null;
+        if (earlyMs != null && !watch.earlyTried && elapsed >= earlyMs && elapsed < maxMs) {
+          watch.earlyTried = true;
+          const rug = await this.rugReady(watch.rugs);
+          const social = await this.rugReady(watch.socials);
+          if (rug?.ok && social?.ok) {
+            const verdict = evaluateEntry(
+              this.entrySample(watch, now, this.deps.config.entryEarlyMinNetBuySol ?? undefined),
+            );
+            if (verdict.ok) {
+              this.watched.delete(launch.mint);
+              await this.buyAtLaunch(launch, true, "early");
+              return;
+            }
+          }
+        }
         if (elapsed >= minMs) {
           const rug = await this.rugReady(watch.rugs);
           if (rug && !rug.ok) {
@@ -879,7 +911,7 @@ export class SniperBot {
           const verdict = evaluateEntry(this.entrySample(watch, now));
           if (verdict.ok && rug?.ok && social?.ok) {
             this.watched.delete(launch.mint);
-            await this.buyAtLaunch(launch, true);
+            await this.buyAtLaunch(launch, true, this.deps.config.entryEarlySec != null ? "full" : undefined);
             return;
           }
         }
@@ -978,7 +1010,7 @@ export class SniperBot {
     ]);
   }
 
-  private entrySample(watch: EntryWatch, nowMs: number) {
+  private entrySample(watch: EntryWatch, nowMs: number, minNetBuySol?: number) {
     const config = this.deps.config;
     return {
       startedAtMs: watch.startedAtMs,
@@ -990,7 +1022,7 @@ export class SniperBot {
       prints: watch.prints,
       minBuys: config.entryMinBuys,
       minUniqueBuyers: config.entryMinUniqueBuyers,
-      minNetBuySol: config.entryMinNetBuySol,
+      minNetBuySol: minNetBuySol ?? config.entryMinNetBuySol,
       minBuyRatio: config.entryMinBuyRatio,
       maxRunupPct: config.entryMaxRunupPct,
       bucketMs: entryBucketMs(
@@ -1041,10 +1073,18 @@ export class SniperBot {
     return false;
   }
 
-  /** USD notional clamped to the hard cap, then SOL at the fresh quote. BUY_SIZE_SOL wins when set. */
-  private quoteBuySize(
-    launch: MarketLaunch,
-  ): { ok: true; sizeUsd: number; sizeSol: number; confidence: ConfidenceBreakdown } | { ok: false; reason: string } {
+  /** USD notional clamped to the hard cap, then SOL at the fresh quote. Percent of balance wins, then BUY_SIZE_SOL. */
+  private async quoteBuySize(launch: MarketLaunch): Promise<
+    | {
+        ok: true;
+        sizeUsd: number;
+        sizeSol: number;
+        confidence: ConfidenceBreakdown;
+        balanceSol?: number;
+        pct?: number;
+      }
+    | { ok: false; reason: string; extra?: Record<string, unknown> }
+  > {
     const quote = this.deps.solQuote();
     if (!quote || !(quote.usd > 0) || !Number.isFinite(quote.usd)) return { ok: false, reason: "no_price" };
     if (this.deps.now().getTime() - quote.updatedAtMs > SOL_PRICE_MAX_AGE_MS) return { ok: false, reason: "no_price" };
@@ -1056,6 +1096,20 @@ export class SniperBot {
       sells: counts.sells,
       safetyOk: true,
     });
+    const pct = this.deps.config.buySizePctOfBalance;
+    if (pct != null) {
+      const parts = await this.balanceParts();
+      const rawSol = (parts.balanceSol * pct) / 100;
+      const sizeUsd = clampBuyUsd(rawSol * quote.usd);
+      const sizeSol = quote.usd > 0 ? sizeUsd / quote.usd : 0;
+      const extra = { sizeSol, balanceSol: parts.balanceSol, pct, freeSol: parts.freeSol };
+      if (!(sizeSol >= MIN_PCT_BUY_SOL)) return { ok: false, reason: "buy_size_min", extra };
+      const overhead = reservedPriorityFeeSol(this.deps.config) + this.deps.config.paper.baseFeeSol + tipForTrade(this.deps.config, sizeSol, false);
+      if (!(parts.freeSol >= sizeSol + overhead)) {
+        return { ok: false, reason: "insufficient_balance", extra: { ...extra, requiredSol: sizeSol + overhead } };
+      }
+      return { ok: true, sizeUsd, sizeSol, confidence, balanceSol: parts.balanceSol, pct };
+    }
     const fixed = this.deps.config.buySizeSol;
     if (fixed != null) {
       const sizeUsd = fixed * quote.usd;
@@ -1067,6 +1121,40 @@ export class SniperBot {
     );
     if (!(sizeUsd > 0)) return { ok: false, reason: "no_price" };
     return { ok: true, sizeUsd, sizeSol: sizeUsd / quote.usd, confidence };
+  }
+
+  /** Total capital used for percent sizing, and the free SOL that can pay for a buy. */
+  private async balanceParts(): Promise<{ balanceSol: number; freeSol: number }> {
+    const openCost = this.deps.positions.list().reduce((sum, position) => sum + Math.max(0, position.costSol), 0);
+    if (this.deps.config.mode === "paper") {
+      const cash = this.deps.paperBalance?.cash() ?? 0;
+      return { balanceSol: cash + openCost, freeSol: cash };
+    }
+    const wallet = await this.cachedWalletSol();
+    const reserve = this.deps.config.liveBalanceReserveSol;
+    return { balanceSol: wallet + openCost - reserve, freeSol: Math.max(0, wallet - reserve) };
+  }
+
+  /** Live wallet balance, reused for 10 seconds. */
+  private async cachedWalletSol(): Promise<number> {
+    const now = this.deps.now().getTime();
+    if (this.walletCache && now - this.walletCache.at < WALLET_BALANCE_CACHE_MS) return this.walletCache.sol;
+    const sol = await this.readBalance();
+    this.walletCache = { at: now, sol };
+    return sol;
+  }
+
+  /** Paper cash change from a filled buy (negative) or sell (positive). */
+  private notePaperCash(delta: number): void {
+    if (this.deps.config.mode !== "paper" || !Number.isFinite(delta)) return;
+    this.deps.paperBalance?.add(delta);
+  }
+
+  /** Balance shown at startup when percent sizing is on. */
+  async reportedBalanceSol(): Promise<number | null> {
+    if (this.deps.config.buySizePctOfBalance == null) return null;
+    const parts = await this.balanceParts();
+    return parts.balanceSol;
   }
 
   private noteTrade(mint: string, side: "buy" | "sell", at: number): void {

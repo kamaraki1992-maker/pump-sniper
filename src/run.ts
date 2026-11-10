@@ -7,6 +7,7 @@ import { fetchCurveReserves, RpcCurveWatch } from "./curve-watch.js";
 import { ConfigError, loadConfig, type AppConfig } from "./config.js";
 import { cuLimitFromConsumed } from "./compute.js";
 import { PaperExecutor } from "./executor-paper.js";
+import { PaperBalance } from "./paper-balance.js";
 import { createLivePorts, LiveExecutor } from "./executor-live.js";
 import { PriorityFeeEstimator } from "./priority-fee.js";
 import { RpcHolderCheck } from "./holders.js";
@@ -165,6 +166,9 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     unsubscribeMint: (mint) => subscription.stream?.unsubscribeTrades([mint]),
     bought: new BoughtMints(`${config.dataDir}/bought-mints.json`),
     ...(walletBalanceSol ? { walletBalanceSol } : {}),
+    ...(config.mode === "paper" && config.buySizePctOfBalance != null && config.paperStartBalanceSol != null
+      ? { paperBalance: new PaperBalance(`${config.dataDir}/paper-balance.json`, config.paperStartBalanceSol) }
+      : {}),
     holders,
     metadataSocials: new MetadataSocials({
       attemptTimeoutMs: config.metadataAttemptTimeoutMs,
@@ -234,8 +238,10 @@ export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promis
   const runtime = await buildRuntime();
   const { config, log, bot, positions, sol } = runtime;
   const removeGuards = installProcessGuards(log);
+  const balanceSol = await bot.reportedBalanceSol();
   log.info("sniper start", {
     mode: config.mode,
+    ...(balanceSol != null ? { balanceSol } : {}),
     buySizeMinUsd: config.buySizeMinUsd,
     buySizeMaxUsd: config.buySizeMaxUsd,
     buySlippagePct: config.buySlippagePct,

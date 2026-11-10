@@ -62,11 +62,20 @@ export interface AppConfig {
   jitoTipMaxSol: number;
   /** Set when BUY_SIZE_SOL is set. Overrides USD confidence sizing. */
   buySizeSol: number | null;
+  /** When set, each buy is this percent of total balance. Overrides BUY_SIZE_SOL and USD sizing. */
+  buySizePctOfBalance: number | null;
+  /** Required in paper mode when percent sizing is on. */
+  paperStartBalanceSol: number | null;
+  /** SOL held back from the live wallet before percent sizing. */
+  liveBalanceReserveSol: number;
   entryWatchMinSec: number;
   entryWatchMaxSec: number;
   entryMinBuys: number;
   entryMinUniqueBuyers: number;
   entryMinNetBuySol: number;
+  /** When set with `entryEarlyMinNetBuySol`, an earlier pass can buy before the watch ends. */
+  entryEarlySec: number | null;
+  entryEarlyMinNetBuySol: number | null;
   entryMinBuyRatio: number;
   entryMaxRunupPct: number;
   entryMaxWatched: number;
@@ -240,11 +249,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const jitoTipMaxSol = num(env.JITO_TIP_MAX_SOL, 0.0015, "JITO_TIP_MAX_SOL");
   const jitoTipSol = tipMode === "fixed" ? legacyTip : jitoTipMinSol;
   const buySizeSol = optionalNum(env.BUY_SIZE_SOL, "BUY_SIZE_SOL");
+  const buySizePctOfBalance = optionalNum(env.BUY_SIZE_PCT_OF_BALANCE, "BUY_SIZE_PCT_OF_BALANCE");
+  const paperStartBalanceSol = optionalNum(env.PAPER_START_BALANCE_SOL, "PAPER_START_BALANCE_SOL");
+  const liveBalanceReserveSol = num(env.LIVE_BALANCE_RESERVE_SOL, 0.02, "LIVE_BALANCE_RESERVE_SOL");
   const entryWatchMinSec = num(env.ENTRY_WATCH_MIN_SEC, 15, "ENTRY_WATCH_MIN_SEC");
   const entryWatchMaxSec = num(env.ENTRY_WATCH_MAX_SEC, 30, "ENTRY_WATCH_MAX_SEC");
   const entryMinBuys = num(env.ENTRY_MIN_BUYS, 8, "ENTRY_MIN_BUYS");
   const entryMinUniqueBuyers = num(env.ENTRY_MIN_UNIQUE_BUYERS, 5, "ENTRY_MIN_UNIQUE_BUYERS");
   const entryMinNetBuySol = num(env.ENTRY_MIN_NET_BUY_SOL, 1, "ENTRY_MIN_NET_BUY_SOL");
+  const entryEarlySec = optionalNum(env.ENTRY_EARLY_SEC, "ENTRY_EARLY_SEC");
+  const entryEarlyMinNetBuySol = optionalNum(env.ENTRY_EARLY_MIN_NET_BUY_SOL, "ENTRY_EARLY_MIN_NET_BUY_SOL");
   const entryMinBuyRatio = num(env.ENTRY_MIN_BUY_RATIO, 0.6, "ENTRY_MIN_BUY_RATIO");
   const entryMaxRunupPct = num(env.ENTRY_MAX_RUNUP_PCT, 60, "ENTRY_MAX_RUNUP_PCT");
   const entryMaxWatched = num(env.ENTRY_MAX_WATCHED, 30, "ENTRY_MAX_WATCHED");
@@ -345,6 +359,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (buySizeSol != null && !(buySizeSol > 0)) {
     throw new ConfigError("BUY_SIZE_SOL must be positive");
   }
+  if (buySizePctOfBalance != null && (!(buySizePctOfBalance > 0) || buySizePctOfBalance > 25)) {
+    throw new ConfigError("BUY_SIZE_PCT_OF_BALANCE must be greater than 0 and at most 25");
+  }
+  if (mode === "paper" && buySizePctOfBalance != null && !(paperStartBalanceSol != null && paperStartBalanceSol > 0)) {
+    throw new ConfigError("PAPER_START_BALANCE_SOL is required when BUY_SIZE_PCT_OF_BALANCE is set in paper mode");
+  }
+  if (!(liveBalanceReserveSol >= 0)) {
+    throw new ConfigError("LIVE_BALANCE_RESERVE_SOL must be >= 0");
+  }
   if (entryWatchMinSec < 0 || entryWatchMaxSec < 0 || entryWatchMaxSec < entryWatchMinSec) {
     throw new ConfigError("ENTRY_WATCH_MAX_SEC must be >= ENTRY_WATCH_MIN_SEC and both must be >= 0");
   }
@@ -356,6 +379,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   if (!(entryMinNetBuySol > 0) || !(entryMinBuyRatio > 0) || entryMinBuyRatio > 1) {
     throw new ConfigError("ENTRY_MIN_NET_BUY_SOL and ENTRY_MIN_BUY_RATIO must be positive, and the ratio at most 1");
+  }
+  if ((entryEarlySec == null) !== (entryEarlyMinNetBuySol == null)) {
+    throw new ConfigError("ENTRY_EARLY_SEC and ENTRY_EARLY_MIN_NET_BUY_SOL must be set together");
+  }
+  if (entryEarlySec != null && entryEarlyMinNetBuySol != null) {
+    if (!(entryEarlySec > 0) || entryEarlySec >= entryWatchMaxSec) {
+      throw new ConfigError("ENTRY_EARLY_SEC must be greater than 0 and below ENTRY_WATCH_MAX_SEC");
+    }
+    if (!(entryEarlyMinNetBuySol > 0)) {
+      throw new ConfigError("ENTRY_EARLY_MIN_NET_BUY_SOL must be positive");
+    }
   }
   if (!(entryMaxRunupPct > 0)) {
     throw new ConfigError("ENTRY_MAX_RUNUP_PCT must be positive");
@@ -492,11 +526,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     jitoTipMinSol,
     jitoTipMaxSol,
     buySizeSol,
+    buySizePctOfBalance,
+    paperStartBalanceSol,
+    liveBalanceReserveSol,
     entryWatchMinSec,
     entryWatchMaxSec,
     entryMinBuys,
     entryMinUniqueBuyers,
     entryMinNetBuySol,
+    entryEarlySec,
+    entryEarlyMinNetBuySol,
     entryMinBuyRatio,
     entryMaxRunupPct,
     entryMaxWatched,
