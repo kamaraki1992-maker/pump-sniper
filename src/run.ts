@@ -19,6 +19,7 @@ import { installProcessRedaction, rpcApiKey } from "./redact.js";
 import { TradeLog } from "./report.js";
 import { SolPriceFeed } from "./sol-price.js";
 import { createRpcSafetyCheck } from "./safety.js";
+import { HeliusFeed } from "./helius-feed.js";
 import { PumpDevStream } from "./stream.js";
 import type { MarketEvent } from "./types.js";
 import { YellowstoneStream } from "./yellowstone.js";
@@ -176,29 +177,33 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
   return { config, log, bot, positions, sol, executor, subscription, stopRpcPressure: stopPressureLog };
 }
 
+function openDataFeed(runtime: Runtime): LiveStream {
+  if (runtime.config.feed === "pumpdev") {
+    return new PumpDevStream(runtime.config.wsUrl, runtime.log, undefined, undefined, {
+      feed: "pumpdev",
+      apiKey: process.env.PUMPDEV_API_KEY?.trim() || null,
+      maxSubscriptions: pumpDevMaxSubscriptions(process.env.PUMPDEV_MAX_SUBSCRIPTIONS),
+    });
+  }
+  if (runtime.config.feed === "pumpportal") {
+    return new PumpDevStream(runtime.config.dataWsUrl, runtime.log, undefined, undefined, {
+      feed: "pumpportal",
+      apiKey: process.env.PUMPPORTAL_API_KEY?.trim() || null,
+    });
+  }
+  return new HeliusFeed(runtime.config.rpcWsUrl ?? "", runtime.log, {
+    stallMs: runtime.config.feedStallSec * 1000,
+  });
+}
+
 export function attachStream(runtime: Runtime): LiveStream {
   const grpcToken = process.env.GRPC_TOKEN?.trim() ?? "";
   const stream: LiveStream =
     runtime.config.grpcUrl && grpcToken
       ? new YellowstoneStream(runtime.config.grpcUrl, grpcToken, runtime.log)
-      : new PumpDevStream(
-          runtime.config.feed === "pumpdev" ? runtime.config.wsUrl : runtime.config.dataWsUrl,
-          runtime.log,
-          undefined,
-          undefined,
-          runtime.config.feed === "pumpdev"
-            ? {
-                feed: "pumpdev",
-                apiKey: process.env.PUMPDEV_API_KEY?.trim() || null,
-                maxSubscriptions: pumpDevMaxSubscriptions(process.env.PUMPDEV_MAX_SUBSCRIPTIONS),
-              }
-            : { feed: "pumpportal", apiKey: process.env.PUMPPORTAL_API_KEY?.trim() || null },
-        );
+      : openDataFeed(runtime);
   if (!(stream instanceof YellowstoneStream)) {
-    runtime.log.info("stream", {
-      source: runtime.config.feed === "pumpdev" ? "pumpdev-ws" : "pumpportal-ws",
-      feed: runtime.config.feed,
-    });
+    runtime.log.info("stream", { source: runtime.config.feed, feed: runtime.config.feed });
   }
   runtime.subscription.stream = stream;
   const fail = (error: unknown) => {
