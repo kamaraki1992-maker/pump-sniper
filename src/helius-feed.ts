@@ -14,11 +14,14 @@ export const HELIUS_LOG_COMMITMENT = "processed";
 export interface HeliusSocket {
   send(data: string): void;
   close(): void;
+  terminate?(): void;
   ping?(): void;
+  removeAllListeners?(): void;
   on(event: "open", cb: () => void): void;
   on(event: "message", cb: (data: unknown) => void): void;
   on(event: "close", cb: () => void): void;
   on(event: "error", cb: (error: Error) => void): void;
+  on(event: "pong", cb: () => void): void;
 }
 
 function defaultSocket(url: string): HeliusSocket {
@@ -26,7 +29,11 @@ function defaultSocket(url: string): HeliusSocket {
   return {
     send: (data) => ws.send(data),
     close: () => ws.close(),
+    terminate: () => ws.terminate(),
     ping: () => ws.ping(),
+    removeAllListeners: () => {
+      ws.removeAllListeners();
+    },
     on: (event, cb) => {
       ws.on(event, cb as never);
     },
@@ -35,6 +42,8 @@ function defaultSocket(url: string): HeliusSocket {
 
 export interface HeliusFeedOptions {
   stallMs?: number;
+  /** Give up on a socket that has not opened and confirmed logsSubscribe. */
+  connectTimeoutMs?: number;
   now?: () => number;
   sockets?: (url: string) => HeliusSocket;
   backoff?: (attempt: number) => number;
@@ -42,6 +51,9 @@ export interface HeliusFeedOptions {
   statsMs?: number;
   pingMs?: number;
 }
+
+const CONNECT_TIMEOUT_MS = 10_000;
+const STALL_CHECK_MS = 5_000;
 
 /**
  * One Helius logsSubscribe for the pump program. Token trades are filtered
@@ -56,12 +68,20 @@ export class HeliusFeed {
   private pingTimer: NodeJS.Timeout | null = null;
   private stallTimer: NodeJS.Timeout | null = null;
   private statsTimer: NodeJS.Timeout | null = null;
-  private lastMessageAt = 0;
+  private connectTimer: NodeJS.Timeout | null = null;
+  /** Last logs notification or subscribe confirmation. Pongs do not update this. */
+  private lastActivityAt = 0;
+  private hadActivity = false;
+  private subscribed = false;
+  private connectStartedAt = 0;
+  private downSince: number | null = null;
+  private reconnectDueAt: number | null = null;
   private readonly tracked = new Set<string>();
   private readonly seen = new Set<string>();
   private readonly seenOrder: string[] = [];
   private onEvent: (event: MarketEvent) => void = () => {};
   private readonly stallMs: number;
+  private readonly connectTimeoutMs: number;
   private readonly now: () => number;
   private readonly sockets: (url: string) => HeliusSocket;
   private readonly backoff: (attempt: number) => number;
@@ -74,7 +94,8 @@ export class HeliusFeed {
     private readonly log: Logger,
     options: HeliusFeedOptions = {},
   ) {
-    this.stallMs = options.stallMs ?? 45_000;
+    this.stallMs = options.stallMs ?? 30_000;
+    this.connectTimeoutMs = options.connectTimeoutMs ?? CONNECT_TIMEOUT_MS;
     this.now = options.now ?? Date.now;
     this.sockets = options.sockets ?? defaultSocket;
     this.backoff = options.backoff ?? nextBackoffMs;
@@ -109,19 +130,49 @@ export class HeliusFeed {
   stop(): void {
     this.stopped = true;
     this.clearTimers();
-    this.ws?.close();
+    const socket = this.ws;
     this.ws = null;
     this.opened = false;
+    this.subscribed = false;
+    if (socket) this.kill(socket);
   }
 
-  /** Reconnect when the socket has been silent longer than the stall window. */
+  /**
+   * Reconnect when the feed is silent, the socket never finishes connecting,
+   * or a scheduled reconnect does not run. This keeps running while the
+   * socket is down so a missed close event cannot stick.
+   */
   checkStall(): void {
-    if (this.stopped || !this.opened) return;
-    const silent = this.now() - this.lastMessageAt;
+    if (this.stopped) return;
+    const now = this.now();
+    if (this.timer) {
+      if (this.reconnectDueAt != null && now >= this.reconnectDueAt + 1_000) {
+        clearTimeout(this.timer);
+        this.timer = null;
+        this.reconnectDueAt = null;
+        this.log.info("helius stall", { silentMs: this.silentMs(), state: "reconnect" });
+        this.markDown();
+        this.schedule("stuck-reconnect");
+      }
+      return;
+    }
+    const socket = this.ws;
+    if (!socket || !this.opened || !this.subscribed) {
+      if (!socket) {
+        this.markDown();
+        this.schedule("disconnected");
+        return;
+      }
+      const waited = now - this.connectStartedAt;
+      if (waited < this.connectTimeoutMs) return;
+      this.log.info("helius stall", { silentMs: waited, state: "connecting" });
+      this.dropAndSchedule(socket, "connect-timeout");
+      return;
+    }
+    const silent = now - this.lastActivityAt;
     if (silent < this.stallMs) return;
-    this.log.info("helius stall", { silentMs: silent });
-    this.opened = false;
-    this.ws?.close();
+    this.log.info("helius stall", { silentMs: silent, state: "silent" });
+    this.dropAndSchedule(socket, "stall");
   }
 
   private armTimers(): void {
@@ -129,7 +180,7 @@ export class HeliusFeed {
     this.pingTimer = setInterval(() => {
       if (this.opened) this.ws?.ping?.();
     }, this.pingMs);
-    this.stallTimer = setInterval(() => this.checkStall(), Math.min(this.stallMs, 5_000));
+    this.stallTimer = setInterval(() => this.checkStall(), Math.min(this.stallMs, STALL_CHECK_MS));
     this.statsTimer = setInterval(() => this.publishStats(), this.statsMs);
     this.pingTimer.unref?.();
     this.stallTimer.unref?.();
@@ -141,10 +192,12 @@ export class HeliusFeed {
     if (this.pingTimer) clearInterval(this.pingTimer);
     if (this.stallTimer) clearInterval(this.stallTimer);
     if (this.statsTimer) clearInterval(this.statsTimer);
+    if (this.connectTimer) clearTimeout(this.connectTimer);
     this.timer = null;
     this.pingTimer = null;
     this.stallTimer = null;
     this.statsTimer = null;
+    this.connectTimer = null;
   }
 
   private publishStats(): void {
@@ -172,39 +225,111 @@ export class HeliusFeed {
         error: error instanceof Error ? error.message : "socket-error",
         url: redactRpcUrl(this.url),
       });
-      this.schedule();
+      this.schedule("socket");
       return;
     }
     this.ws = socket;
-    let scheduled = false;
-    const reconnect = () => {
-      if (this.stopped || scheduled || this.ws !== socket) return;
-      scheduled = true;
-      this.opened = false;
-      const delay = this.backoff(this.attempt);
-      this.attempt += 1;
-      this.log.info("helius reconnect", { delayMs: delay });
-      this.timer = setTimeout(() => this.open(), delay);
-      this.timer.unref?.();
-    };
+    this.opened = false;
+    this.subscribed = false;
+    this.connectStartedAt = this.now();
+    this.armConnectTimer();
     socket.on("open", () => {
       if (this.ws !== socket) return;
       this.opened = true;
       this.attempt = 0;
-      this.lastMessageAt = this.now();
       this.send(this.subscribeBody());
       this.log.info("helius open", { url: redactRpcUrl(this.url), commitment: HELIUS_LOG_COMMITMENT });
     });
     socket.on("message", (data) => {
       if (this.ws !== socket) return;
-      this.lastMessageAt = this.now();
       this.onMessage(data);
+    });
+    socket.on("pong", () => {
+      // Protocol pongs are not feed activity. Silence is measured from logs.
     });
     socket.on("error", (error) => {
       this.log.error("helius ws error", { error: error instanceof Error ? error.message : "ws-error" });
-      reconnect();
+      if (this.ws !== socket) return;
+      this.dropAndSchedule(socket, "error");
     });
-    socket.on("close", () => reconnect());
+    socket.on("close", () => {
+      if (this.stopped || this.ws !== socket) return;
+      this.opened = false;
+      this.subscribed = false;
+      this.ws = null;
+      this.markDown();
+      this.schedule("close");
+    });
+  }
+
+  private armConnectTimer(): void {
+    if (this.connectTimer) clearTimeout(this.connectTimer);
+    this.connectTimer = setTimeout(() => {
+      this.connectTimer = null;
+      this.checkStall();
+    }, this.connectTimeoutMs);
+    this.connectTimer.unref?.();
+  }
+
+  /** Last real feed message. Zero until the first logs notification or subscribe ack. */
+  private silentMs(): number {
+    if (!this.hadActivity) return Math.max(0, this.now() - this.connectStartedAt);
+    return Math.max(0, this.now() - this.lastActivityAt);
+  }
+
+  private markDown(): void {
+    if (this.downSince != null) return;
+    this.downSince = this.hadActivity ? this.lastActivityAt : this.now();
+  }
+
+  private noteActivity(): void {
+    this.lastActivityAt = this.now();
+    this.hadActivity = true;
+  }
+
+  /** A subscribe ack or a logs notification means this socket is usable. */
+  private noteSubscribed(): void {
+    this.opened = true;
+    this.subscribed = true;
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+    if (this.downSince == null) return;
+    const downtimeMs = Math.max(0, this.now() - this.downSince);
+    this.downSince = null;
+    this.log.info("helius resubscribed", { downtimeMs });
+  }
+
+  /** Drop handlers, kill the socket, and reconnect without waiting for close. */
+  private dropAndSchedule(socket: HeliusSocket, reason: string): void {
+    if (this.stopped || this.ws !== socket) return;
+    this.opened = false;
+    this.subscribed = false;
+    this.ws = null;
+    this.markDown();
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+    this.detach(socket);
+    this.kill(socket);
+    this.schedule(reason);
+  }
+
+  private detach(socket: HeliusSocket): void {
+    socket.removeAllListeners?.();
+  }
+
+  private kill(socket: HeliusSocket): void {
+    try {
+      if (socket.terminate) socket.terminate();
+      else socket.close();
+    } catch (error) {
+      this.log.error("helius socket failed", {
+        error: error instanceof Error ? error.message : "socket-error",
+      });
+    }
   }
 
   private subscribeBody(): string {
@@ -226,7 +351,7 @@ export class HeliusFeed {
       this.window.decodeFailures += 1;
       return;
     }
-    const record = parsed as { error?: { message?: string }; id?: number; result?: unknown };
+    const record = parsed as { error?: { message?: string }; id?: number; result?: unknown; method?: unknown };
     if (record.error) {
       this.log.error("helius logsSubscribe rejected", {
         warning: "The RPC refused logsSubscribe. Not falling back to another feed.",
@@ -234,8 +359,15 @@ export class HeliusFeed {
       });
       return;
     }
+    if (record.method == null && record.id === 1 && record.result !== undefined) {
+      this.noteActivity();
+      this.noteSubscribed();
+      return;
+    }
     const notice = readLogsNotice(parsed);
     if (!notice) return;
+    this.noteActivity();
+    this.noteSubscribed();
     if (notice.err != null) {
       this.window.failedTx += 1;
       return;
@@ -282,12 +414,15 @@ export class HeliusFeed {
     }
   }
 
-  private schedule(): void {
+  private schedule(reason: string): void {
     if (this.stopped || this.timer) return;
     const delay = this.backoff(this.attempt);
     this.attempt += 1;
+    this.reconnectDueAt = this.now() + delay;
+    this.log.info("helius reconnect", { attempt: this.attempt, delayMs: delay, reason });
     this.timer = setTimeout(() => {
       this.timer = null;
+      this.reconnectDueAt = null;
       this.open();
     }, delay);
     this.timer.unref?.();

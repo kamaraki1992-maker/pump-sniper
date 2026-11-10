@@ -123,7 +123,7 @@ export interface AppConfig {
   rpcWsUrl: string | null;
   /** Market-data socket. `pumpportal` and `pumpdev` remain available. Orders still use `tradeApiUrl`. */
   feed: "helius" | "pumpportal" | "pumpdev";
-  /** Reconnect the Helius log feed after this many seconds without a message. */
+  /** Reconnect the Helius log feed after this many seconds without a logs notification. */
   feedStallSec: number;
   dataWsUrl: string;
   wsUrl: string;
@@ -270,7 +270,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     : env.DEV_SELL_EXIT.trim() !== "false" && env.DEV_SELL_EXIT.trim() !== "0";
   const earlyExitMinGainPct = num(env.EARLY_EXIT_MIN_GAIN_PCT, 10, "EARLY_EXIT_MIN_GAIN_PCT");
   const earlyExitWindowSec = num(env.EARLY_EXIT_WINDOW_SEC, 5, "EARLY_EXIT_WINDOW_SEC");
-  const feedStallSec = num(env.FEED_STALL_SEC, 45, "FEED_STALL_SEC");
+  const heliusStallExplicit = (env.HELIUS_STALL_SEC ?? "").trim() !== "";
+  const feedStallSec = heliusStallExplicit
+    ? num(env.HELIUS_STALL_SEC, 30, "HELIUS_STALL_SEC")
+    : num(env.FEED_STALL_SEC, 30, "FEED_STALL_SEC");
   const stopLossPct = num(env.STOP_LOSS_PCT, HARD_CAPS.maxStopLossPct, "STOP_LOSS_PCT");
   const trailActivatePct = num(env.TRAIL_ACTIVATE_PCT, 50, "TRAIL_ACTIVATE_PCT");
   const trailDistancePct = num(env.TRAIL_DISTANCE_PCT, 20, "TRAIL_DISTANCE_PCT");
@@ -367,7 +370,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new ConfigError("EARLY_EXIT settings must be >= 0");
   }
   if (!(feedStallSec >= 5)) {
-    throw new ConfigError("FEED_STALL_SEC must be >= 5");
+    throw new ConfigError(`${heliusStallExplicit ? "HELIUS_STALL_SEC" : "FEED_STALL_SEC"} must be >= 5`);
   }
   if (entryBucketSec != null && !(entryBucketSec > 0)) {
     throw new ConfigError("ENTRY_BUCKET_SEC must be positive");

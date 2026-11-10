@@ -36,7 +36,13 @@ class FakeSocket implements HeliusSocket {
   ping(): void {
     this.pinged += 1;
   }
-  on(event: "open" | "message" | "close" | "error", cb: (...args: never[]) => void): void {
+  terminate(): void {
+    this.close();
+  }
+  removeAllListeners(): void {
+    this.handlers.clear();
+  }
+  on(event: "open" | "message" | "close" | "error" | "pong", cb: (...args: never[]) => void): void {
     const list = this.handlers.get(event) ?? [];
     list.push(cb);
     this.handlers.set(event, list);
@@ -45,6 +51,17 @@ class FakeSocket implements HeliusSocket {
     for (const cb of this.handlers.get(event) ?? []) cb(...(args as never[]));
   }
 }
+
+/** Close and terminate never emit, which is the half-dead socket production hit. */
+class DeadSocket extends FakeSocket {
+  terminated = false;
+  override close(): void {}
+  override terminate(): void {
+    this.terminated = true;
+  }
+}
+
+const SUBSCRIBE_ACK = JSON.stringify({ jsonrpc: "2.0", result: 7, id: 1 });
 
 function u32(value: number): Buffer {
   const buf = Buffer.alloc(4);
@@ -343,9 +360,11 @@ test("a Helius creator sell is a dev_sell, and silence reconnects", async () => 
   });
   stream.start(() => {});
   sockets[0]?.emit("open");
+  sockets[0]?.emit("message", SUBSCRIBE_ACK);
   sockets[0]?.emit("close");
   await new Promise((resolve) => setTimeout(resolve, 20));
   sockets[1]?.emit("open");
+  sockets[1]?.emit("message", SUBSCRIBE_ACK);
   const again = JSON.parse(sockets[1]?.sent[0] ?? "{}") as { method?: string };
   assert.equal(again.method, "logsSubscribe");
   now = 5_000;
@@ -353,4 +372,117 @@ test("a Helius creator sell is a dev_sell, and silence reconnects", async () => 
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.ok(sockets.length >= 3);
   stream.stop();
+});
+
+async function until(done: () => boolean, timeoutMs: number): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (done()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+  return done();
+}
+
+function captureLog(): { log: Logger; lines: string[] } {
+  const lines: string[] = [];
+  const log = new Logger();
+  log.info = (message, fields) => {
+    lines.push(JSON.stringify({ message, ...fields }));
+  };
+  return { log, lines };
+}
+
+test("a helius stall reconnects when close never fires, when connect hangs, and when only pongs arrive", async () => {
+  const stallMs = 200;
+  const boundMs = stallMs + 5_000;
+
+  const silentLog = captureLog();
+  const silentSockets: DeadSocket[] = [];
+  const silentStarted = Date.now();
+  const silent = new HeliusFeed("wss://rpc.example/?api-key=supersecretkey123", silentLog.log, {
+    stallMs,
+    connectTimeoutMs: 2_000,
+    pingMs: 60_000,
+    backoff: () => 5,
+    sockets: () => {
+      const socket = new DeadSocket();
+      silentSockets.push(socket);
+      return socket;
+    },
+  });
+  silent.start(() => {});
+  silentSockets[0]?.emit("open");
+  silentSockets[0]?.emit("message", SUBSCRIBE_ACK);
+  assert.equal(
+    await until(() => silentSockets.length >= 2, boundMs),
+    true,
+  );
+  assert.ok(Date.now() - silentStarted < boundMs);
+  assert.equal(silentSockets[0]?.terminated, true);
+  silentSockets[1]?.emit("open");
+  silentSockets[1]?.emit("message", SUBSCRIBE_ACK);
+  const silentText = silentLog.lines.join("\n");
+  assert.match(silentText, /helius reconnect/);
+  assert.match(silentText, /"attempt":1/);
+  assert.match(silentText, /helius resubscribed/);
+  assert.match(silentText, /"downtimeMs":/);
+  silent.stop();
+
+  const stuckLog = captureLog();
+  const stuckSockets: DeadSocket[] = [];
+  const stuckStarted = Date.now();
+  const stuck = new HeliusFeed("wss://rpc.example/?api-key=supersecretkey123", stuckLog.log, {
+    stallMs,
+    connectTimeoutMs: stallMs,
+    pingMs: 60_000,
+    backoff: () => 5,
+    sockets: () => {
+      const socket = new DeadSocket();
+      stuckSockets.push(socket);
+      return socket;
+    },
+  });
+  stuck.start(() => {});
+  assert.equal(await until(() => stuckSockets.length >= 2, boundMs), true);
+  assert.ok(Date.now() - stuckStarted < boundMs);
+  assert.equal(stuckSockets[0]?.terminated, true);
+  stuckSockets[1]?.emit("open");
+  stuckSockets[1]?.emit("message", SUBSCRIBE_ACK);
+  assert.match(stuckLog.lines.join("\n"), /helius reconnect/);
+  assert.match(stuckLog.lines.join("\n"), /helius resubscribed/);
+  stuck.stop();
+
+  const pongLog = captureLog();
+  const pongSockets: DeadSocket[] = [];
+  const pongStarted = Date.now();
+  const pong = new HeliusFeed("wss://rpc.example/?api-key=supersecretkey123", pongLog.log, {
+    stallMs,
+    connectTimeoutMs: 2_000,
+    pingMs: 20,
+    backoff: () => 5,
+    sockets: () => {
+      const socket = new DeadSocket();
+      const ping = socket.ping.bind(socket);
+      socket.ping = () => {
+        ping();
+        socket.emit("pong");
+        socket.emit("message", JSON.stringify({ jsonrpc: "2.0", method: "pong" }));
+      };
+      pongSockets.push(socket);
+      return socket;
+    },
+  });
+  pong.start(() => {});
+  pongSockets[0]?.emit("open");
+  pongSockets[0]?.emit("message", SUBSCRIBE_ACK);
+  assert.equal(await until(() => pongSockets.length >= 2, boundMs), true);
+  assert.ok(Date.now() - pongStarted < boundMs);
+  assert.equal(pongSockets[0]?.terminated, true);
+  pongSockets[1]?.emit("open");
+  pongSockets[1]?.emit("message", SUBSCRIBE_ACK);
+  const pongText = pongLog.lines.join("\n");
+  assert.match(pongText, /helius reconnect/);
+  assert.match(pongText, /helius resubscribed/);
+  assert.match(pongText, /"downtimeMs":/);
+  pong.stop();
 });
