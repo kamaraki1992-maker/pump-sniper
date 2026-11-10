@@ -17,9 +17,9 @@ export function redact(text: string, secrets: readonly string[]): string {
   return redactRpcUrl(out);
 }
 
-/** Strip api-key query values so an RPC WebSocket URL can be logged. */
+/** Strip api-key and PumpDev `key` query values so a WebSocket URL can be logged. */
 export function redactRpcUrl(text: string): string {
-  return text.replace(/([?&](?:api-key|api_key|apikey)=)[^&\s"]+/gi, "$1[REDACTED]");
+  return text.replace(/([?&](?:api-key|api_key|apikey|key)=)[^&\s"]+/gi, "$1[REDACTED]");
 }
 
 export function rpcApiKey(url: string): string | null {
@@ -31,7 +31,7 @@ export function rpcApiKey(url: string): string | null {
       parsed.searchParams.get("apikey")
     );
   } catch {
-    const match = url.match(/[?&](?:api-key|api_key|apikey)=([^&\s"]+)/i);
+    const match = url.match(/[?&](?:api-key|api_key|apikey|key)=([^&\s"]+)/i);
     return match?.[1] ?? null;
   }
 }

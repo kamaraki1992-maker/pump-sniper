@@ -42,6 +42,14 @@ export interface Runtime {
   stopRpcPressure: () => void;
 }
 
+/** Optional ceiling. Absent or invalid keeps the tier's own subscription limit. */
+export function pumpDevMaxSubscriptions(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) return undefined;
+  return parsed;
+}
+
 export function readSecrets(): string[] {
   const secrets: string[] = [];
   const key = process.env.PRIVATE_KEY?.trim();
@@ -50,6 +58,10 @@ export function readSecrets(): string[] {
   if (grpcToken && grpcToken.length >= 8) secrets.push(grpcToken);
   const rpcKey = rpcApiKey(process.env.RPC_WS_URL?.trim() ?? "");
   if (rpcKey && rpcKey.length >= 8) secrets.push(rpcKey);
+  const pumpDevKey = process.env.PUMPDEV_API_KEY?.trim();
+  if (pumpDevKey && pumpDevKey.length >= 8) secrets.push(pumpDevKey);
+  const wsKey = rpcApiKey(process.env.WS_URL?.trim() ?? "");
+  if (wsKey && wsKey.length >= 8) secrets.push(wsKey);
   return secrets;
 }
 
@@ -167,7 +179,10 @@ export function attachStream(runtime: Runtime): LiveStream {
   const stream: LiveStream =
     runtime.config.grpcUrl && grpcToken
       ? new YellowstoneStream(runtime.config.grpcUrl, grpcToken, runtime.log)
-      : new PumpDevStream(runtime.config.wsUrl, runtime.log);
+      : new PumpDevStream(runtime.config.wsUrl, runtime.log, undefined, undefined, {
+          apiKey: process.env.PUMPDEV_API_KEY?.trim() || null,
+          maxSubscriptions: pumpDevMaxSubscriptions(process.env.PUMPDEV_MAX_SUBSCRIPTIONS),
+        });
   if (!(stream instanceof YellowstoneStream)) {
     runtime.log.info("stream", { source: "pumpdev-ws" });
   }

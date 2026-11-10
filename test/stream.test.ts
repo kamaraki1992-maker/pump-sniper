@@ -171,3 +171,87 @@ test("reconnect resubscribes only mints still held", () => {
     }, 20);
   });
 });
+
+class CaptureLogger extends Logger {
+  readonly lines: string[] = [];
+  override info(message: string, fields?: Record<string, unknown>): void {
+    this.lines.push(this.format("info", message, fields));
+  }
+  override error(message: string, fields?: Record<string, unknown>): void {
+    this.lines.push(this.format("error", message, fields));
+  }
+}
+
+test("auth is sent before subscribe on open and on reconnect, and the key stays out of logs", () => {
+  const key = "pumpdev-test-key-value-123456";
+  const log = new CaptureLogger();
+  const sockets: FakeSocket[] = [];
+  const stream = new PumpDevStream(
+    `wss://pumpdev.io/ws?key=${key}`,
+    log,
+    () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    () => 5,
+    { apiKey: key },
+  );
+  stream.start(() => {});
+  sockets[0]?.emit("open");
+  const first = (sockets[0]?.sent ?? []).map((line) => JSON.parse(line) as { method?: string; key?: string });
+  assert.equal(first[0]?.method, "auth");
+  assert.equal(first[0]?.key, key);
+  assert.ok(first.findIndex((row) => row.method === "subscribeNewToken") > 0);
+  sockets[0]?.emit("message", JSON.stringify({ type: "auth", status: "free", tier: "anonymous", key }));
+  const logged = log.lines.join("\n");
+  assert.equal(logged.includes(key), false);
+  assert.match(logged, /anonymous/);
+  assert.match(logged, /ws auth anonymous/);
+  sockets[0]?.emit("close");
+  return new Promise<void>((resolve) => {
+    setTimeout(() => {
+      sockets[1]?.emit("open");
+      const again = JSON.parse(sockets[1]?.sent[0] ?? "{}") as { method?: string; key?: string };
+      assert.equal(again.method, "auth");
+      assert.equal(again.key, key);
+      const subscribed = (sockets[1]?.sent ?? []).map((line) => JSON.parse(line) as { method?: string });
+      assert.ok(subscribed.findIndex((row) => row.method === "subscribeNewToken") > 0);
+      assert.equal(log.lines.join("\n").includes(key), false);
+      stream.stop();
+      resolve();
+    }, 20);
+  });
+});
+
+test("an auth ack raises the subscription cap and a pro tier is not warned", () => {
+  const key = "pumpdev-test-key-value-123456";
+  const log = new CaptureLogger();
+  const sockets: FakeSocket[] = [];
+  const stream = new PumpDevStream(
+    "wss://pumpdev.io/ws",
+    log,
+    () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    () => 1_000,
+    { apiKey: key, maxSubscriptions: 25 },
+  );
+  stream.start(() => {});
+  sockets[0]?.emit("open");
+  const mints = ["A", "B", "C", "D", "E", "F"];
+  stream.subscribeTrades(mints);
+  const subscribed = () =>
+    (sockets[0]?.sent ?? [])
+      .map((line) => JSON.parse(line) as { method?: string; keys?: string[] })
+      .filter((row) => row.method === "subscribeTokenTrade")
+      .flatMap((row) => row.keys ?? []);
+  assert.deepEqual(subscribed().sort(), ["A", "B", "C", "D", "E"]);
+  sockets[0]?.emit("message", JSON.stringify({ type: "auth", status: "ok", tier: "pro", limit: 1000 }));
+  assert.ok(subscribed().includes("F"));
+  assert.equal(log.lines.join("\n").includes("ws auth anonymous"), false);
+  assert.equal(log.lines.join("\n").includes(key), false);
+  stream.stop();
+});
