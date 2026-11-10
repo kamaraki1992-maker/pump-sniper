@@ -249,6 +249,35 @@ function feed(options: { now?: () => number; stallMs?: number } = {}): {
   return { feed: stream, sockets, events };
 }
 
+test("a create uses the same-tx trade reserves and drops a pre-buy initial-curve trade", () => {
+  const mint = Keypair.generate().publicKey;
+  const curve = Keypair.generate().publicKey;
+  const user = Keypair.generate().publicKey;
+  const creator = Keypair.generate().publicKey;
+  const created = createData({ mint, curve, user, creator });
+  const initialTrade = tradeData({ mint, user: creator, isBuy: true, creator });
+  const moved = tradeData({ mint, user: creator, isBuy: true, creator, vSol: 32_000_000_000n });
+  const decoded = eventsFromLogs({
+    slot: 9,
+    signature: "create-and-buy",
+    err: null,
+    logs: [
+      `Program data: ${created.toString("base64")}`,
+      `Program data: ${initialTrade.toString("base64")}`,
+      `Program data: ${moved.toString("base64")}`,
+    ],
+  });
+  const launch = decoded.events.find((event) => event.kind === "launch");
+  const trades = decoded.events.filter((event) => event.kind === "trade");
+  assert.equal(launch?.kind, "launch");
+  if (launch?.kind !== "launch") return;
+  const movedPrice = priceFromReserves(32_000_000_000, Number(VTOK));
+  assert.ok(launch.priceSol != null && movedPrice != null && Math.abs(launch.priceSol - movedPrice) < 1e-18);
+  assert.notEqual(launch.priceSol, 30 / 1_073_000_000);
+  assert.equal(trades.length, 1);
+  assert.equal(trades[0]?.kind === "trade" ? trades[0].priceSol : null, movedPrice);
+});
+
 test("Helius subscribes once, drops untracked trades, and skips a duplicate or failed tx", () => {
   const { feed: stream, sockets, events } = feed();
   sockets[0]?.emit("open");

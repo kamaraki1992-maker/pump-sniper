@@ -108,6 +108,10 @@ export interface AppConfig {
   earlyExitMinGainPct: number;
   /** 0 disables the early-momentum exit. */
   earlyExitWindowSec: number;
+  /** Ignore a sharp drop for this long after a fill. Null disables the guard. */
+  postBuyGuardMs: number | null;
+  /** Drop, in percent below entry, that the post-buy guard ignores. */
+  postBuyGuardDropPct: number | null;
   priorityFeeSol: number;
   /** Total priority-fee clamp for one transaction, in lamports. */
   priorityFeeMaxLamports: number;
@@ -295,6 +299,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     : env.DEV_SELL_EXIT.trim() !== "false" && env.DEV_SELL_EXIT.trim() !== "0";
   const earlyExitMinGainPct = num(env.EARLY_EXIT_MIN_GAIN_PCT, 10, "EARLY_EXIT_MIN_GAIN_PCT");
   const earlyExitWindowSec = num(env.EARLY_EXIT_WINDOW_SEC, 5, "EARLY_EXIT_WINDOW_SEC");
+  const postBuyGuardMs = optionalNum(env.POST_BUY_GUARD_MS, "POST_BUY_GUARD_MS");
+  const postBuyGuardDropPct = optionalNum(env.POST_BUY_GUARD_DROP_PCT, "POST_BUY_GUARD_DROP_PCT");
   const heliusStallExplicit = (env.HELIUS_STALL_SEC ?? "").trim() !== "";
   const feedStallSec = heliusStallExplicit
     ? num(env.HELIUS_STALL_SEC, 30, "HELIUS_STALL_SEC")
@@ -413,6 +419,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   if (earlyExitMinGainPct < 0 || earlyExitWindowSec < 0) {
     throw new ConfigError("EARLY_EXIT settings must be >= 0");
+  }
+  if ((postBuyGuardMs == null) !== (postBuyGuardDropPct == null)) {
+    throw new ConfigError("POST_BUY_GUARD_MS and POST_BUY_GUARD_DROP_PCT must be set together");
+  }
+  if (postBuyGuardMs != null && postBuyGuardDropPct != null) {
+    if (!(postBuyGuardMs >= 0) || !(postBuyGuardDropPct > 0)) {
+      throw new ConfigError("POST_BUY_GUARD_MS must be >= 0 and POST_BUY_GUARD_DROP_PCT must be > 0");
+    }
   }
   if (!(feedStallSec >= 5)) {
     throw new ConfigError(`${heliusStallExplicit ? "HELIUS_STALL_SEC" : "FEED_STALL_SEC"} must be >= 5`);
@@ -567,6 +581,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     devSellExit,
     earlyExitMinGainPct,
     earlyExitWindowSec,
+    postBuyGuardMs,
+    postBuyGuardDropPct,
     priorityFeeSol,
     priorityFeeMaxLamports,
     priorityFeeCacheMs,

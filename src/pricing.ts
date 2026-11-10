@@ -42,7 +42,17 @@ export function priceFromMarketCap(marketCapSol: number): number | null {
 }
 
 /** Initial pump.fun virtual reserves. k stays on this product for the life of the curve. */
-export const PUMP_CURVE_K = 30 * 1_073_000_000;
+export const INITIAL_VIRTUAL_SOL = 30;
+export const INITIAL_VIRTUAL_TOKENS = 1_073_000_000;
+export const PUMP_CURVE_K = INITIAL_VIRTUAL_SOL * INITIAL_VIRTUAL_TOKENS;
+/** Spot before any buy: 30 / 1_073_000_000. */
+export const INITIAL_CURVE_SPOT = INITIAL_VIRTUAL_SOL / INITIAL_VIRTUAL_TOKENS;
+
+/** True when `price` is the untouched initial curve, within a relative 1e-6. */
+export function isInitialCurvePrice(price: number): boolean {
+  if (!(price > 0) || !Number.isFinite(price)) return false;
+  return Math.abs(price - INITIAL_CURVE_SPOT) / INITIAL_CURVE_SPOT <= 1e-6;
+}
 /** One unconfirmed update may not move the mark by more than this multiple. */
 export const MARK_JUMP_LIMIT = 5;
 /** First seconds after entry: a print this large is still a real pump. 54x launch prints stay out. */

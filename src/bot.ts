@@ -16,7 +16,7 @@ import type { HolderDecision } from "./holders.js";
 import { Logger } from "./logger.js";
 import { PaperBalance } from "./paper-balance.js";
 import type { PositionBook } from "./positions.js";
-import { assessMark, curveBuyPrice, curveSellPrice, EARLY_MARK_MS, poolSellPrice, poolSpot, reservesOnCurve, TOTAL_SUPPLY_TOKENS } from "./pricing.js";
+import { assessMark, curveBuyPrice, curveSellPrice, EARLY_MARK_MS, INITIAL_CURVE_SPOT, isInitialCurvePrice, poolSellPrice, poolSpot, reservesOnCurve, TOTAL_SUPPLY_TOKENS } from "./pricing.js";
 import type { TradeLog } from "./report.js";
 import { decideExit, FULL_EXIT_FRACTION, profitLockPrice, ratchetStop, reservesDropped, trailStopPrice, type ExitPlan } from "./risk.js";
 import type { SafetyCheckResult } from "./safety.js";
@@ -115,6 +115,8 @@ export class SniperBot {
   private dailyStopWritten = false;
   private stopped = false;
   private walletCache: { at: number; sol: number } | null = null;
+  /** Mints whose accepted price has already left the untouched initial curve. */
+  private readonly tradedAboveInitial = new Set<string>();
 
   constructor(private readonly deps: BotDeps) {
     this.daily = new DailyLossBook(`${deps.config.dataDir}/daily-pnl.json`);
@@ -321,6 +323,7 @@ export class SniperBot {
         return;
       }
       held = true;
+      if (fill.price > INITIAL_CURVE_SPOT * (1 + 1e-6)) this.tradedAboveInitial.add(launch.mint);
       const position: Position = {
         mint: launch.mint,
         name: launch.name,
@@ -334,7 +337,12 @@ export class SniperBot {
         openedAt: this.deps.now().toISOString(),
         mode: this.deps.config.mode,
         entrySignature: fill.signature,
-        lastMarkPriceSol: launch.priceSol ?? fill.price,
+        lastMarkPriceSol:
+          launch.priceSol != null && launch.priceSol > 0 && !isInitialCurvePrice(launch.priceSol)
+            ? launch.priceSol
+            : fill.price > 0
+              ? fill.price
+              : (launch.priceSol ?? fill.price),
         entryVSolSol: launch.vSolSol,
         lastVSolSol: launch.vSolSol,
         lastVTokens: launch.vTokens,
@@ -381,13 +389,31 @@ export class SniperBot {
   }
 
   async onTrade(trade: MarketTrade): Promise<void> {
+    const position = this.deps.positions.get(trade.mint);
+    if (position && this.ignoredStaleMark(position, trade.priceSol, "trade")) return;
+    if (
+      !position &&
+      trade.priceSol != null &&
+      isInitialCurvePrice(trade.priceSol) &&
+      this.tradedAboveInitial.has(trade.mint)
+    ) {
+      this.deps.log.info("stale_mark_ignored", {
+        mint: trade.mint,
+        price: trade.priceSol,
+        source: "trade",
+        reason: "initial_curve",
+      });
+      return;
+    }
+    if (trade.priceSol != null && trade.priceSol > INITIAL_CURVE_SPOT * (1 + 1e-6)) {
+      this.tradedAboveInitial.add(trade.mint);
+    }
     this.rememberReserves(trade.mint, trade.vSolSol, trade.vTokens ?? null);
     const now = this.deps.now().getTime();
     this.lastMarketTradeAt.set(trade.mint, now);
     this.noteTrade(trade.mint, trade.txType, now);
     const watch = this.watched.get(trade.mint);
     if (watch) this.noteEntryPrint(watch, trade);
-    const position = this.deps.positions.get(trade.mint);
     if (!position) return;
     if (
       this.deps.config.devSellExit &&
@@ -458,8 +484,9 @@ export class SniperBot {
     reserves?: { vSol: number; vTokens: number } | null,
     complete?: boolean,
   ): void {
-    if (reserves) this.rememberReserves(mint, reserves.vSol, reserves.vTokens);
     const position = this.deps.positions.get(mint);
+    if (position && reserves && this.ignoredStaleMark(position, reserves.vSol / reserves.vTokens, "curve")) return;
+    if (reserves) this.rememberReserves(mint, reserves.vSol, reserves.vTokens);
     if (!position || this.stopped || !(realSol >= 0)) return;
     if (complete || position.graduated) {
       this.noteGraduation(position, position.pool ?? null);
@@ -754,6 +781,45 @@ export class SniperBot {
     }
     position.unpriced = false;
     position.lastMarkPriceSol = priced;
+  }
+
+  /**
+   * A post-buy print more than the configured drop below entry is ignored.
+   * A print at the untouched initial curve is ignored once this mint has traded above it.
+   * Neither case runs exit rules.
+   */
+  private ignoredStaleMark(position: Position, price: number | null, source: "trade" | "curve"): boolean {
+    if (price == null || !(price > 0)) return false;
+    const above = position.entryPriceSol > INITIAL_CURVE_SPOT * (1 + 1e-6)
+      || position.lastMarkPriceSol > INITIAL_CURVE_SPOT * (1 + 1e-6)
+      || this.tradedAboveInitial.has(position.mint);
+    if (isInitialCurvePrice(price) && above) {
+      this.deps.log.info("stale_mark_ignored", {
+        mint: position.mint,
+        price,
+        source,
+        reason: "initial_curve",
+      });
+      return true;
+    }
+    const guardMs = this.deps.config.postBuyGuardMs;
+    const dropLimit = this.deps.config.postBuyGuardDropPct;
+    if (guardMs == null || dropLimit == null || !(position.entryPriceSol > 0)) return false;
+    const ageMs = this.deps.now().getTime() - Date.parse(position.openedAt);
+    if (!(ageMs >= 0) || ageMs > guardMs) return false;
+    const dropPct = ((position.entryPriceSol - price) / position.entryPriceSol) * 100;
+    if (dropPct > dropLimit) {
+      this.deps.log.info("stale_mark_ignored", {
+        mint: position.mint,
+        price,
+        source,
+        reason: "post_buy",
+        ageMs,
+        dropPct,
+      });
+      return true;
+    }
+    return false;
   }
 
   private logMark(position: Position, source: "trade" | "curve" | "pool"): void {

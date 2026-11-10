@@ -4,6 +4,7 @@ const ZERO_KEY = new PublicKey(Buffer.alloc(32));
 import { PUMP_PROGRAM_ID } from "./yellowstone.js";
 import {
   normalizeTokenAmount,
+  isInitialCurvePrice,
   priceFromReserves,
   TOTAL_SUPPLY_TOKENS,
   virtualSol,
@@ -223,6 +224,11 @@ function reservesOf(vSolRaw: number | null, vTokenRaw: number | null): {
   return { vSolSol, vTokens, priceSol, marketCapSol };
 }
 
+function initialReserves(vSolRaw: number, vTokenRaw: number): boolean {
+  const price = priceFromReserves(vSolRaw, vTokenRaw);
+  return price != null && isInitialCurvePrice(price);
+}
+
 function solQuoted(quoteMint: string | null): boolean {
   return quoteMint === null || quoteMint === ZERO_PUBKEY || quoteMint === WSOL_MINT;
 }
@@ -267,9 +273,14 @@ export function eventsFromLogs(notice: LogsNotice): { events: MarketEvent[]; fai
     );
     const boughtRaw = devBuys.reduce((sum, trade) => sum + trade.tokenRaw, 0);
     const boughtSol = devBuys.reduce((sum, trade) => sum + trade.solLamports, 0);
-    const reserves = created.vSolRaw !== null && created.vTokenRaw !== null
-      ? reservesOf(created.vSolRaw, created.vTokenRaw)
-      : reservesOf(devBuys[0]?.vSolRaw ?? null, devBuys[0]?.vTokenRaw ?? null);
+    // CreateEvent reserves are the curve before the create buy. The trade in the
+    // same transaction is the post-buy state, and that is the price we keep.
+    const moved = trades.find(
+      (trade) => trade.mint === created.mint && trade.vSolRaw > 0 && trade.vTokenRaw > 0 && !initialReserves(trade.vSolRaw, trade.vTokenRaw),
+    );
+    const reserves = moved
+      ? reservesOf(moved.vSolRaw, moved.vTokenRaw)
+      : reservesOf(created.vSolRaw, created.vTokenRaw);
     const launch: MarketLaunch = {
       kind: "launch",
       mint: created.mint,
@@ -293,6 +304,11 @@ export function eventsFromLogs(notice: LogsNotice): { events: MarketEvent[]; fai
   }
   for (const trade of trades) {
     if (!(trade.vSolRaw > 0) || !(trade.vTokenRaw > 0)) continue;
+    // A create tx can include a trade that still reports the untouched curve.
+    // That print is the pre-buy snapshot, not a later market, so it is not emitted.
+    if (initialReserves(trade.vSolRaw, trade.vTokenRaw) && creates.some((created) => created.mint === trade.mint)) {
+      continue;
+    }
     const reserves = reservesOf(trade.vSolRaw, trade.vTokenRaw);
     const row: MarketTrade = {
       kind: "trade",
