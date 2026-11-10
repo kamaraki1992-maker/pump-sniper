@@ -34,39 +34,54 @@ interface RawTx {
   } | null;
 }
 
+/** Recent signatures are enough to see a dev dump. A batch of 25 was a 429 storm. */
+const HISTORY_SIGNATURE_LIMIT = 8;
+const HISTORY_MISS_TTL_MS = 5 * 60_000;
+const HISTORY_HIT_TTL_MS = 10 * 60_000;
+
 export class RpcCreatorHistory {
   private readonly cache = new Map<string, { at: number; decision: FilterDecision }>();
-  private active = 0;
-  private readonly waiters: Array<() => void> = [];
+  private readonly inflight = new Map<string, Promise<FilterDecision>>();
 
   constructor(
     private readonly config: AppConfig,
-    private readonly log: Logger,
+    log: Logger,
     private readonly now: () => number = Date.now,
     private readonly rpcFetch: typeof fetch = fetch,
-  ) {}
+  ) {
+    void log;
+  }
 
   async lookup(creator: string): Promise<FilterDecision> {
     if (!creator) return { ok: false, reason: "creator-history-unavailable" };
-    const cached = this.cache.get(creator);
-    const ttl = cached && cached.decision.ok === false && cached.decision.reason === "creator-history-unavailable" ? 30_000 : 10 * 60_000;
-    if (cached && this.now() - cached.at < ttl) return cached.decision;
-    const decision = await this.gate(() => this.fetch(creator));
-    this.cache.set(creator, { at: this.now(), decision });
-    return decision;
+    const cached = this.cached(creator);
+    if (cached) return cached;
+    const pending = this.inflight.get(creator);
+    if (pending) return pending;
+    const run = this.fetch(creator)
+      .then((decision) => {
+        this.cache.set(creator, { at: this.now(), decision });
+        return decision;
+      })
+      .catch(() => {
+        const decision: FilterDecision = { ok: false, reason: "creator-history-unavailable" };
+        this.cache.set(creator, { at: this.now(), decision });
+        return decision;
+      })
+      .finally(() => {
+        this.inflight.delete(creator);
+      });
+    this.inflight.set(creator, run);
+    return run;
   }
 
-  private async gate<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.active >= 1) {
-      await new Promise<void>((resolve) => this.waiters.push(resolve));
-    }
-    this.active += 1;
-    try {
-      return await fn();
-    } finally {
-      this.active -= 1;
-      this.waiters.shift()?.();
-    }
+  private cached(creator: string): FilterDecision | null {
+    const cached = this.cache.get(creator);
+    if (!cached) return null;
+    const unavailable = cached.decision.ok === false && cached.decision.reason === "creator-history-unavailable";
+    const ttl = unavailable ? HISTORY_MISS_TTL_MS : HISTORY_HIT_TTL_MS;
+    if (this.now() - cached.at >= ttl) return null;
+    return cached.decision;
   }
 
   private async fetch(creator: string): Promise<FilterDecision> {
@@ -82,18 +97,18 @@ export class RpcCreatorHistory {
         .filter((tx): tx is HistoryTx => tx !== null);
       const curves = await this.curves(views);
       return historyDecision(views, curves, Math.floor(this.now() / 1000));
-    } catch (error) {
-      this.log.info("creator history failed", {
-        creator,
-        error: error instanceof Error ? error.message : "rpc-error",
-      });
+    } catch {
+      // The shared limiter already retried HTTP 429. A miss is a skip, not a crash.
       return { ok: false, reason: "creator-history-unavailable" };
     }
   }
 
   private async signatures(creator: string): Promise<SignatureInfo[]> {
-    const body = await this.rpc<SignatureInfo[]>("getSignaturesForAddress", [creator, { limit: 25 }]);
-    return body ?? [];
+    const body = await this.rpc<SignatureInfo[]>("getSignaturesForAddress", [
+      creator,
+      { limit: HISTORY_SIGNATURE_LIMIT },
+    ]);
+    return (body ?? []).filter((row) => row.err == null).slice(0, HISTORY_SIGNATURE_LIMIT);
   }
 
   private async transactions(signatures: SignatureInfo[]): Promise<Array<RawTx | null>> {
@@ -118,7 +133,7 @@ export class RpcCreatorHistory {
   }
 
   private async curves(views: HistoryTx[]): Promise<CurveMark[]> {
-    const list = [...new Set(views.map((tx) => tx.createdMint).filter((mint): mint is string => Boolean(mint)))].slice(0, 5);
+    const list = [...new Set(views.map((tx) => tx.createdMint).filter((mint): mint is string => Boolean(mint)))].slice(0, 3);
     if (list.length === 0) return [];
     const keys = list.map((mint) =>
       PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), new PublicKey(mint).toBuffer()], PUMP_PROGRAM)[0].toBase58(),

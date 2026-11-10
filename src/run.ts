@@ -11,7 +11,7 @@ import { createLivePorts, LiveExecutor } from "./executor-live.js";
 import { PriorityFeeEstimator } from "./priority-fee.js";
 import { RpcHolderCheck } from "./holders.js";
 import { RpcCreatorHistory } from "./history.js";
-import { createRpcFetch } from "./rpc-limit.js";
+import { createRpcFetch, createRpcStats, startRpcPressureLog } from "./rpc-limit.js";
 import { Logger } from "./logger.js";
 import { PositionBook } from "./positions.js";
 import { installProcessRedaction, rpcApiKey } from "./redact.js";
@@ -38,6 +38,7 @@ export interface Runtime {
   sol: SolPriceFeed;
   executor: Executor;
   subscription: { stream: LiveStream | null };
+  stopRpcPressure: () => void;
 }
 
 export function readSecrets(): string[] {
@@ -68,7 +69,13 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
   const trades = new TradeLog(config.tradesPath, secrets);
   const sol = new SolPriceFeed(config.solPriceUrl);
   await sol.refresh();
-  const rpcFetch = createRpcFetch({ rps: config.heliusRps, cacheTtlMs: config.rpcCacheTtlMs });
+  const rpcStats = createRpcStats();
+  const rpcFetch = createRpcFetch({
+    rps: config.heliusRps,
+    cacheTtlMs: config.rpcCacheTtlMs,
+    stats: rpcStats,
+  });
+  const stopPressureLog = startRpcPressureLog(log, rpcStats);
   const history = new RpcCreatorHistory(config, log, Date.now, rpcFetch);
   const holders = new RpcHolderCheck(config.rpcUrl, config.maxTop10Pct, rpcFetch, log, {
     timeoutMs: config.rugCheckTimeoutMs,
@@ -151,7 +158,7 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
       bot.onCurveReserves(mint, realSol, reserves, complete);
     curveWatch.start();
   }
-  return { config, log, bot, positions, sol, executor, subscription };
+  return { config, log, bot, positions, sol, executor, subscription, stopRpcPressure: stopPressureLog };
 }
 
 export function attachStream(runtime: Runtime): LiveStream {
@@ -213,6 +220,7 @@ export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promis
     bot.stop();
     log.info("shutdown", { why });
     stream.stop();
+    runtime.stopRpcPressure();
     positions.save(sol.price(), config.paper, new Date().toISOString());
     process.exit(0);
   };

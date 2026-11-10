@@ -62,6 +62,15 @@ const CACHEABLE = new Set([
   "getRecentPrioritizationFees",
 ]);
 
+export interface RpcStats {
+  http429: number;
+  retries: number;
+}
+
+export function createRpcStats(): RpcStats {
+  return { http429: 0, retries: 0 };
+}
+
 export interface RpcFetchOptions {
   rps: number;
   cacheTtlMs: number;
@@ -71,6 +80,31 @@ export interface RpcFetchOptions {
   random?: () => number;
   fetchImpl?: typeof fetch;
   bucket?: TokenBucket;
+  stats?: RpcStats;
+}
+
+/** Log the 429 and retry totals once per interval, and only when they moved. */
+export function startRpcPressureLog(
+  log: { info(message: string, fields?: Record<string, unknown>): void },
+  stats: RpcStats,
+  intervalMs = 30_000,
+): () => void {
+  let last429 = stats.http429;
+  let lastRetry = stats.retries;
+  const flush = () => {
+    const http429 = stats.http429 - last429;
+    const retries = stats.retries - lastRetry;
+    last429 = stats.http429;
+    lastRetry = stats.retries;
+    if (http429 === 0 && retries === 0) return;
+    log.info("rpc pressure", { http429, retries, http429Total: stats.http429, retriesTotal: stats.retries });
+  };
+  const timer = setInterval(flush, intervalMs);
+  timer.unref?.();
+  return () => {
+    clearInterval(timer);
+    flush();
+  };
 }
 
 function requestUrl(input: RequestInfo | URL): string {
@@ -131,6 +165,7 @@ export function createRpcFetch(options: RpcFetchOptions): typeof fetch {
       await bucket.acquire();
       const response = await fetchImpl(input, init);
       const retry = response.status === 429 || response.status >= 500;
+      if (response.status === 429) options.stats && (options.stats.http429 += 1);
       if (!retry) {
         if (cacheable && response.ok) {
           const text = await response.text();
@@ -148,6 +183,7 @@ export function createRpcFetch(options: RpcFetchOptions): typeof fetch {
       }
       last = response;
       if (attempt + 1 < maxAttempts) {
+        if (options.stats) options.stats.retries += 1;
         const base = 200 * 2 ** attempt;
         const jitter = Math.floor(random() * base * 0.3);
         await sleep(base + jitter);
