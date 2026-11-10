@@ -76,6 +76,57 @@ test("low net volume, a single burst, and a chase each have their own reason", (
   if (!flat.ok) assert.equal(flat.reason, "entry_runup");
 });
 
+function spread(windowMs: number): EntryPrint[] {
+  const bucket = windowMs / 3;
+  const times = [bucket * 0.5, bucket * 0.8, bucket * 1.4, bucket * 1.8, bucket * 2.5];
+  const wallets = ["a", "b", "c", "d", "a"];
+  return times.map((atMs, index) => ({
+    atMs,
+    side: "buy" as const,
+    trader: wallets[index] ?? "a",
+    sol: 0.15,
+  }));
+}
+
+test("a 5s, 10s, or 30s window can pass when buys span two of its three buckets", () => {
+  for (const windowMs of [5_000, 10_000, 30_000]) {
+    const verdict = evaluateEntry({
+      ...base,
+      startedAtMs: 0,
+      nowMs: windowMs,
+      prints: spread(windowMs),
+      minBuys: 5,
+      minUniqueBuyers: 4,
+      minNetBuySol: 0.5,
+    });
+    assert.equal(verdict.ok, true, `window ${windowMs}`);
+  }
+  const burst = spread(5_000).map((print) => ({ ...print, atMs: 4_800 }));
+  const oneBucket = evaluateEntry({
+    ...base,
+    startedAtMs: 0,
+    nowMs: 5_000,
+    prints: burst,
+    minBuys: 5,
+    minUniqueBuyers: 4,
+    minNetBuySol: 0.5,
+  });
+  assert.equal(oneBucket.ok, false);
+  if (!oneBucket.ok) assert.equal(oneBucket.reason, "entry_burst");
+  const chase = evaluateEntry({
+    ...base,
+    startedAtMs: 0,
+    nowMs: 5_000,
+    prints: spread(5_000),
+    price: 1.7,
+    minBuys: 5,
+    minUniqueBuyers: 4,
+    minNetBuySol: 0.5,
+  });
+  assert.equal(chase.ok, false);
+  if (!chase.ok) assert.equal(chase.reason, "entry_runup");
+});
+
 test("the tip is 1% of size, clamped, and emergency exits pay the max", () => {
   const config = loadConfig({});
   assert.equal(tipForTrade(config, 0.15), 0.0015);

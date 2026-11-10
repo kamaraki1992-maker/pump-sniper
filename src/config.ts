@@ -70,6 +70,10 @@ export interface AppConfig {
   entryMinBuyRatio: number;
   entryMaxRunupPct: number;
   entryMaxWatched: number;
+  /** When set, entry buckets use this width. Otherwise each bucket is one third of the watch so far. */
+  entryBucketSec: number | null;
+  /** Realized daily loss that stops new entries. Unset means the limit is off. */
+  maxDailyLossSol: number | null;
   /** A print this far below the previous mark exits immediately. */
   stopFastDropPct: number;
   devSellExit: boolean;
@@ -230,6 +234,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const entryMinBuyRatio = num(env.ENTRY_MIN_BUY_RATIO, 0.6, "ENTRY_MIN_BUY_RATIO");
   const entryMaxRunupPct = num(env.ENTRY_MAX_RUNUP_PCT, 60, "ENTRY_MAX_RUNUP_PCT");
   const entryMaxWatched = num(env.ENTRY_MAX_WATCHED, 30, "ENTRY_MAX_WATCHED");
+  const entryBucketSec = optionalNum(env.ENTRY_BUCKET_SEC, "ENTRY_BUCKET_SEC");
+  const maxDailyLossSol = optionalNum(env.MAX_DAILY_LOSS_SOL, "MAX_DAILY_LOSS_SOL");
   const stopFastDropPct = num(env.STOP_FAST_DROP_PCT, 12, "STOP_FAST_DROP_PCT");
   const devSellExit = env.DEV_SELL_EXIT === undefined || env.DEV_SELL_EXIT.trim() === ""
     ? true
@@ -334,6 +340,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   if (!(feedStallSec >= 5)) {
     throw new ConfigError("FEED_STALL_SEC must be >= 5");
+  }
+  if (entryBucketSec != null && !(entryBucketSec > 0)) {
+    throw new ConfigError("ENTRY_BUCKET_SEC must be positive");
+  }
+  if (maxDailyLossSol != null && !(maxDailyLossSol > 0)) {
+    throw new ConfigError("MAX_DAILY_LOSS_SOL must be positive when set");
   }
   if (!(stopLossPct > 0) || stopLossPct > HARD_CAPS.maxStopLossPct) {
     throw new ConfigError(
@@ -440,6 +452,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     entryMinBuyRatio,
     entryMaxRunupPct,
     entryMaxWatched,
+    entryBucketSec,
+    maxDailyLossSol,
     stopFastDropPct,
     devSellExit,
     earlyExitMinGainPct,

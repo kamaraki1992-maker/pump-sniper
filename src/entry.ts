@@ -19,6 +19,8 @@ export interface EntrySample {
   minNetBuySol: number;
   minBuyRatio: number;
   maxRunupPct: number;
+  /** Bucket width. When omitted, each of the three buckets is one third of the watch so far. */
+  bucketMs?: number;
 }
 
 export type EntryVerdict =
@@ -34,20 +36,37 @@ export type EntryVerdict =
         | "entry_timeout";
     };
 
-const BUCKET_MS = 5_000;
-
 function organic(sample: EntrySample, print: EntryPrint): boolean {
   if (!print.trader || print.trader === sample.creator) return false;
   if (sample.bundled.has(print.trader)) return false;
   return true;
 }
 
-/** Buys in how many of the three most recent 5s buckets. */
-export function recentBuyBuckets(prints: readonly EntryPrint[], nowMs: number, organicPrint: (print: EntryPrint) => boolean): number {
+/** Width of one entry bucket. The default is one third of the time since the watch started. */
+export function entryBucketMs(startedAtMs: number, nowMs: number, overrideMs?: number): number {
+  if (overrideMs != null && overrideMs > 0) return overrideMs;
+  const elapsed = nowMs - startedAtMs;
+  if (!(elapsed > 0)) return 0;
+  return elapsed / 3;
+}
+
+/**
+ * Buys in how many of the three buckets that tile the watch.
+ * A 5s window uses ~1.67s buckets, so two separate bursts inside those 5s can pass.
+ */
+export function recentBuyBuckets(
+  prints: readonly EntryPrint[],
+  startedAtMs: number,
+  nowMs: number,
+  organicPrint: (print: EntryPrint) => boolean,
+  bucketMs?: number,
+): number {
+  const bucket = entryBucketMs(startedAtMs, nowMs, bucketMs);
+  if (!(bucket > 0)) return 0;
   let hits = 0;
   for (let i = 0; i < 3; i += 1) {
-    const end = nowMs - i * BUCKET_MS;
-    const start = end - BUCKET_MS;
+    const end = nowMs - i * bucket;
+    const start = Math.max(startedAtMs, end - bucket);
     const hit = prints.some(
       (print) => print.side === "buy" && organicPrint(print) && print.atMs > start && print.atMs <= end,
     );
@@ -83,7 +102,13 @@ export function evaluateEntry(sample: EntrySample): EntryVerdict {
   if (net < sample.minNetBuySol || ratio < sample.minBuyRatio) {
     return { ok: false, reason: "entry_low_volume" };
   }
-  const buckets = recentBuyBuckets(sample.prints, sample.nowMs, (print) => organic(sample, print));
+  const buckets = recentBuyBuckets(
+    sample.prints,
+    sample.startedAtMs,
+    sample.nowMs,
+    (print) => organic(sample, print),
+    sample.bucketMs,
+  );
   if (buckets < 2) return { ok: false, reason: "entry_burst" };
   if (!(sample.startPrice > 0) || !(sample.price > sample.startPrice)) {
     return { ok: false, reason: "entry_runup" };

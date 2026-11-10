@@ -1,8 +1,12 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import type { BoughtMints } from "./bought.js";
 import { bondingCurveAddress } from "./curve-watch.js";
 import { confidenceBreakdown, sizeFromConfidence, type ConfidenceBreakdown } from "./confidence.js";
 import { clampBuyUsd, HARD_CAPS, requiredBuyBalanceSol, type AppConfig } from "./config.js";
-import { evaluateEntry, type EntryPrint } from "./entry.js";
+import { DailyLossBook } from "./daily-loss.js";
+import { evaluateEntry, entryBucketMs, type EntryPrint } from "./entry.js";
+import { berlinDay } from "./report.js";
 import { isEmergencyExit, tipForTrade } from "./tip.js";
 import { SOL_PRICE_MAX_AGE_MS } from "./sol-price.js";
 import type { FilterDecision } from "./filter.js";
@@ -93,14 +97,18 @@ export class SniperBot {
   /** Latest on-curve reserves from a trade or curve-watch update. Launch snapshots are not stored. */
   private readonly freshReserves = new Map<string, { vSol: number; vTokens: number }>();
   private readonly watched = new Map<string, EntryWatch>();
+  private readonly daily: DailyLossBook;
+  private dailyStopWritten = false;
   private stopped = false;
 
   constructor(private readonly deps: BotDeps) {
+    this.daily = new DailyLossBook(`${deps.config.dataDir}/daily-pnl.json`);
     for (const mint of deps.bought?.list() ?? []) this.seen.add(mint);
     for (const position of deps.positions.list()) {
       this.seen.add(position.mint);
       deps.subscribeMint(position.mint);
     }
+    this.maybePauseFlat();
   }
 
   stop(): void {
@@ -109,6 +117,10 @@ export class SniperBot {
   }
 
   async onLaunch(launch: MarketLaunch): Promise<void> {
+    if (this.entriesHalted()) {
+      this.skip(launch, "daily_stop");
+      return;
+    }
     if (this.deps.config.entryWatchMaxSec > 0) {
       await this.watchLaunch(launch);
       return;
@@ -118,6 +130,10 @@ export class SniperBot {
 
   private async buyAtLaunch(launch: MarketLaunch, fromWatch = false): Promise<void> {
     if (this.stopped) return;
+    if (this.entriesHalted()) {
+      this.skip(launch, "daily_stop");
+      return;
+    }
     if (!fromWatch) {
       if (this.deps.bought?.has(launch.mint)) {
         this.skip(launch, "already_bought");
@@ -591,6 +607,7 @@ export class SniperBot {
           bundle: "jito",
         });
         if (fill.status === "filled") {
+          if (realized !== null) this.noteRealized(realized);
           const remaining = before - sold;
           const partial = remaining > 1e-9 && share < 0.999;
           this.deps.log.info("sell filled", {
@@ -619,6 +636,7 @@ export class SniperBot {
           this.lastMarketTradeAt.delete(current.mint);
           this.deps.curveWatch?.unwatch(current.mint);
           this.deps.unsubscribeMint(current.mint);
+          this.maybePauseFlat();
           return;
         }
         this.deps.log.info("sell failed", {
@@ -816,6 +834,10 @@ export class SniperBot {
     const maxMs = this.deps.config.entryWatchMaxSec * 1000;
     try {
       while (!this.stopped && this.watched.has(launch.mint)) {
+        if (this.entriesHalted()) {
+          this.skip(launch, "daily_stop");
+          return;
+        }
         const now = this.deps.now().getTime();
         if (watch.creatorSold) {
           this.skip(launch, "entry_creator_sold");
@@ -905,6 +927,11 @@ export class SniperBot {
       minNetBuySol: config.entryMinNetBuySol,
       minBuyRatio: config.entryMinBuyRatio,
       maxRunupPct: config.entryMaxRunupPct,
+      bucketMs: entryBucketMs(
+        watch.startedAtMs,
+        nowMs,
+        config.entryBucketSec != null ? config.entryBucketSec * 1000 : undefined,
+      ),
     };
   }
 
@@ -1036,6 +1063,39 @@ export class SniperBot {
     return Promise.race([work, timeout]).finally(() => {
       if (timer) clearTimeout(timer);
     });
+  }
+
+  /** Realized Berlin-day PnL only. Open marks are not part of the daily stop. */
+  private entriesHalted(): boolean {
+    const cap = this.deps.config.maxDailyLossSol;
+    if (cap == null) return false;
+    const day = berlinDay(this.deps.now().toISOString());
+    return this.daily.realized(this.deps.config.mode, day) <= -cap;
+  }
+
+  private noteRealized(pnl: number): void {
+    if (this.deps.config.maxDailyLossSol == null) return;
+    const day = berlinDay(this.deps.now().toISOString());
+    this.daily.add(this.deps.config.mode, day, pnl);
+    if (!this.entriesHalted()) return;
+    for (const mint of [...this.watched.keys()]) this.watched.delete(mint);
+  }
+
+  private maybePauseFlat(): void {
+    if (this.dailyStopWritten || !this.entriesHalted()) return;
+    if (this.deps.positions.list().length > 0 || this.pendingBuys.size > 0) return;
+    this.dailyStopWritten = true;
+    const day = berlinDay(this.deps.now().toISOString());
+    const realizedSol = this.daily.realized(this.deps.config.mode, day);
+    this.deps.log.info("daily_stop", {
+      realizedSol,
+      day,
+      mode: this.deps.config.mode,
+      stopFile: this.deps.config.stopFile,
+    });
+    const path = this.deps.config.stopFile;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `daily_stop ${day} ${realizedSol}\n`);
   }
 
   private skip(launch: MarketLaunch, reason: string, extra?: Record<string, unknown>): void {
