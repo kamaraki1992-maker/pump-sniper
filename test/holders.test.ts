@@ -4,6 +4,7 @@ import { Keypair, PublicKey } from "@solana/web3.js";
 import { bondingCurveAddress } from "../src/curve-watch.js";
 import {
   excludedHolderAccounts,
+  protocolHolders,
   readLargestAccounts,
   readSupplyAmount,
   top10Decision,
@@ -64,6 +65,59 @@ test("top 10 excludes the bonding curve, its token account, and the pump pool", 
   assert.equal(exact.ok, true);
   assert.equal(exact.pct, 25);
 });
+
+test("a Token-2022 mayhem launch does not count the sol vault's half of supply", () => {
+  // Same shape as 9KD1MxS9MUr4dYdVyUxPVzoNU7vzHKCoiuouyYyRpump:
+  // supply 2e15, curve Token-2022 ATA ~49.75%, mayhem sol-vault ATA ~49.78%.
+  const mint = Keypair.generate().publicKey;
+  const protocol = protocolHolders(mint);
+  const supply = 2_000_000_000_000_000n;
+  const wallet = Keypair.generate().publicKey.toBase58();
+  const stray = Keypair.generate().publicKey.toBase58();
+  const accounts: LargestAccount[] = [
+    { address: protocol.curveTokenAccount, amount: 994_916_703_841_525n },
+    { address: protocol.mayhemVault, amount: 995_546_581_633_088n },
+    { address: wallet, amount: 4_000_000_000_000n },
+  ];
+  const curveOnly = top10Decision(accounts, supply, new Set([protocol.curveTokenAccount]), 25);
+  assert.equal(curveOnly.ok, false);
+  assert.ok((curveOnly.pct ?? 0) > 49.5 && (curveOnly.pct ?? 0) < 50.5);
+
+  const splCurveAta = splTokenAccount(mint);
+  assert.notEqual(splCurveAta, protocol.curveTokenAccount);
+  const wrongProgram = top10Decision(accounts, supply, new Set([splCurveAta]), 25);
+  assert.equal(wrongProgram.ok, false);
+
+  const decision = top10Decision(accounts, supply, new Set(protocol.addresses), 25);
+  assert.equal(decision.ok, true);
+  assert.ok((decision.pct ?? 0) < 1);
+
+  const ownedByVault = top10Decision(
+    [
+      { address: protocol.curveTokenAccount, amount: 994_916_703_841_525n },
+      { address: stray, amount: 995_546_581_633_088n },
+      { address: wallet, amount: 4_000_000_000_000n },
+    ],
+    supply,
+    new Set([protocol.curveTokenAccount]),
+    25,
+    new Map([[stray, protocol.solVault]]),
+    new Set(protocol.owners),
+  );
+  assert.equal(ownedByVault.ok, true);
+  assert.ok((ownedByVault.pct ?? 0) < 1);
+});
+
+function splTokenAccount(mint: PublicKey): string {
+  const curve = bondingCurveAddress(mint.toBase58(), null);
+  assert.ok(curve);
+  const tokenProgram = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+  const ataProgram = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+  return PublicKey.findProgramAddressSync(
+    [new PublicKey(curve).toBuffer(), tokenProgram.toBuffer(), mint.toBuffer()],
+    ataProgram,
+  )[0].toBase58();
+}
 
 test("largest-account and supply payloads unwrap the value field", () => {
   const rows = readLargestAccounts({
