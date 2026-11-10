@@ -17,7 +17,8 @@ export type TradeReason =
   | "trailing_stop"
   | "dev_sell"
   | "fast_drop"
-  | "early_no_momentum";
+  | "early_no_momentum"
+  | "profit_lock";
 
 export interface MarketLaunch {
   kind: "launch";
@@ -37,6 +38,8 @@ export interface MarketLaunch {
   /** Virtual token reserves, in display tokens. */
   vTokens: number | null;
   bondingCurveKey: string | null;
+  /** Metadata JSON URL from the create event. */
+  metadataUri?: string | null;
   slot?: number | null;
   solAmount?: number | null;
 }
@@ -170,6 +173,8 @@ export interface Position {
   peakPriceSol?: number | null;
   /** Latched stop in SOL per token. Only ratchets up. Null until the trail arms. */
   trailStopPriceSol?: number | null;
+  /** Price floor armed by the profit lock. Only ratchets up. */
+  profitLockPriceSol?: number | null;
   /** Locked floor in percent above entry. Derived from `trailStopPriceSol`. */
   trailFloorPct?: number | null;
   /** True after the 2x partial has filled. The remainder rides the trail. */

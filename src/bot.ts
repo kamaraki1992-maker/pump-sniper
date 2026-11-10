@@ -5,6 +5,7 @@ import { bondingCurveAddress } from "./curve-watch.js";
 import { confidenceBreakdown, sizeFromConfidence, type ConfidenceBreakdown } from "./confidence.js";
 import { clampBuyUsd, HARD_CAPS, requiredBuyBalanceSol, type AppConfig } from "./config.js";
 import { DailyLossBook } from "./daily-loss.js";
+import type { MetadataSocials, SocialDecision } from "./socials.js";
 import { evaluateEntry, entryBucketMs, type EntryPrint } from "./entry.js";
 import { berlinDay } from "./report.js";
 import { isEmergencyExit, tipForTrade } from "./tip.js";
@@ -16,7 +17,7 @@ import { Logger } from "./logger.js";
 import type { PositionBook } from "./positions.js";
 import { assessMark, curveBuyPrice, curveSellPrice, EARLY_MARK_MS, poolSellPrice, poolSpot, reservesOnCurve, TOTAL_SUPPLY_TOKENS } from "./pricing.js";
 import type { TradeLog } from "./report.js";
-import { decideExit, FULL_EXIT_FRACTION, ratchetStop, reservesDropped, trailStopPrice, type ExitPlan } from "./risk.js";
+import { decideExit, FULL_EXIT_FRACTION, profitLockPrice, ratchetStop, reservesDropped, trailStopPrice, type ExitPlan } from "./risk.js";
 import type { SafetyCheckResult } from "./safety.js";
 import type { Executor, MarketGraduation, MarketLaunch, MarketTrade, OrderRequest, Position, TradeReason } from "./types.js";
 
@@ -56,6 +57,8 @@ export interface BotDeps {
   readCurveReserves?: (mint: string) => Promise<{ vSol: number; vTokens: number } | null>;
   /** Creator token balance in display tokens. A drop while a position is open is a dev sell. */
   readCreatorBalance?: (mint: string, creator: string) => Promise<number | null>;
+  /** Metadata social check. Absent checks fail closed when REQUIRE_SOCIALS is on. */
+  metadataSocials?: MetadataSocials;
 }
 
 interface EntryWatch {
@@ -164,6 +167,7 @@ export class SniperBot {
         this.skip(launch, hold.reason ?? "creator-hold");
         return;
       }
+      const socialP = this.socialCheck(launch);
       if (this.deps.holders) {
         const top10 = await this.withinBudget(
           this.deps.holders.lookup(launch.mint),
@@ -182,6 +186,11 @@ export class SniperBot {
       );
       if (!history.ok) {
         this.skip(launch, history.reason ?? "creator-history-unavailable");
+        return;
+      }
+      const social = await socialP;
+      if (!social.ok) {
+        this.skip(launch, social.reason ?? "metadata_unavailable");
         return;
       }
     }
@@ -478,6 +487,13 @@ export class SniperBot {
         this.deps.config.trailDistancePct,
       );
       position.trailStopPriceSol = ratchetStop(position.trailStopPriceSol, nextStop);
+      const nextLock = profitLockPrice(
+        position.entryPriceSol,
+        peak,
+        this.deps.config.profitLockTriggerPct,
+        this.deps.config.profitLockFloorPct,
+      );
+      position.profitLockPriceSol = ratchetStop(position.profitLockPriceSol, nextLock);
       position.trailFloorPct =
         position.trailStopPriceSol != null
           ? ((position.trailStopPriceSol / position.entryPriceSol) - 1) * 100
@@ -498,6 +514,7 @@ export class SniperBot {
       volumeStallMs: this.deps.config.volumeStallSec * 1000,
       volumeStallGraceMs: this.deps.config.volumeStallGraceSec * 1000,
       trailStopPriceSol: position.trailStopPriceSol ?? null,
+      profitLockPriceSol: position.profitLockPriceSol ?? null,
       tp1Pct: this.deps.config.tp1Pct,
       tp1SellFraction: this.deps.config.tp1SellFraction,
       tp1Taken: position.tp1Taken === true,
@@ -513,7 +530,7 @@ export class SniperBot {
         : null;
     const exit = plan ?? early;
     if (!exit) return;
-    const hot = isEmergencyExit(exit.signal) || exit.signal === "early_no_momentum";
+    const hot = isEmergencyExit(exit.signal) || exit.signal === "early_no_momentum" || exit.signal === "profit_lock";
     const cooldown = this.cooldownUntil.get(position.mint) ?? 0;
     if (!hot && this.deps.now().getTime() < cooldown) return;
     await this.sellPosition(position, exit.signal, quote > 0 ? quote : position.lastMarkPriceSol, exit.fraction);
@@ -547,7 +564,7 @@ export class SniperBot {
         if (!current) return;
         const before = current.tokenAmount;
         const requested = portion >= 0.999 ? before : before * portion;
-        const stopLike = isEmergencyExit(reason) || reason === "early_no_momentum";
+        const stopLike = isEmergencyExit(reason) || reason === "early_no_momentum" || reason === "profit_lock";
         const execution = stopLike
           ? quote > 0
             ? quote
@@ -883,23 +900,46 @@ export class SniperBot {
   }
 
   private rugChecks(launch: MarketLaunch): Promise<{ ok: boolean; reason: string }> {
-    return (async () => {
-      if (this.deps.holders) {
-        const top10 = await this.withinBudget(
-          this.deps.holders.lookup(launch.mint),
-          this.deps.config.rugCheckTimeoutMs,
-          { ok: false, reason: "top10-timeout", pct: null },
-        );
-        if (!top10.ok) return { ok: false, reason: top10.reason ?? "top10" };
-      }
-      const history = await this.withinBudget(
-        this.deps.history.lookup(launch.creator),
-        this.deps.config.rugCheckTimeoutMs,
-        { ok: false, reason: "creator-history-timeout" },
-      );
+    const socialP = this.socialCheck(launch);
+    const top10P = this.deps.holders
+      ? this.withinBudget(this.deps.holders.lookup(launch.mint), this.deps.config.rugCheckTimeoutMs, {
+          ok: false,
+          reason: "top10-timeout",
+          pct: null,
+        })
+      : Promise.resolve({ ok: true, reason: "", pct: null });
+    const historyP = this.withinBudget(
+      this.deps.history.lookup(launch.creator),
+      this.deps.config.rugCheckTimeoutMs,
+      { ok: false, reason: "creator-history-timeout" },
+    );
+    return Promise.all([socialP, top10P, historyP]).then(([social, top10, history]) => {
+      if (!social.ok) return { ok: false, reason: social.reason ?? "metadata_unavailable" };
+      if (!top10.ok) return { ok: false, reason: top10.reason ?? "top10" };
       if (!history.ok) return { ok: false, reason: history.reason ?? "creator-history-unavailable" };
       return { ok: true, reason: "" };
-    })();
+    });
+  }
+
+  private socialCheck(launch: MarketLaunch): Promise<SocialDecision> {
+    if (!this.deps.config.requireSocials) {
+      return Promise.resolve({ ok: true, reason: null, twitter: null, telegram: null });
+    }
+    const uri = launch.metadataUri?.trim() ?? "";
+    const finish = (decision: SocialDecision): SocialDecision => {
+      this.deps.log.info("socials", {
+        mint: launch.mint,
+        ok: decision.ok,
+        reason: decision.reason,
+        twitter: decision.twitter,
+        telegram: decision.telegram,
+      });
+      return decision;
+    };
+    if (!uri || !this.deps.metadataSocials) {
+      return Promise.resolve(finish({ ok: false, reason: "metadata_unavailable", twitter: null, telegram: null }));
+    }
+    return this.deps.metadataSocials.lookup(uri).then(finish);
   }
 
   /** Resolved rug result, or null when the checks are still running. */

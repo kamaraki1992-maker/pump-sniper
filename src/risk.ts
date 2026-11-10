@@ -8,7 +8,8 @@ export type ExitSignal =
   | "trailing_stop"
   | "dev_sell"
   | "fast_drop"
-  | "early_no_momentum";
+  | "early_no_momentum"
+  | "profit_lock";
 
 export interface ExitPlan {
   signal: ExitSignal;
@@ -40,6 +41,23 @@ export function trailStopPrice(
   if (!(distancePct >= 0) || distancePct >= 100) return null;
   if (peak + 1e-9 < entry * (1 + activatePct / 100)) return null;
   return Math.max(entry, peak * (1 - distancePct / 100));
+}
+
+/**
+ * Once the peak reaches `triggerPct`, the floor is `entry * (1 + floorPct/100)`.
+ * It does not move with later peaks. Null until the trigger is reached.
+ */
+export function profitLockPrice(
+  entry: number,
+  peak: number,
+  triggerPct: number | null | undefined,
+  floorPct: number | null | undefined,
+): number | null {
+  if (triggerPct == null || floorPct == null) return null;
+  if (!(entry > 0) || !(peak > 0) || !(triggerPct > 0)) return null;
+  const gain = ((peak / entry) - 1) * 100;
+  if (gain + 1e-9 < triggerPct) return null;
+  return entry * (1 + floorPct / 100);
 }
 
 /** A later dip cannot loosen a stop that already latched. */
@@ -76,6 +94,8 @@ export function decideExit(input: {
   volumeStallGraceMs?: number;
   /** Latched trail stop in SOL per token. Null until +activate has been seen. */
   trailStopPriceSol?: number | null;
+  /** Latched profit-lock floor. Null until the trigger gain has been seen. */
+  profitLockPriceSol?: number | null;
   tp1Pct?: number;
   tp1SellFraction?: number;
   tp1Taken?: boolean;
@@ -83,9 +103,12 @@ export function decideExit(input: {
   const entry = input.entryPrice;
   const mark = input.markPrice;
   if (entry > 0 && mark > 0) {
-    const trail = input.trailStopPriceSol;
-    if (trail != null && trail > 0 && mark <= trail) {
-      return { signal: "trailing_stop", fraction: FULL_EXIT_FRACTION };
+    const trail = input.trailStopPriceSol != null && input.trailStopPriceSol > 0 ? input.trailStopPriceSol : null;
+    const locked = input.profitLockPriceSol != null && input.profitLockPriceSol > 0 ? input.profitLockPriceSol : null;
+    const floor = trail != null && locked != null ? Math.max(trail, locked) : (trail ?? locked);
+    if (floor != null && mark <= floor) {
+      const signal = trail != null && trail >= (locked ?? 0) ? "trailing_stop" : "profit_lock";
+      return { signal, fraction: FULL_EXIT_FRACTION };
     }
     const sl = stopLossPrice(entry, input.stopLossPct);
     if (sl != null && mark <= sl) return { signal: "sl", fraction: FULL_EXIT_FRACTION };

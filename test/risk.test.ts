@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { decideExit, FULL_EXIT_FRACTION, ratchetStop, stopLossPrice, trailStopPrice, type ExitPlan } from "../src/risk.js";
+import { decideExit, FULL_EXIT_FRACTION, profitLockPrice, ratchetStop, stopLossPrice, trailStopPrice, type ExitPlan } from "../src/risk.js";
 
 const held = {
   entryPrice: 1,
@@ -80,6 +80,22 @@ test("volume stall waits out the grace, then the silence window", () => {
   assert.equal(decideExit({ ...quiet, lastTradeAtMs: 100_000, nowMs: 144_000 }), null);
   assert.equal(signal(decideExit({ ...quiet, lastTradeAtMs: 100_000, nowMs: 145_000 })), "volume_stall");
   assert.equal(signal(decideExit({ ...quiet, markPrice: 0.8, nowMs: 10_000 })), "sl");
+});
+
+test("profit lock arms at exactly +20% and the higher trail floor wins", () => {
+  assert.equal(profitLockPrice(1, 1.2 - 1e-6, 20, 10), null);
+  const armed = profitLockPrice(1, 1.2, 20, 10);
+  assert.ok(armed != null && Math.abs(armed - 1.1) < 1e-12);
+  assert.equal(ratchetStop(armed, profitLockPrice(1, 1.15, 20, 10)), armed);
+  assert.equal(signal(decideExit({ ...held, markPrice: 1.1, profitLockPriceSol: armed })), "profit_lock");
+  assert.equal(decideExit({ ...held, markPrice: 1.11, profitLockPriceSol: armed }), null);
+  assert.equal(signal(decideExit({ ...held, markPrice: 0.8 })), "sl");
+  const trail = trailStopPrice(1, 1.6, 50, 20);
+  assert.ok(trail != null && trail > 1.1);
+  assert.equal(
+    signal(decideExit({ ...held, markPrice: trail ?? 0, trailStopPriceSol: trail, profitLockPriceSol: armed })),
+    "trailing_stop",
+  );
 });
 
 test("a missing price does not exit", () => {

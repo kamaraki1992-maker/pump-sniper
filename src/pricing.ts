@@ -279,6 +279,7 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
       vSolSol,
       vTokens,
       bondingCurveKey: asString(record.bondingCurveKey),
+      metadataUri: asString(record.uri),
       slot: asNumber(record.slot),
       solAmount: asNumber(record.solAmount),
     };

@@ -74,6 +74,14 @@ export interface AppConfig {
   entryBucketSec: number | null;
   /** Realized daily loss that stops new entries. Unset means the limit is off. */
   maxDailyLossSol: number | null;
+  /** When true, a create must publish a well-formed Twitter/X and/or Telegram link. */
+  requireSocials: boolean;
+  /** `any` accepts either network. `both` requires each. */
+  requireSocialsMode: "any" | "both";
+  metadataTimeoutMs: number;
+  /** Unset means the profit lock is off. */
+  profitLockTriggerPct: number | null;
+  profitLockFloorPct: number | null;
   /** A print this far below the previous mark exits immediately. */
   stopFastDropPct: number;
   devSellExit: boolean;
@@ -236,6 +244,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const entryMaxWatched = num(env.ENTRY_MAX_WATCHED, 30, "ENTRY_MAX_WATCHED");
   const entryBucketSec = optionalNum(env.ENTRY_BUCKET_SEC, "ENTRY_BUCKET_SEC");
   const maxDailyLossSol = optionalNum(env.MAX_DAILY_LOSS_SOL, "MAX_DAILY_LOSS_SOL");
+  const requireSocials = env.REQUIRE_SOCIALS === "true" || env.REQUIRE_SOCIALS === "1";
+  const socialModeRaw = (env.REQUIRE_SOCIALS_MODE ?? "").trim().toLowerCase();
+  const requireSocialsMode: "any" | "both" = socialModeRaw === "" ? "any" : socialModeRaw === "both" ? "both" : socialModeRaw === "any" ? "any" : "any";
+  if (socialModeRaw !== "" && socialModeRaw !== "any" && socialModeRaw !== "both") {
+    throw new ConfigError("REQUIRE_SOCIALS_MODE must be any or both");
+  }
+  const metadataTimeoutMs = num(env.METADATA_TIMEOUT_MS, 2_500, "METADATA_TIMEOUT_MS");
+  const profitLockTriggerPct = optionalNum(env.PROFIT_LOCK_TRIGGER_PCT, "PROFIT_LOCK_TRIGGER_PCT");
+  const profitLockFloorPct = optionalNum(env.PROFIT_LOCK_FLOOR_PCT, "PROFIT_LOCK_FLOOR_PCT");
   const stopFastDropPct = num(env.STOP_FAST_DROP_PCT, 12, "STOP_FAST_DROP_PCT");
   const devSellExit = env.DEV_SELL_EXIT === undefined || env.DEV_SELL_EXIT.trim() === ""
     ? true
@@ -347,6 +364,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (maxDailyLossSol != null && !(maxDailyLossSol > 0)) {
     throw new ConfigError("MAX_DAILY_LOSS_SOL must be positive when set");
   }
+  if (!(metadataTimeoutMs > 0)) {
+    throw new ConfigError("METADATA_TIMEOUT_MS must be positive");
+  }
+  if ((profitLockTriggerPct == null) !== (profitLockFloorPct == null)) {
+    throw new ConfigError("PROFIT_LOCK_TRIGGER_PCT and PROFIT_LOCK_FLOOR_PCT must be set together");
+  }
+  if (profitLockTriggerPct != null && profitLockFloorPct != null) {
+    if (!(profitLockTriggerPct > 0) || !(profitLockFloorPct > 0) || profitLockFloorPct >= profitLockTriggerPct) {
+      throw new ConfigError("PROFIT_LOCK_FLOOR_PCT must be positive and below PROFIT_LOCK_TRIGGER_PCT");
+    }
+  }
   if (!(stopLossPct > 0) || stopLossPct > HARD_CAPS.maxStopLossPct) {
     throw new ConfigError(
       `STOP_LOSS_PCT ${stopLossPct} exceeds hard cap ${HARD_CAPS.maxStopLossPct}`,
@@ -454,6 +482,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     entryMaxWatched,
     entryBucketSec,
     maxDailyLossSol,
+    requireSocials,
+    requireSocialsMode,
+    metadataTimeoutMs,
+    profitLockTriggerPct,
+    profitLockFloorPct,
     stopFastDropPct,
     devSellExit,
     earlyExitMinGainPct,

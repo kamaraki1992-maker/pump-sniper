@@ -14,6 +14,7 @@ import { installProcessGuards } from "./guards.js";
 import { RpcCreatorHistory } from "./history.js";
 import { createRpcFetch, createRpcStats, startRpcPressureLog } from "./rpc-limit.js";
 import { Logger } from "./logger.js";
+import { MetadataSocials } from "./socials.js";
 import { PositionBook } from "./positions.js";
 import { installProcessRedaction, rpcApiKey } from "./redact.js";
 import { TradeLog } from "./report.js";
@@ -165,6 +166,10 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     bought: new BoughtMints(`${config.dataDir}/bought-mints.json`),
     ...(walletBalanceSol ? { walletBalanceSol } : {}),
     holders,
+    metadataSocials: new MetadataSocials({
+      timeoutMs: config.metadataTimeoutMs,
+      mode: config.requireSocialsMode,
+    }),
     safetyCheck: createRpcSafetyCheck(config, rpcFetch),
     ...(curveWatch ? { curveWatch } : {}),
     readCurveReserves: (mint) => fetchCurveReserves(config.rpcUrl, mint, rpcFetch),

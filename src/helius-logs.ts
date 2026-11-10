@@ -41,6 +41,7 @@ interface CreateFields {
   vSolRaw: number | null;
   vTokenRaw: number | null;
   quoteMint: string | null;
+  uri: string;
 }
 
 interface TradeFields {
@@ -170,6 +171,7 @@ export function decodeCreateEvent(data: Buffer): CreateFields | null {
     vSolRaw,
     vTokenRaw,
     quoteMint,
+    uri,
   };
 }
 
@@ -283,6 +285,7 @@ export function eventsFromLogs(notice: LogsNotice): { events: MarketEvent[]; fai
       vSolSol: reserves.vSolSol,
       vTokens: reserves.vTokens,
       bondingCurveKey: created.bondingCurve,
+      metadataUri: created.uri || null,
       slot: notice.slot,
       solAmount: boughtSol > 0 ? boughtSol / 1e9 : null,
     };
