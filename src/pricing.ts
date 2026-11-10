@@ -224,6 +224,32 @@ export function eventPrice(record: Record<string, unknown>): {
   return { priceSol: priceFromReserves(vSol, vTok), marketCapSol };
 }
 
+const NON_PUMP_POOLS = new Set(["raydium", "bonk", "moonshot", "meteora", "orca"]);
+const NAMED_POOLS = new Set(["pump", "pumpswap", "pump-amm", ...NON_PUMP_POOLS]);
+
+/**
+ * PumpPortal's free data socket. Reserves are SOL and display tokens, the same
+ * units `virtualSol` / `virtualTokens` already produce from PumpDev's raw fields.
+ * `pool: "raydium"` and other non-pump venues are dropped. `pool: "pump"` stays
+ * on the bonding curve.
+ */
+export function parsePumpPortalMessage(raw: unknown): MarketEvent | null {
+  const record = asRecord(raw);
+  if (!record || typeof record.type === "string") return null;
+  const poolName = asString(record.pool)?.toLowerCase() ?? "";
+  if (poolName && NON_PUMP_POOLS.has(poolName)) return null;
+  const adjusted: Record<string, unknown> = { ...record };
+  const named = poolName !== "" && NAMED_POOLS.has(poolName);
+  const amm = poolName === "pumpswap" || poolName === "pump-amm";
+  if (record.txType === "migrate") {
+    if (poolName && poolName !== "pump" && !amm && named) return null;
+    adjusted.txType = "create_pool";
+  }
+  if (amm || (!named && poolName !== "")) adjusted.source = adjusted.source ?? "pumpswap";
+  if (named) delete adjusted.pool;
+  return parsePumpDevMessage(adjusted);
+}
+
 export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
   const record = asRecord(raw);
   if (!record) return null;

@@ -1,6 +1,6 @@
 import WebSocket from "ws";
 import { Logger } from "./logger.js";
-import { parsePumpDevMessage } from "./pricing.js";
+import { parsePumpDevMessage, parsePumpPortalMessage } from "./pricing.js";
 import { redactRpcUrl } from "./redact.js";
 import type { MarketEvent } from "./types.js";
 
@@ -16,10 +16,15 @@ const TIER_SUBSCRIPTION_LIMIT: Record<string, number> = {
 };
 
 export interface PumpDevOptions {
+  /** Default in this class is pumpdev so existing callers keep the auth cap. The process default is pumpportal. */
+  feed?: "pumpportal" | "pumpdev";
   apiKey?: string | null;
-  /** Ceiling applied on top of the tier limit. Does not raise the anonymous default by itself. */
+  /** Ceiling applied on top of the PumpDev tier limit. Ignored by the PumpPortal feed. */
   maxSubscriptions?: number;
 }
+
+/** PumpPortal accepts at most this many mint keys in one subscribe message. */
+export const PORTAL_SUBSCRIBE_BATCH = 100;
 
 export function nextBackoffMs(attempt: number, baseMs = 1000, capMs = 30_000): number {
   const exp = Math.min(20, Math.max(0, attempt));
@@ -67,9 +72,15 @@ export class PumpDevStream {
   /** Mints waiting for a free subscription slot. */
   private readonly queued = new Set<string>();
   private readonly acked = new Set<string>();
+  /** Mints already sent on this socket. PumpPortal does not ack subscriptions. */
+  private readonly sent = new Set<string>();
   private onEvent: (event: MarketEvent) => void = () => {};
   private readonly apiKey: string | null;
+  /** PumpPortal trade subscriptions. Not sent on the URL and not logged. */
+  private readonly portalKey: string | null;
+  private portalKeyWarned = false;
   private readonly configuredMax: number | undefined;
+  private readonly portal: boolean;
 
   constructor(
     private readonly url: string,
@@ -78,10 +89,13 @@ export class PumpDevStream {
     private readonly backoff: (attempt: number) => number = nextBackoffMs,
     options: PumpDevOptions = {},
   ) {
+    this.portal = options.feed === "pumpportal";
     const key = options.apiKey?.trim() ?? "";
-    this.apiKey = key.length > 0 ? key : null;
-    this.configuredMax = options.maxSubscriptions;
-    if (this.configuredMax != null) {
+    this.portalKey = this.portal && key.length > 0 ? key : null;
+    this.apiKey = this.portal || key.length === 0 ? null : key;
+    this.configuredMax = this.portal ? undefined : options.maxSubscriptions;
+    if (this.portal) this.subscriptionLimit = Number.MAX_SAFE_INTEGER;
+    else if (this.configuredMax != null) {
       this.subscriptionLimit = Math.min(ANONYMOUS_SUBSCRIPTION_LIMIT, this.configuredMax);
     }
   }
@@ -116,6 +130,7 @@ export class PumpDevStream {
     const drop: string[] = [];
     for (const mint of mints) {
       this.queued.delete(mint);
+      this.sent.delete(mint);
       if (this.wanted.delete(mint)) {
         this.acked.delete(mint);
         drop.push(mint);
@@ -153,6 +168,7 @@ export class PumpDevStream {
       this.attempt = 0;
       this.opened = true;
       this.acked.clear();
+      this.sent.clear();
       this.retried = false;
       if (this.apiKey) this.send({ method: "auth", key: this.apiKey });
       this.send({ method: "subscribeNewToken" });
@@ -170,8 +186,9 @@ export class PumpDevStream {
         } catch {
           return;
         }
+        if (this.onPortalNotice(parsed)) return;
         if (this.onControl(parsed)) return;
-        const event = parsePumpDevMessage(parsed);
+        const event = this.portal ? parsePumpPortalMessage(parsed) : parsePumpDevMessage(parsed);
         if (event) this.onEvent(event);
       } catch (error) {
         this.log.info("ws message failed", {
@@ -225,6 +242,26 @@ export class PumpDevStream {
     return true;
   }
 
+  /** PumpPortal speaks `{ message }` instead of `{ type }`. The body is not a trade. */
+  private onPortalNotice(raw: unknown): boolean {
+    if (!this.portal || !raw || typeof raw !== "object") return false;
+    const record = raw as Record<string, unknown>;
+    if (typeof record.txType === "string" || typeof record.mint === "string") return false;
+    if (typeof record.message !== "string") return false;
+    const text = record.message.slice(0, 180);
+    if (/api key/i.test(text)) {
+      if (this.portalKeyWarned) return true;
+      this.portalKeyWarned = true;
+      this.log.error("pumpportal trades require a key", {
+        warning:
+          "Trade subscriptions were rejected. Set PUMPPORTAL_API_KEY. The linked wallet must hold at least 0.02 SOL. New-token events still arrive.",
+      });
+      return true;
+    }
+    this.log.info("pumpportal", { message: text });
+    return true;
+  }
+
   private onAuth(record: Record<string, unknown>): void {
     const status = typeof record.status === "string" ? record.status : "unknown";
     const tier = typeof record.tier === "string" && record.tier.trim() !== "" ? record.tier.trim().toLowerCase() : "anonymous";
@@ -270,8 +307,21 @@ export class PumpDevStream {
   }
 
   private flushPending(): void {
-    const pending = [...this.wanted].filter((mint) => !this.acked.has(mint));
-    if (pending.length > 0) this.send({ method: "subscribeTokenTrade", keys: pending });
+    const pending = this.portal
+      ? [...this.wanted].filter((mint) => !this.sent.has(mint))
+      : [...this.wanted].filter((mint) => !this.acked.has(mint));
+    if (pending.length === 0) return;
+    const batch = this.portal ? PORTAL_SUBSCRIBE_BATCH : pending.length;
+    for (let index = 0; index < pending.length; index += batch) {
+      const keys = pending.slice(index, index + batch);
+      const payload: { method: string; keys: string[]; apiKey?: string } = {
+        method: "subscribeTokenTrade",
+        keys,
+      };
+      if (this.portalKey) payload.apiKey = this.portalKey;
+      this.send(payload);
+      if (this.portal) for (const mint of keys) this.sent.add(mint);
+    }
   }
 
   private send(payload: unknown): void {

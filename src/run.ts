@@ -60,6 +60,8 @@ export function readSecrets(): string[] {
   if (rpcKey && rpcKey.length >= 8) secrets.push(rpcKey);
   const pumpDevKey = process.env.PUMPDEV_API_KEY?.trim();
   if (pumpDevKey && pumpDevKey.length >= 8) secrets.push(pumpDevKey);
+  const portalKey = process.env.PUMPPORTAL_API_KEY?.trim();
+  if (portalKey && portalKey.length >= 8) secrets.push(portalKey);
   const wsKey = rpcApiKey(process.env.WS_URL?.trim() ?? "");
   if (wsKey && wsKey.length >= 8) secrets.push(wsKey);
   return secrets;
@@ -179,12 +181,24 @@ export function attachStream(runtime: Runtime): LiveStream {
   const stream: LiveStream =
     runtime.config.grpcUrl && grpcToken
       ? new YellowstoneStream(runtime.config.grpcUrl, grpcToken, runtime.log)
-      : new PumpDevStream(runtime.config.wsUrl, runtime.log, undefined, undefined, {
-          apiKey: process.env.PUMPDEV_API_KEY?.trim() || null,
-          maxSubscriptions: pumpDevMaxSubscriptions(process.env.PUMPDEV_MAX_SUBSCRIPTIONS),
-        });
+      : new PumpDevStream(
+          runtime.config.feed === "pumpdev" ? runtime.config.wsUrl : runtime.config.dataWsUrl,
+          runtime.log,
+          undefined,
+          undefined,
+          runtime.config.feed === "pumpdev"
+            ? {
+                feed: "pumpdev",
+                apiKey: process.env.PUMPDEV_API_KEY?.trim() || null,
+                maxSubscriptions: pumpDevMaxSubscriptions(process.env.PUMPDEV_MAX_SUBSCRIPTIONS),
+              }
+            : { feed: "pumpportal", apiKey: process.env.PUMPPORTAL_API_KEY?.trim() || null },
+        );
   if (!(stream instanceof YellowstoneStream)) {
-    runtime.log.info("stream", { source: "pumpdev-ws" });
+    runtime.log.info("stream", {
+      source: runtime.config.feed === "pumpdev" ? "pumpdev-ws" : "pumpportal-ws",
+      feed: runtime.config.feed,
+    });
   }
   runtime.subscription.stream = stream;
   const fail = (error: unknown) => {

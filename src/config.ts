@@ -103,6 +103,9 @@ export interface AppConfig {
   grpcUrl: string | null;
   /** Present only when RPC_WS_URL is set. Logs must redact its api-key. */
   rpcWsUrl: string | null;
+  /** Market-data socket. `pumpdev` remains available; orders still use `tradeApiUrl`. */
+  feed: "pumpportal" | "pumpdev";
+  dataWsUrl: string;
   wsUrl: string;
   tradeApiUrl: string;
   rpcUrl: string;
@@ -453,6 +456,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     safetyCheckTimeoutMs,
     grpcUrl: grpcUrlRaw && grpcTokenPresent ? grpcUrlRaw : null,
     rpcWsUrl: str(env.RPC_WS_URL, "") || null,
+    feed: env.FEED === "pumpdev" ? "pumpdev" : "pumpportal",
+    dataWsUrl: str(env.DATA_WS_URL, "wss://pumpportal.fun/api/data"),
     wsUrl: str(env.WS_URL, "wss://pumpdev.io/ws"),
     tradeApiUrl: str(env.TRADE_API_URL, "https://pumpdev.io/api/bundle"),
     rpcUrl: str(env.RPC_URL, "https://api.mainnet-beta.solana.com"),
