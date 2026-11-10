@@ -85,6 +85,11 @@ export interface AppConfig {
   maxDailyLossSol: number | null;
   /** When true, a create must publish a well-formed Twitter/X and/or Telegram link. */
   requireSocials: boolean;
+  /** When true with REQUIRE_SOCIALS, a socials miss can still enter. */
+  allowNoSocialsEntry: boolean;
+  /** Time stop for no-socials positions. Required when the fast lane is on. */
+  noSocialsTimeStopSec: number | null;
+  noSocialsMinGainPct: number | null;
   /** `any` accepts either network. `both` requires each. */
   requireSocialsMode: "any" | "both";
   metadataTimeoutMs: number;
@@ -265,10 +270,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const entryBucketSec = optionalNum(env.ENTRY_BUCKET_SEC, "ENTRY_BUCKET_SEC");
   const maxDailyLossSol = optionalNum(env.MAX_DAILY_LOSS_SOL, "MAX_DAILY_LOSS_SOL");
   const requireSocials = env.REQUIRE_SOCIALS === "true" || env.REQUIRE_SOCIALS === "1";
+  const allowNoSocialsEntry = env.ALLOW_NO_SOCIALS_ENTRY === "true" || env.ALLOW_NO_SOCIALS_ENTRY === "1";
+  const noSocialsTimeStopSec = optionalNum(env.NO_SOCIALS_TIME_STOP_SEC, "NO_SOCIALS_TIME_STOP_SEC");
+  const noSocialsMinGainPct = optionalNum(env.NO_SOCIALS_MIN_GAIN_PCT, "NO_SOCIALS_MIN_GAIN_PCT");
   const socialModeRaw = (env.REQUIRE_SOCIALS_MODE ?? "").trim().toLowerCase();
   const requireSocialsMode: "any" | "both" = socialModeRaw === "" ? "any" : socialModeRaw === "both" ? "both" : socialModeRaw === "any" ? "any" : "any";
   if (socialModeRaw !== "" && socialModeRaw !== "any" && socialModeRaw !== "both") {
     throw new ConfigError("REQUIRE_SOCIALS_MODE must be any or both");
+  }
+  if (allowNoSocialsEntry && (!(noSocialsTimeStopSec != null && noSocialsTimeStopSec > 0) || !(noSocialsMinGainPct != null && noSocialsMinGainPct > 0))) {
+    throw new ConfigError("NO_SOCIALS_TIME_STOP_SEC and NO_SOCIALS_MIN_GAIN_PCT must be > 0 when ALLOW_NO_SOCIALS_ENTRY is on");
   }
   const metadataTimeoutMs = num(env.METADATA_TIMEOUT_MS, 2_500, "METADATA_TIMEOUT_MS");
   const metadataRetry = env.METADATA_RETRY === undefined || env.METADATA_RETRY.trim() === ""
@@ -542,6 +553,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     entryBucketSec,
     maxDailyLossSol,
     requireSocials,
+    allowNoSocialsEntry,
+    noSocialsTimeStopSec,
+    noSocialsMinGainPct,
     requireSocialsMode,
     metadataTimeoutMs,
     metadataRetry,

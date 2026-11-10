@@ -18,7 +18,8 @@ export type TradeReason =
   | "dev_sell"
   | "fast_drop"
   | "early_no_momentum"
-  | "profit_lock";
+  | "profit_lock"
+  | "no_socials_time_stop";
 
 export interface MarketLaunch {
   kind: "launch";
@@ -144,6 +145,8 @@ export interface TradeRecord {
   triggerPriceSol?: number | null;
   /** Paper and live sells go out as a Jito bundle. */
   bundle?: "jito" | null;
+  /** Buy had no verified socials and entered through the fast lane. */
+  noSocials?: boolean;
 }
 
 export interface Position {
@@ -194,6 +197,8 @@ export interface Position {
   unpriced?: boolean;
   /** Creator token balance last observed, in display tokens. A drop is a dev sell. */
   creatorTokens?: number | null;
+  /** Entered without verified socials. Uses the no-socials time stop. */
+  noSocials?: boolean;
 }
 
 export interface Executor {

@@ -78,6 +78,8 @@ interface EntryWatch {
   rugs: Promise<{ ok: boolean; reason: string }>;
   socials: Promise<SocialDecision>;
   earlyTried: boolean;
+  /** The early instant passed while socials were still unknown. */
+  earlyDeferred: boolean;
 }
 
 const MAX_OPEN_LOG_MS = 5_000;
@@ -145,6 +147,7 @@ export class SniperBot {
     launch: MarketLaunch,
     fromWatch = false,
     entryStage?: "early" | "full",
+    noSocials = false,
   ): Promise<void> {
     if (this.stopped) return;
     if (this.entriesHalted()) {
@@ -304,6 +307,7 @@ export class SniperBot {
         realizedPnlSol: null,
         costSol: fill.status === "filled" ? fill.cashflowSol : null,
         confidence: confidence.score,
+        ...(noSocials ? { noSocials: true } : {}),
       });
       if (fill.status === "filled") this.notePaperCash(-fill.cashflowSol);
       if (fill.status !== "filled") {
@@ -338,6 +342,7 @@ export class SniperBot {
         lastTradeAtMs: this.lastMarketTradeAt.get(launch.mint) ?? this.deps.now().getTime(),
         tradesSeen: 0,
         creatorTokens: launch.initialBuyTokens,
+        ...(noSocials ? { noSocials: true } : {}),
       };
       this.deps.positions.open(position);
       if (position.bondingCurve) this.deps.curveWatch?.watch(launch.mint, position.bondingCurve);
@@ -365,6 +370,7 @@ export class SniperBot {
         sizeSol,
         ...(orderSize.balanceSol != null ? { balanceSol: orderSize.balanceSol, pct: orderSize.pct } : {}),
         ...(entryStage ? { entryStage } : {}),
+        ...(this.deps.config.allowNoSocialsEntry ? { noSocials } : {}),
         jitoTipSol: fill.jitoTipSol,
         ...confidenceFields(confidence),
       });
@@ -541,13 +547,21 @@ export class SniperBot {
       minPressureSells: 4,
       useStreamLiquidity: this.deps.curveWatch?.isLive(position.mint) !== true,
     });
+    const timed =
+      !plan && position.noSocials === true && position.entryPriceSol > 0
+        ? this.noSocialsTimeStop(position, openedAtMs)
+        : null;
     const early =
-      !plan && this.deps.config.earlyExitWindowSec > 0 && position.entryPriceSol > 0
+      !plan &&
+      !timed &&
+      position.noSocials !== true &&
+      this.deps.config.earlyExitWindowSec > 0 &&
+      position.entryPriceSol > 0
         ? this.earlyMomentum(position, openedAtMs)
         : null;
-    const exit = plan ?? early;
+    const exit = plan ?? timed ?? early;
     if (!exit) return;
-    const hot = isEmergencyExit(exit.signal) || exit.signal === "early_no_momentum" || exit.signal === "profit_lock";
+    const hot = isEmergencyExit(exit.signal) || exit.signal === "early_no_momentum" || exit.signal === "profit_lock" || exit.signal === "no_socials_time_stop";
     const cooldown = this.cooldownUntil.get(position.mint) ?? 0;
     if (!hot && this.deps.now().getTime() < cooldown) return;
     await this.sellPosition(position, exit.signal, quote > 0 ? quote : position.lastMarkPriceSol, exit.fraction);
@@ -561,6 +575,19 @@ export class SniperBot {
     const gain = ((peak / position.entryPriceSol) - 1) * 100;
     if (gain + 1e-9 >= this.deps.config.earlyExitMinGainPct) return null;
     return { signal: "early_no_momentum", fraction: FULL_EXIT_FRACTION };
+  }
+
+  /** No-socials positions that never reached the gain target are closed in full. */
+  private noSocialsTimeStop(position: Position, openedAtMs: number): ExitPlan | null {
+    const windowSec = this.deps.config.noSocialsTimeStopSec;
+    const minGain = this.deps.config.noSocialsMinGainPct;
+    if (windowSec == null || minGain == null || !(windowSec > 0) || !(minGain > 0)) return null;
+    if (this.deps.now().getTime() - openedAtMs < windowSec * 1000) return null;
+    const peak = position.peakPriceSol ?? position.lastMarkPriceSol;
+    if (!(peak > 0) || !(position.entryPriceSol > 0)) return null;
+    const gain = ((peak / position.entryPriceSol) - 1) * 100;
+    if (gain + 1e-9 >= minGain) return null;
+    return { signal: "no_socials_time_stop", fraction: FULL_EXIT_FRACTION };
   }
 
   async panicSell(): Promise<void> {
@@ -581,7 +608,7 @@ export class SniperBot {
         if (!current) return;
         const before = current.tokenAmount;
         const requested = portion >= 0.999 ? before : before * portion;
-        const stopLike = isEmergencyExit(reason) || reason === "early_no_momentum" || reason === "profit_lock";
+        const stopLike = isEmergencyExit(reason) || reason === "early_no_momentum" || reason === "profit_lock" || reason === "no_socials_time_stop";
         const execution = stopLike
           ? quote > 0
             ? quote
@@ -639,6 +666,7 @@ export class SniperBot {
           costSol: fill.status === "filled" ? costAllocated : current.costSol,
           triggerPriceSol: quote,
           bundle: "jito",
+          ...(current.noSocials ? { noSocials: true } : {}),
         });
         if (fill.status === "filled") {
           this.notePaperCash(fill.cashflowSol);
@@ -865,6 +893,7 @@ export class SniperBot {
       rugs: this.rugChecks(launch),
       socials: this.socialCheck(launch, startedAtMs),
       earlyTried: false,
+      earlyDeferred: false,
     };
     this.watched.set(launch.mint, watch);
     const minMs = this.deps.config.entryWatchMinSec * 1000;
@@ -883,17 +912,25 @@ export class SniperBot {
         const elapsed = now - startedAtMs;
         const earlyMs = this.deps.config.entryEarlySec != null ? this.deps.config.entryEarlySec * 1000 : null;
         if (earlyMs != null && !watch.earlyTried && elapsed >= earlyMs && elapsed < maxMs) {
-          watch.earlyTried = true;
           const rug = await this.rugReady(watch.rugs);
           const social = await this.rugReady(watch.socials);
-          if (rug?.ok && social?.ok) {
-            const verdict = evaluateEntry(
-              this.entrySample(watch, now, this.deps.config.entryEarlyMinNetBuySol ?? undefined),
-            );
-            if (verdict.ok) {
-              this.watched.delete(launch.mint);
-              await this.buyAtLaunch(launch, true, "early");
-              return;
+          const lane = this.socialLane(social, startedAtMs, now);
+          if (lane === "pending") {
+            watch.earlyDeferred = true;
+          } else if (lane === "no_socials" && rug == null) {
+            // Rug checks are still running. Try the early pass again on the next tick.
+          } else {
+            watch.earlyTried = true;
+            const earlyOk = lane === "no_socials" || (lane === "ok" && !watch.earlyDeferred);
+            if (earlyOk && rug?.ok) {
+              const verdict = evaluateEntry(
+                this.entrySample(watch, now, this.deps.config.entryEarlyMinNetBuySol ?? undefined),
+              );
+              if (verdict.ok) {
+                this.watched.delete(launch.mint);
+                await this.buyAtLaunch(launch, true, "early", lane === "no_socials");
+                return;
+              }
             }
           }
         }
@@ -904,14 +941,20 @@ export class SniperBot {
             return;
           }
           const social = await this.rugReady(watch.socials);
-          if (social && !social.ok) {
-            this.skip(launch, social.reason ?? "metadata_unavailable");
+          const lane = this.socialLane(social, startedAtMs, now);
+          if (lane === "reject") {
+            this.skip(launch, social?.reason ?? "metadata_unavailable");
             return;
           }
           const verdict = evaluateEntry(this.entrySample(watch, now));
-          if (verdict.ok && rug?.ok && social?.ok) {
+          if (verdict.ok && rug?.ok && (lane === "ok" || lane === "no_socials")) {
             this.watched.delete(launch.mint);
-            await this.buyAtLaunch(launch, true, this.deps.config.entryEarlySec != null ? "full" : undefined);
+            await this.buyAtLaunch(
+              launch,
+              true,
+              this.deps.config.entryEarlySec != null ? "full" : undefined,
+              lane === "no_socials",
+            );
             return;
           }
         }
@@ -922,11 +965,22 @@ export class SniperBot {
             return;
           }
           const social = await watch.socials;
-          if (!social.ok) {
+          const lane = this.socialLane(social, startedAtMs, this.deps.now().getTime());
+          if (lane === "no_socials") {
+            const verdict = evaluateEntry(this.entrySample(watch, this.deps.now().getTime()));
+            if (verdict.ok) {
+              this.watched.delete(launch.mint);
+              await this.buyAtLaunch(launch, true, this.deps.config.entryEarlySec != null ? "full" : undefined, true);
+              return;
+            }
+            this.skip(launch, verdict.reason);
+            return;
+          }
+          if (lane !== "ok") {
             this.skip(launch, social.reason ?? "metadata_unavailable");
             return;
           }
-          const verdict = evaluateEntry(this.entrySample(watch, now));
+          const verdict = evaluateEntry(this.entrySample(watch, this.deps.now().getTime()));
           this.skip(launch, verdict.ok ? "entry_timeout" : verdict.reason);
           return;
         }
@@ -963,6 +1017,30 @@ export class SniperBot {
       if (!history.ok) return { ok: false, reason: history.reason ?? "creator-history-unavailable" };
       return { ok: true, reason: "" };
     });
+  }
+
+  private allowNoSocialsEntry(): boolean {
+    return this.deps.config.allowNoSocialsEntry && this.deps.config.requireSocials;
+  }
+
+  /**
+   * `ok` keeps the normal socials path. `no_socials` is the fast lane.
+   * `pending` means the metadata result is not final yet. `reject` skips.
+   */
+  private socialLane(
+    social: SocialDecision | null,
+    startedAtMs: number,
+    nowMs: number,
+  ): "pending" | "ok" | "no_socials" | "reject" {
+    if (!this.deps.config.requireSocials) return "ok";
+    const deadlinePassed = nowMs >= this.socialDeadline(startedAtMs);
+    if (!social) return this.allowNoSocialsEntry() && deadlinePassed ? "no_socials" : "pending";
+    if (social.ok) return "ok";
+    if (!this.allowNoSocialsEntry()) return "reject";
+    if (social.reason === "no_socials") return "no_socials";
+    if (social.reason === "metadata_unavailable" && deadlinePassed) return "no_socials";
+    if (social.reason === "metadata_unavailable") return "pending";
+    return "reject";
   }
 
   /** Retry budget for this watch. Ends a margin before the entry decision. */

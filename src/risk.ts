@@ -9,7 +9,8 @@ export type ExitSignal =
   | "dev_sell"
   | "fast_drop"
   | "early_no_momentum"
-  | "profit_lock";
+  | "profit_lock"
+  | "no_socials_time_stop";
 
 export interface ExitPlan {
   signal: ExitSignal;
