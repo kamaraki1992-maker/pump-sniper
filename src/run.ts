@@ -4,16 +4,24 @@ import bs58 from "bs58";
 import { BoughtMints } from "./bought.js";
 import { SniperBot } from "./bot.js";
 import { fetchCurveReserves, RpcCurveWatch } from "./curve-watch.js";
-import { ConfigError, formatTrailTiers, loadConfig, type AppConfig } from "./config.js";
+import { ConfigError, loadConfig, type AppConfig } from "./config.js";
+import { cuLimitFromConsumed } from "./compute.js";
 import { PaperExecutor } from "./executor-paper.js";
+import { PaperBalance } from "./paper-balance.js";
 import { createLivePorts, LiveExecutor } from "./executor-live.js";
+import { PriorityFeeEstimator } from "./priority-fee.js";
+import { RpcHolderCheck } from "./holders.js";
+import { installProcessGuards } from "./guards.js";
 import { RpcCreatorHistory } from "./history.js";
+import { createRpcFetch, createRpcStats, startRpcPressureLog } from "./rpc-limit.js";
 import { Logger } from "./logger.js";
+import { MetadataSocials } from "./socials.js";
 import { PositionBook } from "./positions.js";
-import { installProcessRedaction, rpcApiKey } from "./redact.js";
+import { installProcessRedaction, rpcApiKey, rpcHost } from "./redact.js";
 import { TradeLog } from "./report.js";
 import { SolPriceFeed } from "./sol-price.js";
 import { createRpcSafetyCheck } from "./safety.js";
+import { HeliusFeed } from "./helius-feed.js";
 import { PumpDevStream } from "./stream.js";
 import type { MarketEvent } from "./types.js";
 import { YellowstoneStream } from "./yellowstone.js";
@@ -34,6 +42,15 @@ export interface Runtime {
   sol: SolPriceFeed;
   executor: Executor;
   subscription: { stream: LiveStream | null };
+  stopRpcPressure: () => void;
+}
+
+/** Optional ceiling. Absent or invalid keeps the tier's own subscription limit. */
+export function pumpDevMaxSubscriptions(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) return undefined;
+  return parsed;
 }
 
 export function readSecrets(): string[] {
@@ -44,6 +61,14 @@ export function readSecrets(): string[] {
   if (grpcToken && grpcToken.length >= 8) secrets.push(grpcToken);
   const rpcKey = rpcApiKey(process.env.RPC_WS_URL?.trim() ?? "");
   if (rpcKey && rpcKey.length >= 8) secrets.push(rpcKey);
+  const rugKey = rpcApiKey(process.env.RUG_CHECK_RPC_URL?.trim() ?? "");
+  if (rugKey && rugKey.length >= 8) secrets.push(rugKey);
+  const pumpDevKey = process.env.PUMPDEV_API_KEY?.trim();
+  if (pumpDevKey && pumpDevKey.length >= 8) secrets.push(pumpDevKey);
+  const portalKey = process.env.PUMPPORTAL_API_KEY?.trim();
+  if (portalKey && portalKey.length >= 8) secrets.push(portalKey);
+  const wsKey = rpcApiKey(process.env.WS_URL?.trim() ?? "");
+  if (wsKey && wsKey.length >= 8) secrets.push(wsKey);
   return secrets;
 }
 
@@ -64,7 +89,17 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
   const trades = new TradeLog(config.tradesPath, secrets);
   const sol = new SolPriceFeed(config.solPriceUrl);
   await sol.refresh();
-  const history = new RpcCreatorHistory(config, log);
+  const rpcStats = createRpcStats();
+  const rpcFetch = createRpcFetch({
+    rps: config.heliusRps,
+    cacheTtlMs: config.rpcCacheTtlMs,
+    stats: rpcStats,
+  });
+  const stopPressureLog = startRpcPressureLog(log, rpcStats);
+  const history = new RpcCreatorHistory(config, log, Date.now, rpcFetch);
+  const holders = new RpcHolderCheck(config.rugCheckRpcUrl, config.maxTop10Pct, rpcFetch, log, {
+    timeoutMs: config.rugCheckTimeoutMs,
+  });
   const botRef: {
     onCurveReserves: (
       mint: string,
@@ -80,20 +115,37 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
         botRef.onCurveReserves(mint, realSol, reserves, complete),
       )
     : undefined;
+  const priorityFees = new PriorityFeeEstimator(
+    config.rpcUrl,
+    config.priorityFeeSol,
+    config.priorityFeeMaxLamports,
+    config.priorityFeeCacheMs,
+    rpcFetch,
+  );
+  const quotePriorityFee = (accountKeys: string[], cuLimit: number) =>
+    priorityFees.quote(accountKeys, cuLimit).then((quote) => quote.sol);
   let executor: Executor;
   let walletBalanceSol: (() => Promise<number>) | undefined;
   if (config.mode === "live") {
     const keypair = loadLiveKeypair();
     log.info("live mode", { pubkey: keypair.publicKey.toBase58() });
-    const connection = new Connection(config.rpcUrl, "confirmed");
-    executor = new LiveExecutor(createLivePorts(config, keypair, connection));
+    const connection = new Connection(config.rpcUrl, {
+      commitment: "confirmed",
+      fetch: rpcFetch,
+      disableRetryOnRateLimit: true,
+    });
+    const ports = createLivePorts(config, keypair, connection);
+    ports.priorityFee = quotePriorityFee;
+    executor = new LiveExecutor(ports);
     walletBalanceSol = async () => {
       const lamports = await connection.getBalance(keypair.publicKey, "processed");
       return lamports / 1e9;
     };
   } else {
     log.info("paper mode");
-    executor = new PaperExecutor(config.paper);
+    executor = new PaperExecutor(config.paper, (order) =>
+      quotePriorityFee(order.mint ? [order.mint] : [], cuLimitFromConsumed(null)),
+    );
   }
   const subscription: { stream: LiveStream | null } = { stream: null };
   const bot = new SniperBot({
@@ -116,16 +168,44 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     unsubscribeMint: (mint) => subscription.stream?.unsubscribeTrades([mint]),
     bought: new BoughtMints(`${config.dataDir}/bought-mints.json`),
     ...(walletBalanceSol ? { walletBalanceSol } : {}),
-    safetyCheck: createRpcSafetyCheck(config),
+    ...(config.mode === "paper" && config.buySizePctOfBalance != null && config.paperStartBalanceSol != null
+      ? { paperBalance: new PaperBalance(`${config.dataDir}/paper-balance.json`, config.paperStartBalanceSol) }
+      : {}),
+    holders,
+    metadataSocials: new MetadataSocials({
+      attemptTimeoutMs: config.metadataAttemptTimeoutMs,
+      retry: config.metadataRetry,
+      mode: config.requireSocialsMode,
+    }),
+    safetyCheck: createRpcSafetyCheck(config, rpcFetch),
     ...(curveWatch ? { curveWatch } : {}),
-    readCurveReserves: (mint) => fetchCurveReserves(config.rpcUrl, mint),
+    readCurveReserves: (mint) => fetchCurveReserves(config.rpcUrl, mint, rpcFetch),
   });
   if (curveWatch) {
     botRef.onCurveReserves = (mint, realSol, reserves, complete) =>
       bot.onCurveReserves(mint, realSol, reserves, complete);
     curveWatch.start();
   }
-  return { config, log, bot, positions, sol, executor, subscription };
+  return { config, log, bot, positions, sol, executor, subscription, stopRpcPressure: stopPressureLog };
+}
+
+function openDataFeed(runtime: Runtime): LiveStream {
+  if (runtime.config.feed === "pumpdev") {
+    return new PumpDevStream(runtime.config.wsUrl, runtime.log, undefined, undefined, {
+      feed: "pumpdev",
+      apiKey: process.env.PUMPDEV_API_KEY?.trim() || null,
+      maxSubscriptions: pumpDevMaxSubscriptions(process.env.PUMPDEV_MAX_SUBSCRIPTIONS),
+    });
+  }
+  if (runtime.config.feed === "pumpportal") {
+    return new PumpDevStream(runtime.config.dataWsUrl, runtime.log, undefined, undefined, {
+      feed: "pumpportal",
+      apiKey: process.env.PUMPPORTAL_API_KEY?.trim() || null,
+    });
+  }
+  return new HeliusFeed(runtime.config.rpcWsUrl ?? "", runtime.log, {
+    stallMs: runtime.config.feedStallSec * 1000,
+  });
 }
 
 export function attachStream(runtime: Runtime): LiveStream {
@@ -133,21 +213,24 @@ export function attachStream(runtime: Runtime): LiveStream {
   const stream: LiveStream =
     runtime.config.grpcUrl && grpcToken
       ? new YellowstoneStream(runtime.config.grpcUrl, grpcToken, runtime.log)
-      : new PumpDevStream(runtime.config.wsUrl, runtime.log);
+      : openDataFeed(runtime);
   if (!(stream instanceof YellowstoneStream)) {
-    runtime.log.info("stream", { source: "pumpdev-ws" });
+    runtime.log.info("stream", { source: runtime.config.feed, feed: runtime.config.feed });
   }
   runtime.subscription.stream = stream;
+  const fail = (error: unknown) => {
+    runtime.log.error("event failed", { error: error instanceof Error ? error.message : "event-error" });
+  };
   stream.start((event) => {
     if (event.kind === "launch") {
-      void runtime.bot.onLaunch(event);
+      void runtime.bot.onLaunch(event).catch(fail);
       return;
     }
     if (event.kind === "graduation") {
-      void runtime.bot.onGraduation(event);
+      void runtime.bot.onGraduation(event).catch(fail);
       return;
     }
-    void runtime.bot.onTrade(event);
+    void runtime.bot.onTrade(event).catch(fail);
   });
   for (const position of runtime.positions.list()) stream.subscribeTrades([position.mint]);
   return stream;
@@ -156,21 +239,33 @@ export function attachStream(runtime: Runtime): LiveStream {
 export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promise<void> {
   const runtime = await buildRuntime();
   const { config, log, bot, positions, sol } = runtime;
+  const removeGuards = installProcessGuards(log);
+  const balanceSol = await bot.reportedBalanceSol();
+  log.info("rug check rpc", { host: rpcHost(config.rugCheckRpcUrl) });
   log.info("sniper start", {
     mode: config.mode,
+    ...(balanceSol != null ? { balanceSol } : {}),
     buySizeMinUsd: config.buySizeMinUsd,
     buySizeMaxUsd: config.buySizeMaxUsd,
-    maxSlippagePct: config.maxSlippagePct,
+    buySlippagePct: config.buySlippagePct,
+    sellSlippagePct: config.sellSlippagePct,
     jitoTipSol: config.jitoTipSol,
-    takeProfitPct: config.takeProfitPct,
     stopLossPct: config.stopLossPct,
+    trailActivatePct: config.trailActivatePct,
+    trailDistancePct: config.trailDistancePct,
+    tp1Pct: config.tp1Pct,
+    tp1SellFraction: config.tp1SellFraction,
     maxOpenPositions: config.maxOpenPositions,
     maxHoldMinutes: config.maxHoldMinutes,
     volumeStallSec: config.volumeStallSec,
     volumeStallGraceSec: config.volumeStallGraceSec,
-    trailTiers: formatTrailTiers(config.trailTiers),
-    takeProfitDisabled: config.takeProfitPct === 0,
   });
+  if (config.ignoredTrailTiers) {
+    log.info("TRAIL_TIERS is ignored; the trail uses TRAIL_ACTIVATE_PCT and TRAIL_DISTANCE_PCT");
+  }
+  if (config.ignoredTakeProfit) {
+    log.info("TAKE_PROFIT_PCT is ignored; the partial take profit uses TP1_PCT");
+  }
   const stream = attachStream(runtime);
   let stopped = false;
   const shutdown = (why: string) => {
@@ -179,6 +274,8 @@ export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promis
     bot.stop();
     log.info("shutdown", { why });
     stream.stop();
+    runtime.stopRpcPressure();
+    removeGuards();
     positions.save(sol.price(), config.paper, new Date().toISOString());
     process.exit(0);
   };

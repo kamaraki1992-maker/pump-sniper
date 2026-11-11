@@ -42,7 +42,17 @@ export function priceFromMarketCap(marketCapSol: number): number | null {
 }
 
 /** Initial pump.fun virtual reserves. k stays on this product for the life of the curve. */
-export const PUMP_CURVE_K = 30 * 1_073_000_000;
+export const INITIAL_VIRTUAL_SOL = 30;
+export const INITIAL_VIRTUAL_TOKENS = 1_073_000_000;
+export const PUMP_CURVE_K = INITIAL_VIRTUAL_SOL * INITIAL_VIRTUAL_TOKENS;
+/** Spot before any buy: 30 / 1_073_000_000. */
+export const INITIAL_CURVE_SPOT = INITIAL_VIRTUAL_SOL / INITIAL_VIRTUAL_TOKENS;
+
+/** True when `price` is the untouched initial curve, within a relative 1e-6. */
+export function isInitialCurvePrice(price: number): boolean {
+  if (!(price > 0) || !Number.isFinite(price)) return false;
+  return Math.abs(price - INITIAL_CURVE_SPOT) / INITIAL_CURVE_SPOT <= 1e-6;
+}
 /** One unconfirmed update may not move the mark by more than this multiple. */
 export const MARK_JUMP_LIMIT = 5;
 /** First seconds after entry: a print this large is still a real pump. 54x launch prints stay out. */
@@ -224,6 +234,32 @@ export function eventPrice(record: Record<string, unknown>): {
   return { priceSol: priceFromReserves(vSol, vTok), marketCapSol };
 }
 
+const NON_PUMP_POOLS = new Set(["raydium", "bonk", "moonshot", "meteora", "orca"]);
+const NAMED_POOLS = new Set(["pump", "pumpswap", "pump-amm", ...NON_PUMP_POOLS]);
+
+/**
+ * PumpPortal's free data socket. Reserves are SOL and display tokens, the same
+ * units `virtualSol` / `virtualTokens` already produce from PumpDev's raw fields.
+ * `pool: "raydium"` and other non-pump venues are dropped. `pool: "pump"` stays
+ * on the bonding curve.
+ */
+export function parsePumpPortalMessage(raw: unknown): MarketEvent | null {
+  const record = asRecord(raw);
+  if (!record || typeof record.type === "string") return null;
+  const poolName = asString(record.pool)?.toLowerCase() ?? "";
+  if (poolName && NON_PUMP_POOLS.has(poolName)) return null;
+  const adjusted: Record<string, unknown> = { ...record };
+  const named = poolName !== "" && NAMED_POOLS.has(poolName);
+  const amm = poolName === "pumpswap" || poolName === "pump-amm";
+  if (record.txType === "migrate") {
+    if (poolName && poolName !== "pump" && !amm && named) return null;
+    adjusted.txType = "create_pool";
+  }
+  if (amm || (!named && poolName !== "")) adjusted.source = adjusted.source ?? "pumpswap";
+  if (named) delete adjusted.pool;
+  return parsePumpDevMessage(adjusted);
+}
+
 export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
   const record = asRecord(raw);
   if (!record) return null;
@@ -253,6 +289,9 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
       vSolSol,
       vTokens,
       bondingCurveKey: asString(record.bondingCurveKey),
+      metadataUri: asString(record.uri),
+      slot: asNumber(record.slot),
+      solAmount: asNumber(record.solAmount),
     };
     return launch;
   }
@@ -283,6 +322,8 @@ export function parsePumpDevMessage(raw: unknown): MarketEvent | null {
       vSolSol,
       vTokens,
       ...(pumpswap ? { venue: "pumpswap" as const, poolBaseTokens: pool.baseTokens, poolQuoteSol: pool.quoteSol } : {}),
+      slot: asNumber(record.slot),
+      solAmount: asNumber(record.solAmount),
     };
     return trade;
   }

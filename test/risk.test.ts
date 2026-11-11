@@ -1,103 +1,104 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { decideExit, exitSignal, FULL_EXIT_FRACTION, nextTrailFloor, type TrailTier } from "../src/risk.js";
+import { decideExit, FULL_EXIT_FRACTION, profitLockPrice, ratchetStop, stopLossPrice, trailStopPrice, type ExitPlan } from "../src/risk.js";
 
-const tiers: TrailTier[] = [
-  { activatePct: 15, floorPct: 5 },
-  { activatePct: 30, floorPct: 15 },
-  { activatePct: 50, floorPct: 35 },
-  { activatePct: 100, floorPct: 75 },
-];
+const held = {
+  entryPrice: 1,
+  stopLossPct: 20,
+  openedAtMs: 0,
+  nowMs: 1_000,
+  maxHoldMs: 10 * 60_000,
+  tp1Pct: 100,
+  tp1SellFraction: 0.5,
+  tp1Taken: false,
+};
 
-test("take profit sells 100% at +50% and not before", () => {
+function signal(plan: ExitPlan | null): string | null {
+  return plan?.signal ?? null;
+}
+
+test("stop loss sells 100% at -20% from the entry fill and not before", () => {
   assert.equal(FULL_EXIT_FRACTION, 1);
-  assert.equal(exitSignal(1, 1.5, 50, 15), "tp");
-  assert.equal(exitSignal(1, 2, 50, 15), "tp");
-  assert.equal(exitSignal(1, 1.49, 50, 15), null);
-});
-
-test("stop loss sells 100% at -15% and not before", () => {
-  assert.equal(exitSignal(1, 0.85, 50, 15), "sl");
-  assert.equal(exitSignal(1, 0.5, 50, 15), "sl");
-  assert.equal(exitSignal(1, 0.86, 50, 15), null);
+  assert.equal(stopLossPrice(1, 20), 0.8);
+  assert.equal(signal(decideExit({ ...held, markPrice: 0.8 })), "sl");
+  assert.equal(decideExit({ ...held, markPrice: 0.8 })?.fraction, 1);
+  assert.equal(signal(decideExit({ ...held, markPrice: 0.5 })), "sl");
+  assert.equal(decideExit({ ...held, markPrice: 0.81 }), null);
 });
 
 test("take profit and stop loss outrank a hold that has already expired", () => {
   const expired = { openedAtMs: 0, nowMs: 10 * 60_000, maxHoldMs: 10 * 60_000 };
-  assert.equal(decideExit({ entryPrice: 1, markPrice: 1.5, takeProfitPct: 50, stopLossPct: 15, ...expired }), "tp");
-  assert.equal(decideExit({ entryPrice: 1, markPrice: 0.85, takeProfitPct: 50, stopLossPct: 15, ...expired }), "sl");
-  assert.equal(decideExit({ entryPrice: 1, markPrice: 1, takeProfitPct: 50, stopLossPct: 15, ...expired }), "timeout");
+  assert.equal(signal(decideExit({ ...held, markPrice: 2, ...expired })), "tp");
+  assert.equal(decideExit({ ...held, markPrice: 2, ...expired })?.fraction, 0.5);
+  assert.equal(signal(decideExit({ ...held, markPrice: 0.8, ...expired })), "sl");
+  assert.equal(signal(decideExit({ ...held, markPrice: 1, ...expired })), "timeout");
   assert.equal(
-    decideExit({ entryPrice: 1, markPrice: 1, takeProfitPct: 50, stopLossPct: 15, openedAtMs: 0, nowMs: 10 * 60_000 - 1, maxHoldMs: 10 * 60_000 }),
+    decideExit({ ...held, markPrice: 1, openedAtMs: 0, nowMs: 10 * 60_000 - 1, maxHoldMs: 10 * 60_000 }),
     null,
   );
 });
 
-test("take profit at 0 is disabled and does not sell a flat or higher mark", () => {
-  assert.equal(exitSignal(1, 1, 0, 15), null);
-  assert.equal(exitSignal(1, 1.5, 0, 15), null);
-  assert.equal(exitSignal(1, 2, 0, 15), null);
-  assert.equal(exitSignal(1, 0.85, 0, 15), "sl");
+test("break-even is the floor and a 20% trail ratchets above it after +50%", () => {
+  assert.equal(trailStopPrice(1, 1.49, 50, 20), null);
+  const armed = trailStopPrice(1, 1.5, 50, 20);
+  assert.ok(armed != null && Math.abs(armed - 1.2) < 1e-12);
+  assert.ok(armed >= 1);
+  assert.ok(Math.abs((trailStopPrice(1, 2, 50, 20) ?? 0) - 1.6) < 1e-12);
+  assert.equal(trailStopPrice(1, 1.5, 50, 80), 1);
+  assert.equal(ratchetStop(1.6, trailStopPrice(1, 1.7, 50, 20)), 1.6);
+  const higher = ratchetStop(1.6, trailStopPrice(1, 3, 50, 20));
+  assert.ok(higher != null && Math.abs(higher - 2.4) < 1e-12);
 });
 
-test("each profit-lock tier ratchets the floor and never lowers it", () => {
-  assert.equal(nextTrailFloor(1, 1.14, tiers, null), null);
-  assert.equal(nextTrailFloor(1, 1.15, tiers, null), 5);
-  assert.equal(nextTrailFloor(1, 1.29, tiers, null), 5);
-  assert.equal(nextTrailFloor(1, 1.3, tiers, null), 15);
-  assert.equal(nextTrailFloor(1, 1.5, tiers, null), 35);
-  assert.equal(nextTrailFloor(1, 2, tiers, null), 75);
-  assert.equal(nextTrailFloor(1, 1.4, tiers, 75), 75);
-  assert.equal(nextTrailFloor(1, 1.1, tiers, 35), 35);
-});
-
-test("a locked floor sells at entry times that floor, and take profit still wins when it is on", () => {
-  const held = {
-    entryPrice: 1,
-    takeProfitPct: 0,
-    stopLossPct: 15,
-    openedAtMs: 0,
-    nowMs: 1_000,
-    maxHoldMs: 10 * 60_000,
-  };
-  assert.equal(decideExit({ ...held, markPrice: 1.3, trailFloorPct: 15 }), null);
-  assert.equal(decideExit({ ...held, markPrice: 1.05, trailFloorPct: 5 }), "trailing_stop");
-  assert.equal(decideExit({ ...held, markPrice: 1.06, trailFloorPct: 5 }), null);
-  assert.equal(decideExit({ ...held, markPrice: 1.15, trailFloorPct: 15 }), "trailing_stop");
-  assert.equal(decideExit({ ...held, markPrice: 1.5, trailFloorPct: 35 }), null);
-  assert.equal(decideExit({ ...held, markPrice: 1.35, trailFloorPct: 35 }), "trailing_stop");
-  assert.equal(decideExit({ ...held, markPrice: 2, trailFloorPct: 75 }), null);
-  assert.equal(decideExit({ ...held, markPrice: 1.75, trailFloorPct: 75 }), "trailing_stop");
-  assert.equal(decideExit({ ...held, markPrice: 1.4, trailFloorPct: 75 }), "trailing_stop");
-  assert.equal(decideExit({ ...held, markPrice: 0.85, trailFloorPct: null }), "sl");
+test("the armed trail sells on a 20% giveback and the 2x partial does not repeat", () => {
+  const stop = trailStopPrice(1, 1.5, 50, 20);
+  assert.equal(signal(decideExit({ ...held, markPrice: 1.2, trailStopPriceSol: stop })), "trailing_stop");
+  assert.equal(decideExit({ ...held, markPrice: 1.21, trailStopPriceSol: stop }), null);
+  assert.equal(decideExit({ ...held, markPrice: 1, trailStopPriceSol: null }), null);
+  const atTwo = decideExit({ ...held, markPrice: 2, trailStopPriceSol: 1.6 });
+  assert.equal(atTwo?.signal, "tp");
+  assert.equal(atTwo?.fraction, 0.5);
+  assert.equal(decideExit({ ...held, markPrice: 2, trailStopPriceSol: 1.6, tp1Taken: true }), null);
   assert.equal(
-    decideExit({ ...held, markPrice: 1.5, trailFloorPct: 75, takeProfitPct: 50 }),
-    "tp",
+    signal(decideExit({ ...held, markPrice: 1.6, trailStopPriceSol: 1.6, tp1Taken: true })),
+    "trailing_stop",
   );
 });
 
 test("volume stall waits out the grace, then the silence window", () => {
   const quiet = {
-    entryPrice: 1,
+    ...held,
     markPrice: 1,
-    takeProfitPct: 0,
-    stopLossPct: 15,
-    openedAtMs: 0,
-    maxHoldMs: 10 * 60_000,
     lastTradeAtMs: 0,
     volumeStallMs: 45_000,
     volumeStallGraceMs: 90_000,
   };
   assert.equal(decideExit({ ...quiet, nowMs: 45_000 }), null);
   assert.equal(decideExit({ ...quiet, nowMs: 134_000 }), null);
-  assert.equal(decideExit({ ...quiet, nowMs: 135_000 }), "volume_stall");
-  assert.equal(decideExit({ ...quiet, lastTradeAtMs: 30_000, nowMs: 135_000 }), "volume_stall");
+  assert.equal(signal(decideExit({ ...quiet, nowMs: 135_000 })), "volume_stall");
+  assert.equal(signal(decideExit({ ...quiet, lastTradeAtMs: 30_000, nowMs: 135_000 })), "volume_stall");
   assert.equal(decideExit({ ...quiet, lastTradeAtMs: 100_000, nowMs: 144_000 }), null);
-  assert.equal(decideExit({ ...quiet, lastTradeAtMs: 100_000, nowMs: 145_000 }), "volume_stall");
-  assert.equal(decideExit({ ...quiet, markPrice: 0.85, nowMs: 10_000 }), "sl");
+  assert.equal(signal(decideExit({ ...quiet, lastTradeAtMs: 100_000, nowMs: 145_000 })), "volume_stall");
+  assert.equal(signal(decideExit({ ...quiet, markPrice: 0.8, nowMs: 10_000 })), "sl");
+});
+
+test("profit lock arms at exactly +20% and the higher trail floor wins", () => {
+  assert.equal(profitLockPrice(1, 1.2 - 1e-6, 20, 10), null);
+  const armed = profitLockPrice(1, 1.2, 20, 10);
+  assert.ok(armed != null && Math.abs(armed - 1.1) < 1e-12);
+  assert.equal(ratchetStop(armed, profitLockPrice(1, 1.15, 20, 10)), armed);
+  assert.equal(signal(decideExit({ ...held, markPrice: 1.1, profitLockPriceSol: armed })), "profit_lock");
+  assert.equal(decideExit({ ...held, markPrice: 1.11, profitLockPriceSol: armed }), null);
+  assert.equal(signal(decideExit({ ...held, markPrice: 0.8 })), "sl");
+  const trail = trailStopPrice(1, 1.6, 50, 20);
+  assert.ok(trail != null && trail > 1.1);
+  assert.equal(
+    signal(decideExit({ ...held, markPrice: trail ?? 0, trailStopPriceSol: trail, profitLockPriceSol: armed })),
+    "trailing_stop",
+  );
 });
 
 test("a missing price does not exit", () => {
-  assert.equal(exitSignal(0, 1, 50, 15), null);
-  assert.equal(exitSignal(1, 0, 50, 15), null);
+  assert.equal(decideExit({ ...held, entryPrice: 0, markPrice: 1 }), null);
+  assert.equal(decideExit({ ...held, markPrice: 0 }), null);
 });

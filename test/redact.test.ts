@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 import { Logger } from "../src/logger.js";
-import { redact } from "../src/redact.js";
+import { redact, redactRpcUrl } from "../src/redact.js";
 import { TradeLog } from "../src/report.js";
 import type { TradeRecord } from "../src/types.js";
 
@@ -56,4 +56,14 @@ test("the private key is removed from logs, errors, and the trade report", () =>
   const stored = log.readAll();
   assert.equal(JSON.stringify(stored).includes(secret), false);
   assert.match(stored[0]?.error ?? "", /\[REDACTED\]/);
+});
+
+test("key query values are stripped the same way as api-key", () => {
+  const url = "wss://pumpdev.io/ws?key=pumpdev-test-key-value";
+  const cleaned = redactRpcUrl(`connect ${url}`);
+  assert.equal(cleaned.includes("pumpdev-test-key-value"), false);
+  assert.match(cleaned, /key=\[REDACTED\]/);
+  const rpc = redactRpcUrl("wss://mainnet.helius-rpc.com/?api-key=supersecretkey123");
+  assert.equal(rpc.includes("supersecretkey123"), false);
+  assert.match(rpc, /api-key=\[REDACTED\]/);
 });

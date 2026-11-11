@@ -17,15 +17,25 @@ function failed(order: OrderRequest, error: string): FillResult {
   };
 }
 
+function capped(model: PaperModel, order: OrderRequest): PaperModel {
+  const cap = order.slippagePct;
+  const slip = order.useQuotedSlippage || !(cap >= 0) || !Number.isFinite(cap) ? cap : Math.min(model.slippagePct, cap);
+  const tip = order.tipSol != null && order.tipSol >= 0 && Number.isFinite(order.tipSol) ? order.tipSol : model.jitoTipSol;
+  return { ...model, slippagePct: slip, jitoTipSol: tip };
+}
+
 /** Simulated fills. This executor never signs or broadcasts. */
 export class PaperExecutor implements Executor {
-  constructor(private readonly model: PaperModel) {}
+  constructor(
+    private readonly model: PaperModel,
+    private readonly feeSol?: (order: OrderRequest) => Promise<number>,
+  ) {}
 
   async buy(order: OrderRequest): Promise<FillResult> {
     if (!(order.quotePriceSol > 0) || !(order.sizeSol > 0)) {
       return failed(order, "no-price");
     }
-    const fill = paperBuy(order.quotePriceSol, order.sizeSol, this.model);
+    const fill = paperBuy(order.quotePriceSol, order.sizeSol, await this.priced(order));
     return {
       status: "filled",
       signature: "paper",
@@ -45,7 +55,7 @@ export class PaperExecutor implements Executor {
     if (!(order.quotePriceSol > 0) || !(tokens > 0)) {
       return failed(order, "no-price");
     }
-    const fill = paperSell(order.quotePriceSol, tokens, this.model);
+    const fill = paperSell(order.quotePriceSol, tokens, await this.priced(order));
     return {
       status: "filled",
       signature: "paper",
@@ -58,5 +68,17 @@ export class PaperExecutor implements Executor {
       cashflowSol: fill.proceedsSol,
       error: null,
     };
+  }
+
+  private async priced(order: OrderRequest): Promise<PaperModel> {
+    const base = capped(this.model, order);
+    if (!this.feeSol) return base;
+    try {
+      const sol = await this.feeSol(order);
+      if (!(sol >= 0) || !Number.isFinite(sol)) return base;
+      return { ...base, priorityFeeSol: sol };
+    } catch {
+      return base;
+    }
   }
 }

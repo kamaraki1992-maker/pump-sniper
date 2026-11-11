@@ -1,6 +1,7 @@
 import bs58 from "bs58";
 import { Logger } from "./logger.js";
 import { WSOL_MINT } from "./pricing.js";
+import { nextBackoffMs } from "./stream.js";
 import type { MarketEvent, MarketLaunch, MarketTrade } from "./types.js";
 
 export const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
@@ -81,6 +82,8 @@ export function signatureToBase58(signature: Uint8Array): string {
  */
 export class YellowstoneStream {
   private stopped = false;
+  private attempt = 0;
+  private timer: NodeJS.Timeout | null = null;
   private stream: { end: () => void; write: (req: unknown) => void } | null = null;
   private readonly mints = new Set<string>();
   private onEvent: (event: MarketEvent) => void = () => {};
@@ -107,8 +110,25 @@ export class YellowstoneStream {
 
   stop(): void {
     this.stopped = true;
-    this.stream?.end();
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    try {
+      this.stream?.end();
+    } catch {
+      // The socket is already gone.
+    }
     this.stream = null;
+  }
+
+  private schedule(): void {
+    if (this.stopped || this.timer) return;
+    const delay = nextBackoffMs(this.attempt);
+    this.attempt += 1;
+    this.log.info("grpc reconnect", { delayMs: delay });
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      void this.open();
+    }, delay);
   }
 
   private async open(): Promise<void> {
@@ -134,10 +154,19 @@ export class YellowstoneStream {
         return;
       }
       this.stream = stream;
+      this.attempt = 0;
       stream.on("error", (error: Error) => {
         this.log.info("grpc error", { error: error.message });
+        try {
+          stream.end();
+        } catch {
+          // Already closed.
+        }
+        if (this.stream === stream) this.stream = null;
+        this.schedule();
       });
       stream.on("data", (update: { transaction?: { transaction?: GeyserTx } }) => {
+        try {
         const tx = update.transaction?.transaction;
         if (!tx?.meta || tx.meta.logMessagesNone) return;
         const events = eventsFromGeyserLogs({
@@ -151,6 +180,11 @@ export class YellowstoneStream {
         for (const event of events) {
           if (event.kind === "trade" && !this.mints.has(event.mint)) continue;
           this.onEvent(event);
+        }
+        } catch (error) {
+          this.log.info("grpc message failed", {
+            error: error instanceof Error ? error.message : "grpc-message",
+          });
         }
       });
       stream.write({
@@ -178,6 +212,7 @@ export class YellowstoneStream {
       this.log.info("grpc unavailable", {
         error: error instanceof Error ? error.message : "grpc-error",
       });
+      this.schedule();
     }
   }
 }
