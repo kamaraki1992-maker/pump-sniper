@@ -309,6 +309,7 @@ export class SniperBot {
         realizedPnlSol: null,
         costSol: fill.status === "filled" ? fill.cashflowSol : null,
         confidence: confidence.score,
+        entryScore: confidence.score * 100,
         ...(noSocials ? { noSocials: true } : {}),
       });
       if (fill.status === "filled") this.notePaperCash(-fill.cashflowSol);
@@ -379,6 +380,7 @@ export class SniperBot {
         ...(orderSize.balanceSol != null ? { balanceSol: orderSize.balanceSol, pct: orderSize.pct } : {}),
         ...(entryStage ? { entryStage } : {}),
         ...(this.deps.config.allowNoSocialsEntry ? { noSocials } : {}),
+        entryScore: confidence.score * 100,
         jitoTipSol: fill.jitoTipSol,
         ...confidenceFields(confidence),
       });
@@ -1240,6 +1242,15 @@ export class SniperBot {
       sells: counts.sells,
       safetyOk: true,
     });
+    const entryScore = confidence.score * 100;
+    const minEntryScore = this.deps.config.minEntryScore;
+    if (minEntryScore != null && entryScore < minEntryScore) {
+      return {
+        ok: false,
+        reason: "entry_low_score",
+        extra: { score: entryScore, hold: confidence.hold, flow: confidence.flow, raw: confidence.raw },
+      };
+    }
     const pct = this.deps.config.buySizePctOfBalance;
     if (pct != null) {
       const parts = await this.balanceParts();

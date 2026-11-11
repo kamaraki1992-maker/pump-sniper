@@ -127,6 +127,8 @@ export interface TradeRecord {
   sizeUsd?: number | null;
   /** Curved confidence score used to size a buy. Null on sells. */
   confidence?: number | null;
+  /** Same score on a 0–100 scale. Null on sells. */
+  entryScore?: number | null;
   price: number;
   feesSol: number;
   jitoTipSol: number;

@@ -76,6 +76,8 @@ export interface AppConfig {
   /** When set with `entryEarlyMinNetBuySol`, an earlier pass can buy before the watch ends. */
   entryEarlySec: number | null;
   entryEarlyMinNetBuySol: number | null;
+  /** 0–100 confidence gate. Unset means the gate is off. */
+  minEntryScore: number | null;
   entryMinBuyRatio: number;
   entryMaxRunupPct: number;
   entryMaxWatched: number;
@@ -268,6 +270,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const entryMinNetBuySol = num(env.ENTRY_MIN_NET_BUY_SOL, 1, "ENTRY_MIN_NET_BUY_SOL");
   const entryEarlySec = optionalNum(env.ENTRY_EARLY_SEC, "ENTRY_EARLY_SEC");
   const entryEarlyMinNetBuySol = optionalNum(env.ENTRY_EARLY_MIN_NET_BUY_SOL, "ENTRY_EARLY_MIN_NET_BUY_SOL");
+  const minEntryScore = optionalNum(env.MIN_ENTRY_SCORE, "MIN_ENTRY_SCORE");
   const entryMinBuyRatio = num(env.ENTRY_MIN_BUY_RATIO, 0.6, "ENTRY_MIN_BUY_RATIO");
   const entryMaxRunupPct = num(env.ENTRY_MAX_RUNUP_PCT, 60, "ENTRY_MAX_RUNUP_PCT");
   const entryMaxWatched = num(env.ENTRY_MAX_WATCHED, 30, "ENTRY_MAX_WATCHED");
@@ -407,6 +410,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     if (!(entryEarlyMinNetBuySol > 0)) {
       throw new ConfigError("ENTRY_EARLY_MIN_NET_BUY_SOL must be positive");
     }
+  }
+  if (minEntryScore != null && (!(minEntryScore > 0) || minEntryScore > 100)) {
+    throw new ConfigError("MIN_ENTRY_SCORE must be greater than 0 and at most 100");
   }
   if (!(entryMaxRunupPct > 0)) {
     throw new ConfigError("ENTRY_MAX_RUNUP_PCT must be positive");
@@ -561,6 +567,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     entryMinNetBuySol,
     entryEarlySec,
     entryEarlyMinNetBuySol,
+    minEntryScore,
     entryMinBuyRatio,
     entryMaxRunupPct,
     entryMaxWatched,
