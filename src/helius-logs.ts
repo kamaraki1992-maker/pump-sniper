@@ -22,6 +22,15 @@ export const CREATE_EVENT_DISC = Buffer.from([27, 114, 169, 77, 222, 235, 99, 11
 export const TRADE_EVENT_DISC = Buffer.from([189, 219, 127, 211, 78, 230, 97, 238]);
 /** sha256("event:CompleteEvent")[0..8] */
 export const COMPLETE_EVENT_DISC = Buffer.from([95, 114, 97, 156, 212, 46, 152, 8]);
+/** sha256("event:CreatePoolEvent")[0..8] on the PumpSwap program. */
+export const PUMP_SWAP_CREATE_DISC = Buffer.from([177, 49, 12, 210, 160, 118, 167, 116]);
+/** sha256("event:BuyEvent")[0..8] */
+export const PUMP_SWAP_BUY_DISC = Buffer.from([103, 244, 82, 31, 44, 245, 119, 119]);
+/** sha256("event:SellEvent")[0..8] */
+export const PUMP_SWAP_SELL_DISC = Buffer.from([62, 47, 55, 10, 165, 3, 220, 42]);
+
+/** Pool address to base mint. Survives across notifications in one process. */
+const pumpSwapPools = new Map<string, { mint: string; quoteMint: string }>();
 
 const ZERO_PUBKEY = ZERO_KEY.toBase58();
 
@@ -54,6 +63,9 @@ interface TradeFields {
   vSolRaw: number;
   vTokenRaw: number;
   creator: string | null;
+  venue?: "pumpswap";
+  poolBaseTokens?: number | null;
+  poolQuoteSol?: number | null;
 }
 
 class Cursor {
@@ -176,6 +188,65 @@ export function decodeCreateEvent(data: Buffer): CreateFields | null {
   };
 }
 
+/**
+ * PumpSwap CreatePool, Buy, and Sell events. The buy/sell layout stores pool
+ * reserves at the same offset. The mint comes from a CreatePool seen earlier.
+ * A known discriminator that is too short to parse is a failure.
+ */
+export function decodePumpSwap(
+  data: Buffer,
+  pools: Map<string, { mint: string; quoteMint: string }>,
+): TradeFields | "fail" | null {
+  if (sameDisc(data, PUMP_SWAP_CREATE_DISC)) {
+    const cur = new Cursor(data, 8);
+    if (cur.i64() === null || cur.read(2) === null) return "fail";
+    if (!cur.pubkey()) return "fail";
+    const mint = cur.pubkey();
+    const quote = cur.pubkey();
+    if (!mint || !quote || cur.read(2) === null) return "fail";
+    if (cur.u64() === null || cur.u64() === null) return "fail";
+    const baseRaw = cur.u64();
+    const quoteRaw = cur.u64();
+    if (baseRaw === null || quoteRaw === null) return "fail";
+    for (let i = 0; i < 3; i += 1) if (cur.u64() === null) return "fail";
+    if (cur.read(1) === null) return "fail";
+    const pool = cur.pubkey();
+    if (!pool) return "fail";
+    pools.set(pool, { mint, quoteMint: quote });
+    return null;
+  }
+  const buy = sameDisc(data, PUMP_SWAP_BUY_DISC);
+  const sell = sameDisc(data, PUMP_SWAP_SELL_DISC);
+  if (!buy && !sell) return null;
+  const cur = new Cursor(data, 8);
+  if (cur.i64() === null) return "fail";
+  if (cur.u64() === null || cur.u64() === null || cur.u64() === null || cur.u64() === null) return "fail";
+  const baseRaw = cur.u64();
+  const quoteRaw = cur.u64();
+  if (baseRaw === null || quoteRaw === null || !(baseRaw > 0)) return "fail";
+  for (let i = 0; i < 7; i += 1) if (cur.u64() === null) return "fail";
+  const pool = cur.pubkey();
+  const user = cur.pubkey();
+  if (!pool || !user) return "fail";
+  const known = pools.get(pool);
+  if (!known || !solQuoted(known.quoteMint)) return null;
+  const priceSol = quoteRaw / 1e9 / (baseRaw / 1e6);
+  return {
+    mint: known.mint,
+    solLamports: 0,
+    tokenRaw: 0,
+    isBuy: buy,
+    user,
+    vSolRaw: quoteRaw,
+    vTokenRaw: baseRaw,
+    creator: null,
+    venue: "pumpswap",
+    poolBaseTokens: baseRaw / 1e6,
+    poolQuoteSol: quoteRaw / 1e9,
+    ...(priceSol > 0 ? {} : {}),
+  };
+}
+
 function decodeCompleteMint(data: Buffer): string | null {
   if (!sameDisc(data, COMPLETE_EVENT_DISC)) return null;
   const cur = new Cursor(data, 8);
@@ -238,7 +309,10 @@ function solQuoted(quoteMint: string | null): boolean {
  * Failed transactions are skipped. Unknown program-data lines are ignored.
  * A short or corrupt known event counts as a decode failure.
  */
-export function eventsFromLogs(notice: LogsNotice): { events: MarketEvent[]; failures: number } {
+export function eventsFromLogs(
+  notice: LogsNotice,
+  pools: Map<string, { mint: string; quoteMint: string }> = pumpSwapPools,
+): { events: MarketEvent[]; failures: number } {
   if (notice.err != null) return { events: [], failures: 0 };
   const creates: CreateFields[] = [];
   const trades: TradeFields[] = [];
@@ -263,7 +337,11 @@ export function eventsFromLogs(notice: LogsNotice): { events: MarketEvent[]; fai
       const mint = decodeCompleteMint(data);
       if (!mint) failures += 1;
       else completes.push(mint);
+      continue;
     }
+    const swapped = decodePumpSwap(data, pools);
+    if (swapped === "fail") failures += 1;
+    else if (swapped) trades.push(swapped);
   }
   const events: MarketEvent[] = [];
   for (const created of creates) {
@@ -309,7 +387,11 @@ export function eventsFromLogs(notice: LogsNotice): { events: MarketEvent[]; fai
     if (initialReserves(trade.vSolRaw, trade.vTokenRaw) && creates.some((created) => created.mint === trade.mint)) {
       continue;
     }
-    const reserves = reservesOf(trade.vSolRaw, trade.vTokenRaw);
+    const reserves = trade.venue === "pumpswap" ? null : reservesOf(trade.vSolRaw, trade.vTokenRaw);
+    const poolPrice =
+      trade.poolBaseTokens != null && trade.poolBaseTokens > 0 && trade.poolQuoteSol != null
+        ? trade.poolQuoteSol / trade.poolBaseTokens
+        : null;
     const row: MarketTrade = {
       kind: "trade",
       mint: trade.mint,
@@ -317,12 +399,13 @@ export function eventsFromLogs(notice: LogsNotice): { events: MarketEvent[]; fai
       trader: trade.user,
       signature: notice.signature,
       solQuoted: true,
-      priceSol: reserves.priceSol,
-      marketCapSol: reserves.marketCapSol,
-      vSolSol: reserves.vSolSol,
-      vTokens: reserves.vTokens,
+      priceSol: trade.venue === "pumpswap" ? poolPrice : reserves?.priceSol ?? null,
+      marketCapSol: trade.venue === "pumpswap" ? (poolPrice != null ? poolPrice * TOTAL_SUPPLY_TOKENS : null) : reserves?.marketCapSol ?? null,
+      vSolSol: reserves?.vSolSol ?? null,
+      vTokens: reserves?.vTokens ?? null,
       slot: notice.slot,
-      solAmount: trade.solLamports / 1e9,
+      solAmount: trade.solLamports > 0 ? trade.solLamports / 1e9 : null,
+      ...(trade.venue ? { venue: trade.venue, poolBaseTokens: trade.poolBaseTokens, poolQuoteSol: trade.poolQuoteSol } : {}),
     };
     events.push(row);
   }

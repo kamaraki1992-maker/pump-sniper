@@ -38,6 +38,11 @@ export interface StatusReport {
     breakout: EntryTypeStats;
     pullback: EntryTypeStats;
   };
+  strategies: {
+    sniper: EntryTypeStats;
+    momentum: EntryTypeStats;
+    scalp: EntryTypeStats;
+  };
 }
 
 export interface EntryTypeStats {
@@ -97,6 +102,17 @@ export function buildStatus(input: {
     if ((sell.realizedPnlSol ?? 0) < 0) bucket.losses += 1;
   }
   for (const bucket of Object.values(entryTypes)) {
+    bucket.winRate = bucket.wins + bucket.losses > 0 ? bucket.wins / (bucket.wins + bucket.losses) : null;
+  }
+  const strategies = { sniper: emptyEntryStats(), momentum: emptyEntryStats(), scalp: emptyEntryStats() };
+  for (const sell of sells) {
+    const kind = sell.strategy === "momentum" || sell.strategy === "scalp" ? sell.strategy : "sniper";
+    const bucket = strategies[kind];
+    bucket.trades += 1;
+    if ((sell.realizedPnlSol ?? 0) > 0) bucket.wins += 1;
+    if ((sell.realizedPnlSol ?? 0) < 0) bucket.losses += 1;
+  }
+  for (const bucket of Object.values(strategies)) {
     bucket.winRate = bucket.wins + bucket.losses > 0 ? bucket.wins / (bucket.wins + bucket.losses) : null;
   }
   const netPnlSol = sells.reduce((sum, row) => sum + (row.realizedPnlSol ?? 0), 0);
@@ -178,6 +194,7 @@ export function buildStatus(input: {
     killSwitch: { active: kill, reason: killBody?.reason ?? null },
     sessionStart: equity?.sessionStart ?? null,
     entryTypes,
+    strategies,
     solCrashPause: {
       active: pauseUntil > nowMs,
       until: pauseUntil > 0 ? new Date(pauseUntil).toISOString() : null,

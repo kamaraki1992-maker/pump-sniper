@@ -28,6 +28,8 @@ import { solFromUsdBalance } from "./momentum/paper.js";
 import { reclaimEmptyAta } from "./momentum/rent.js";
 import { MomentumRunner } from "./momentum/runner.js";
 import { HeliusFeed } from "./helius-feed.js";
+import { ScalpRunner } from "./scalp/runner.js";
+import { createScalpGate } from "./scalp/gate.js";
 import { PumpDevStream } from "./stream.js";
 import type { MarketEvent } from "./types.js";
 import { YellowstoneStream } from "./yellowstone.js";
@@ -123,7 +125,7 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
   const paperBalance =
     config.mode === "paper" &&
     paperStartSol != null &&
-    (config.buySizePctOfBalance != null || config.strategy === "momentum")
+    (config.buySizePctOfBalance != null || config.strategy === "momentum" || config.strategy === "scalp")
       ? new PaperBalance(`${config.dataDir}/paper-balance.json`, paperStartSol)
       : undefined;
   const rpcStats = createRpcStats();
@@ -389,8 +391,90 @@ export async function runMomentum(runtime: Runtime, options: { maxRuntimeMs?: nu
   await new Promise(() => {});
 }
 
+function attachScalp(runtime: Runtime, runner: ScalpRunner): LiveStream | null {
+  if (!runtime.config.rpcWsUrl) {
+    runtime.log.info("scalp feed", { source: "missing" });
+    return null;
+  }
+  const stream = new HeliusFeed(runtime.config.rpcWsUrl, runtime.log, {
+    stallMs: runtime.config.feedStallSec * 1000,
+    allTrades: true,
+    pumpSwap: true,
+  });
+  runtime.subscription.stream = stream;
+  runtime.log.info("stream", { source: "helius", feed: "scalp" });
+  stream.start((event) => {
+    if (event.kind === "launch") runner.noteLaunch(event);
+    else if (event.kind === "trade") runner.noteTrade(event);
+  });
+  return stream;
+}
+
+export async function runScalp(runtime: Runtime, options: { maxRuntimeMs?: number } = {}): Promise<void> {
+  const { config, log, positions, sol, executor, trades } = runtime;
+  const removeGuards = installProcessGuards(log);
+  const market = new HttpMomentumMarket(config.momentumPollSec * 1000);
+  const runner = new ScalpRunner({
+    config,
+    executor,
+    positions,
+    trades,
+    log,
+    solUsd: () => sol.fresh(),
+    solLast: () => ({ price: sol.price(), atMs: sol.updatedAt() }),
+    now: () => new Date(),
+    market,
+    gate: createScalpGate(config, market),
+    ...(runtime.paperBalance ? { paperBalance: runtime.paperBalance } : {}),
+    ...(runtime.walletBalanceSol ? { walletBalanceSol: runtime.walletBalanceSol } : {}),
+    ...(runtime.reclaimRent ? { reclaimRent: runtime.reclaimRent } : {}),
+  });
+  log.info("scalp start", {
+    mode: config.mode,
+    priorityFeeSol: config.scalpPriorityFeeSol,
+    maxHoldMin: config.scalpMaxHoldMin,
+    gateMs: config.scalpGateMs,
+    maxOpenPositions: config.maxOpenPositions,
+  });
+  const stream = attachScalp(runtime, runner);
+  let stopped = false;
+  const shutdown = (why: string) => {
+    if (stopped) return;
+    stopped = true;
+    log.info("shutdown", { why });
+    stream?.stop();
+    runtime.stopRpcPressure();
+    removeGuards();
+    positions.save(sol.price(), config.paper, new Date().toISOString());
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => shutdown("sigterm"));
+  process.on("SIGINT", () => shutdown("sigint"));
+  const stopWatch = setInterval(() => {
+    if (existsSync(config.stopFile)) shutdown("stop-file");
+  }, 500);
+  const clock = setInterval(() => runner.checkClocks(), 1_000);
+  const priceWatch = setInterval(() => {
+    void sol.refresh();
+    void runner.tick();
+    positions.save(sol.price(), config.paper, new Date().toISOString());
+  }, 5_000);
+  stopWatch.unref();
+  clock.unref();
+  priceWatch.unref();
+  if (options.maxRuntimeMs && options.maxRuntimeMs > 0) {
+    const timer = setTimeout(() => shutdown("max-runtime"), options.maxRuntimeMs);
+    timer.unref();
+  }
+  await new Promise(() => {});
+}
+
 export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promise<void> {
   const runtime = await buildRuntime();
+  if (runtime.config.strategy === "scalp") {
+    await runScalp(runtime, options);
+    return;
+  }
   if (runtime.config.strategy === "momentum") {
     await runMomentum(runtime, options);
     return;

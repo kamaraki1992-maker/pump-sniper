@@ -1,6 +1,6 @@
 export type Mode = "paper" | "live";
 
-export type Strategy = "sniper" | "momentum";
+export type Strategy = "sniper" | "momentum" | "scalp";
 
 export type TradeSide = "buy" | "sell";
 
@@ -27,7 +27,12 @@ export type TradeReason =
   | "momentum_tp2"
   | "momentum_tp3"
   | "momentum_moonbag"
-  | "momentum_stale";
+  | "momentum_stale"
+  | "scalp_sl"
+  | "scalp_tp"
+  | "scalp_trail"
+  | "scalp_fast"
+  | "scalp_max_hold";
 
 export interface MarketLaunch {
   kind: "launch";
@@ -172,6 +177,8 @@ export interface TradeRecord {
   costs?: TradeCosts;
   /** Momentum entry that opened the position. Copied onto its sells. */
   entryType?: "breakout" | "pullback" | null;
+  /** Which rule set wrote the row. Older sniper rows omit it. */
+  strategy?: "sniper" | "momentum" | "scalp";
 }
 
 export interface TradeCosts {
@@ -245,6 +252,10 @@ export interface Position {
   /** Graduated route sent on the Lightning bundle. */
   momentumPool?: "pump" | "pump-amm" | "raydium" | "auto";
   momentumEntryType?: "breakout" | "pullback";
+  /** Which bot opened the position. */
+  strategy?: "sniper" | "momentum" | "scalp";
+  /** Scalp already sold the 60% take-profit. The rest is on the 10% trail. */
+  scalpTpTaken?: boolean;
 }
 
 export interface Executor {

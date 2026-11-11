@@ -2,7 +2,7 @@
 
 A Solana mainnet watcher for new [pump.fun](https://pump.fun) launches. It filters creators and opens or closes one position per mint with fixed risk rules.
 
-`STRATEGY=sniper` (the default) is the launch watcher below. `STRATEGY=momentum` is a separate rule set for pump.fun mints that have already graduated. It does not use the sniper exits. Paper mode runs the same loop and does not sign. Live mode still requires `MODE=live`.
+`STRATEGY=sniper` (the default) is the launch watcher below. `STRATEGY=momentum` trades breakouts and pullbacks. `STRATEGY=scalp` watches the Helius trade stream for a 12–25% spike and ten buys in a row, then runs the same safety gate. Scalp's priority fee is fixed at `SCALP_PRIORITY_FEE_SOL` (0.0002). It sells 60% at +18% and trails the rest 10% under the peak. A position that never reaches +10% within 5 minutes is closed, and anything still open is closed at `SCALP_MAX_HOLD_MIN` (30). Paper mode runs the same decisions and does not sign. Live mode still requires `MODE=live`.
 
 The process starts in **paper** mode. Paper mode simulates fills from the live stream and does not sign or send transactions. It does not need a wallet key. **Live** mode runs only when the environment variable `MODE` is exactly `live`. Every other value, including `LIVE`, `paper`, and an empty string, stays in paper mode. The process never switches mode by itself.
 

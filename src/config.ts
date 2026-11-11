@@ -180,6 +180,12 @@ export interface AppConfig {
   momentumPumpswapFeeBps: number;
   /** Bonding-curve fee, in basis points. pump.fun charges about 1%. */
   momentumPumpFeeBps: number;
+  /** Fixed priority fee for every scalp order. */
+  scalpPriorityFeeSol: number;
+  /** Hard close for a scalp position that is still open. */
+  scalpMaxHoldMin: number;
+  /** Safety gate budget after a scalp spike. A miss skips the buy. */
+  scalpGateMs: number;
   /** Raydium swap fee, in basis points. */
   momentumRaydiumFeeBps: number;
   /** Alternative paper bankroll. Converted with the live SOL/USD price when the balance file is created. */
@@ -290,7 +296,8 @@ function strategyOf(value: string | undefined): Strategy {
   const strategy = (value ?? "").trim().toLowerCase();
   if (strategy === "" || strategy === "sniper") return "sniper";
   if (strategy === "momentum") return "momentum";
-  throw new ConfigError("STRATEGY must be sniper or momentum");
+  if (strategy === "scalp") return "scalp";
+  throw new ConfigError("STRATEGY must be sniper, momentum, or scalp");
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -380,7 +387,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rpcCacheTtlMs = num(env.RPC_CACHE_TTL_MS, 3_000, "RPC_CACHE_TTL_MS");
   const maxOpenPositions = num(
     env.MAX_OPEN_POSITIONS,
-    strategy === "momentum" ? 4 : HARD_CAPS.maxOpenPositions,
+    strategy === "momentum" || strategy === "scalp" ? 4 : HARD_CAPS.maxOpenPositions,
     "MAX_OPEN_POSITIONS",
   );
   const maxHoldMinutes = num(env.MAX_HOLD_MINUTES, 10, "MAX_HOLD_MINUTES");
@@ -408,6 +415,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const momentumJitoTipMaxSol = num(env.MOMENTUM_JITO_TIP_MAX_SOL, 0.0003, "MOMENTUM_JITO_TIP_MAX_SOL");
   const momentumPumpswapFeeBps = num(env.MOMENTUM_PUMPSWAP_FEE_BPS, 25, "MOMENTUM_PUMPSWAP_FEE_BPS");
   const momentumPumpFeeBps = num(env.MOMENTUM_PUMP_FEE_BPS, 100, "MOMENTUM_PUMP_FEE_BPS");
+  const scalpPriorityFeeSol = num(env.SCALP_PRIORITY_FEE_SOL, 0.0002, "SCALP_PRIORITY_FEE_SOL");
+  const scalpMaxHoldMin = num(env.SCALP_MAX_HOLD_MIN, 30, "SCALP_MAX_HOLD_MIN");
+  const scalpGateMs = num(env.SCALP_GATE_MS, 1_500, "SCALP_GATE_MS");
   const momentumRaydiumFeeBps = num(env.MOMENTUM_RAYDIUM_FEE_BPS, 25, "MOMENTUM_RAYDIUM_FEE_BPS");
   const paperStartBalanceUsd = optionalNum(env.PAPER_START_BALANCE_USD, "PAPER_START_BALANCE_USD");
   const heliusSenderUrl = str(env.HELIUS_SENDER_URL, "") || null;
@@ -611,13 +621,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new ConfigError("MOMENTUM_PULLBACK_LOOKBACK_MIN must be an integer >= 5");
   }
   if (
-    strategy === "momentum" &&
+    (strategy === "momentum" || strategy === "scalp") &&
     mode === "paper" &&
     paperStartBalanceSol == null &&
     paperStartBalanceUsd == null
   ) {
     throw new ConfigError(
-      "STRATEGY=momentum in paper mode requires PAPER_START_BALANCE_SOL or PAPER_START_BALANCE_USD",
+      "STRATEGY=momentum or STRATEGY=scalp in paper mode requires PAPER_START_BALANCE_SOL or PAPER_START_BALANCE_USD",
     );
   }
   if (!(momentumSizePct > 0) || momentumSizePct > 100) {
@@ -626,6 +636,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!(momentumMaxUsd > 0)) throw new ConfigError("MOMENTUM_MAX_USD must be positive");
   if (!(gasReserveUsd >= 0)) throw new ConfigError("GAS_RESERVE_USD must be >= 0");
   if (!(momentumJitoTipSol >= 0)) throw new ConfigError("MOMENTUM_JITO_TIP_SOL must be >= 0");
+  if (!(scalpPriorityFeeSol > 0) || scalpPriorityFeeSol > 0.01) {
+    throw new ConfigError("SCALP_PRIORITY_FEE_SOL must be between 0 and 0.01");
+  }
+  if (!(scalpMaxHoldMin > 0)) throw new ConfigError("SCALP_MAX_HOLD_MIN must be positive");
+  if (!(scalpGateMs >= 250)) throw new ConfigError("SCALP_GATE_MS must be at least 250");
   if (!(momentumPriorityFeeSol > 0) || momentumPriorityFeeSol > momentumTurboFeeSol) {
     throw new ConfigError("MOMENTUM_PRIORITY_FEE_SOL must be > 0 and at most MOMENTUM_TURBO_FEE_SOL");
   }
@@ -764,6 +779,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     momentumJitoTipMaxSol,
     momentumPumpswapFeeBps,
     momentumPumpFeeBps,
+    scalpPriorityFeeSol,
+    scalpMaxHoldMin,
+    scalpGateMs,
     momentumRaydiumFeeBps,
     paperStartBalanceUsd,
     heliusSenderUrl,

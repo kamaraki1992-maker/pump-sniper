@@ -377,6 +377,7 @@ export class MomentumRunner {
       entryScore: confidence,
       bundle: fees.useJito ? "jito" : null,
       entryType,
+      strategy: "momentum",
       ...(costs ? { costs } : {}),
     });
     if (fill.status !== "filled") return;
@@ -402,6 +403,7 @@ export class MomentumRunner {
       momentumTp2Taken: false,
       momentumPool: pool,
       momentumEntryType: entryType,
+      strategy: "momentum",
       graduated: true,
     };
     this.deps.positions.open(position);
@@ -524,6 +526,7 @@ export class MomentumRunner {
         triggerPriceSol: quote,
         bundle: fees.useJito ? "jito" : null,
         entryType: current.momentumEntryType ?? null,
+        strategy: "momentum",
         ...(costs ? { costs } : {}),
       });
       if (fill.status !== "filled") return;
