@@ -16,8 +16,11 @@ export interface DexPair {
   marketCapUsd: number;
   liquidityUsd: number;
   volume5mUsd: number;
+  volume1hUsd: number | null;
   buys5m: number;
   sells5m: number;
+  /** DexScreener `priceChange.m5`. Null when the payload omits it. */
+  priceChange5mPct: number | null;
   pairCreatedAtMs: number | null;
   /** Token side of the pool, in display units. */
   baseAmount: number | null;
@@ -34,6 +37,10 @@ export interface TradeWindow {
   buyVolume15mUsd: number;
   sellVolume15mUsd: number;
   volume15mComplete: boolean;
+  /** Transaction counts, not volume. Incomplete when the page does not cover 15 minutes. */
+  buys15m: number | null;
+  sells15m: number | null;
+  txns15mComplete: boolean;
 }
 
 export interface MomentumMarket {
@@ -93,8 +100,10 @@ export function parseDexPair(payload: unknown, mint: string): DexPair | null {
       marketCapUsd: num(row.marketCap) ?? num(row.fdv) ?? 0,
       liquidityUsd: liquidity,
       volume5mUsd: num(asRecord(row.volume)?.m5) ?? 0,
+      volume1hUsd: num(asRecord(row.volume)?.h1),
       buys5m: num(txns?.buys) ?? 0,
       sells5m: num(txns?.sells) ?? 0,
+      priceChange5mPct: num(asRecord(row.priceChange)?.m5),
       pairCreatedAtMs: created,
       baseAmount: num(liquidityRow?.base),
       quoteAmount: num(liquidityRow?.quote),
@@ -133,6 +142,9 @@ export function parseGeckoTrades(payload: unknown, nowMs: number): TradeWindow {
   let oldest = nowMs;
   let buy = 0;
   let sell = 0;
+  let buys15m = 0;
+  let sells15m = 0;
+  let unknownSide = false;
   let oldest15 = nowMs;
   let rows15 = 0;
   for (const item of list) {
@@ -148,17 +160,26 @@ export function parseGeckoTrades(payload: unknown, nowMs: number): TradeWindow {
       oldest15 = Math.min(oldest15, stamp);
       const volume = num(attrs.volume_in_usd) ?? 0;
       const kind = typeof attrs.kind === "string" ? attrs.kind.toLowerCase() : "";
-      if (kind === "sell") sell += volume;
-      else if (kind === "buy") buy += volume;
+      if (kind === "sell") {
+        sell += volume;
+        sells15m += 1;
+      } else if (kind === "buy") {
+        buy += volume;
+        buys15m += 1;
+      } else unknownSide = true;
     }
   }
   const truncated = list.length >= TRADE_PAGE;
+  const covered = !truncated || oldest15 <= quarter;
   return {
     makers1h: makers.size,
     makersComplete: !truncated || oldest <= hour,
     buyVolume15mUsd: buy,
     sellVolume15mUsd: sell,
-    volume15mComplete: rows15 === 0 || !truncated || oldest15 <= quarter,
+    volume15mComplete: list.length > 0 && !unknownSide && covered,
+    buys15m: unknownSide || !covered || list.length === 0 ? null : buys15m,
+    sells15m: unknownSide || !covered || list.length === 0 ? null : sells15m,
+    txns15mComplete: list.length > 0 && !unknownSide && covered,
   };
 }
 

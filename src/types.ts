@@ -25,6 +25,7 @@ export type TradeReason =
   | "momentum_sl"
   | "momentum_tp1"
   | "momentum_tp2"
+  | "momentum_tp3"
   | "momentum_moonbag"
   | "momentum_stale";
 
@@ -238,6 +239,7 @@ export interface Position {
   momentumOriginalTokens?: number;
   momentumTp1Taken?: boolean;
   momentumTp2Taken?: boolean;
+  momentumTp3Taken?: boolean;
   /** Graduated route sent on the Lightning bundle. */
   momentumPool?: "pump-amm" | "raydium" | "auto";
 }

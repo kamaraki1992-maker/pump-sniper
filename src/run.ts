@@ -334,6 +334,7 @@ export async function runMomentum(runtime: Runtime, options: { maxRuntimeMs?: nu
     trades,
     log,
     solUsd: () => sol.fresh(),
+    solLast: () => ({ price: sol.price(), atMs: sol.updatedAt() }),
     now: () => new Date(),
     market: new HttpMomentumMarket(config.momentumPollSec * 1000),
     chain: (mint, creator) => readChainFacts(config.rugCheckRpcUrl, mint, creator),

@@ -33,6 +33,7 @@ export interface StatusReport {
   drawdownPct: number | null;
   killSwitch: { active: boolean; reason: string | null };
   sessionStart: string | null;
+  solCrashPause: { active: boolean; until: string | null; high: number | null; price: number | null };
 }
 
 function readJson<T>(path: string): T | null {
@@ -64,6 +65,8 @@ export function buildStatus(input: {
   paperBalancePath: string;
   gasReserveUsd: number;
   feeBps: number;
+  solCrashPath?: string;
+  nowMs?: number;
 }): StatusReport {
   const trades = readTrades(input.tradesPath);
   const filled = trades.filter((row) => row.status === "filled");
@@ -128,6 +131,11 @@ export function buildStatus(input: {
   const kill = existsSync(input.killPath);
   const killBody = kill ? readJson<KillFile>(input.killPath) : null;
   const grossPnlSol = netPnlSol + feeSol;
+  const crash = input.solCrashPath
+    ? readJson<{ pauseUntilMs?: number; high?: number | null; price?: number | null }>(input.solCrashPath)
+    : null;
+  const nowMs = input.nowMs ?? Date.now();
+  const pauseUntil = typeof crash?.pauseUntilMs === "number" ? crash.pauseUntilMs : 0;
   return {
     totalTrades: filled.length,
     winRate: wins + losses > 0 ? wins / (wins + losses) : null,
@@ -143,6 +151,12 @@ export function buildStatus(input: {
     drawdownPct: equitySol != null && equity ? drawdownPct(equitySol, equity.hwmSol) : null,
     killSwitch: { active: kill, reason: killBody?.reason ?? null },
     sessionStart: equity?.sessionStart ?? null,
+    solCrashPause: {
+      active: pauseUntil > nowMs,
+      until: pauseUntil > 0 ? new Date(pauseUntil).toISOString() : null,
+      high: typeof crash?.high === "number" ? crash.high : null,
+      price: typeof crash?.price === "number" ? crash.price : null,
+    },
   };
 }
 
@@ -162,6 +176,7 @@ if (process.argv[1]?.endsWith("status.ts")) {
     paperBalancePath: `${config.dataDir}/paper-balance.json`,
     gasReserveUsd: config.gasReserveUsd,
     feeBps: config.momentumPumpswapFeeBps,
+    solCrashPath: `${config.dataDir}/sol-crash.json`,
   });
   report.grossPnlSol = round(report.grossPnlSol, 9) ?? 0;
   report.netPnlSol = round(report.netPnlSol, 9) ?? 0;

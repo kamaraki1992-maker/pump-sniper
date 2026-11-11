@@ -13,6 +13,7 @@ import {
   MOMENTUM,
   bundledInsiderPct,
   evaluateMomentum,
+  hourVolumeOk,
   higherLows,
   localResistance,
   momentumExit,
@@ -33,6 +34,7 @@ import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "../src/safety.js";
 import { WSOL_MINT } from "../src/pricing.js";
 import { classifySellSimulation, hasRequiredSocial, honeypotDecision } from "../src/momentum/honeypot.js";
 import { EquityBook, killTriggered } from "../src/momentum/equity.js";
+import { SolCrashGuard } from "../src/momentum/sol-crash.js";
 import { buildStatus } from "../src/status.js";
 import { PaperBalance } from "../src/paper-balance.js";
 import { PositionBook } from "../src/positions.js";
@@ -79,8 +81,14 @@ function passingFacts(patch: Partial<MomentumFacts> = {}): MomentumFacts {
     pairCreatedAtMs: nowMs - 30 * 60 * 1000,
     marketCapUsd: 100_000,
     volume5mUsd: 40_000,
+    volume1hUsd: 20_000,
     buys5m: 20,
     sells5m: 5,
+    buys15m: 8,
+    sells15m: 3,
+    txns15mComplete: true,
+    priceChange5mPct: 10,
+    candleMove5mPct: 5,
     makers1h: 300,
     makersComplete: true,
     price: resistance + 1,
@@ -220,31 +228,31 @@ test("exits fire in order and use fractions of the original position", () => {
     priceSol: 1,
     tp1Taken: false,
     tp2Taken: false,
+    tp3Taken: false,
     sellVolume15mUsd: 1,
     buyVolume15mUsd: 10,
     volume15mComplete: true,
   };
   assert.equal(momentumExit({ ...held, priceSol: 0.75 })?.reason, "momentum_sl");
   assert.equal(momentumExit({ ...held, priceSol: 0.75 })?.sellFraction, 1);
-  assert.equal(momentumExit({ ...held, priceSol: 2, peakPriceSol: 2 })?.reason, "momentum_tp1");
-  assert.equal(momentumExit({ ...held, priceSol: 5, peakPriceSol: 5 })?.reason, "momentum_tp1");
-  assert.equal(momentumExit({ ...held, priceSol: 5, peakPriceSol: 5 })?.sellFraction, 0.5);
-  const afterTp1 = momentumExit({ ...held, tp1Taken: true, priceSol: 5, peakPriceSol: 5 });
+  assert.equal(momentumExit({ ...held, priceSol: 1.5, peakPriceSol: 1.5 })?.reason, "momentum_tp1");
+  assert.equal(momentumExit({ ...held, priceSol: 1.5, peakPriceSol: 1.5 })?.sellFraction, 0.25);
+  assert.equal(momentumExit({ ...held, priceSol: 4, peakPriceSol: 4 })?.reason, "momentum_tp1");
+  const afterTp1 = momentumExit({ ...held, tp1Taken: true, priceSol: 2, peakPriceSol: 2 });
   assert.equal(afterTp1?.reason, "momentum_tp2");
-  assert.equal(afterTp1?.sellFraction, 0.5);
-  assert.equal(
-    momentumExit({ ...held, tp1Taken: true, tp2Taken: true, peakPriceSol: 6, priceSol: 4.1 })?.reason,
-    "momentum_moonbag",
-  );
-  assert.equal(
-    momentumExit({ ...held, tp1Taken: true, tp2Taken: true, peakPriceSol: 6, priceSol: 4.3 }),
-    null,
-  );
+  assert.ok(afterTp1 && Math.abs(afterTp1.sellFraction - 0.35 / 0.75) < 1e-9);
+  const afterTp2 = momentumExit({ ...held, tp1Taken: true, tp2Taken: true, priceSol: 4, peakPriceSol: 4 });
+  assert.equal(afterTp2?.reason, "momentum_tp3");
+  assert.ok(afterTp2 && Math.abs(afterTp2.sellFraction - 0.25 / 0.4) < 1e-9);
+  const bag = { ...held, tp1Taken: true, tp2Taken: true, tp3Taken: true };
+  assert.equal(momentumExit({ ...bag, peakPriceSol: 6, priceSol: 4.4 })?.reason, "momentum_moonbag");
+  assert.equal(momentumExit({ ...bag, peakPriceSol: 6, priceSol: 4.6 }), null);
   assert.equal(
     momentumExit({
       ...held,
       tp1Taken: true,
       tp2Taken: true,
+      tp3Taken: true,
       peakPriceSol: 6,
       priceSol: 6,
       sellVolume15mUsd: 5,
@@ -257,6 +265,7 @@ test("exits fire in order and use fractions of the original position", () => {
       ...held,
       tp1Taken: true,
       tp2Taken: true,
+      tp3Taken: true,
       peakPriceSol: 6,
       priceSol: 6,
       sellVolume15mUsd: 5,
@@ -556,8 +565,10 @@ test("a paper momentum tick buys a breakout and the stop sells the position", as
           marketCapUsd: facts.marketCapUsd,
           liquidityUsd: facts.liquidityUsd,
           volume5mUsd: facts.volume5mUsd,
+          volume1hUsd: facts.volume1hUsd,
           buys5m: facts.buys5m,
           sells5m: facts.sells5m,
+          priceChange5mPct: facts.priceChange5mPct,
           pairCreatedAtMs: facts.pairCreatedAtMs,
           baseAmount: 1_000_000,
           quoteAmount: 1_000_000,
@@ -575,6 +586,9 @@ test("a paper momentum tick buys a breakout and the stop sells the position", as
           buyVolume15mUsd: 10,
           sellVolume15mUsd: 1,
           volume15mComplete: true,
+          buys15m: 8,
+          sells15m: 3,
+          txns15mComplete: true,
         };
       },
     },
@@ -733,4 +747,45 @@ test("status reports pnl, fees, equity, and the kill switch", () => {
   assert.equal(report.sessionStart, "2026-01-01T00:00:00.000Z");
   assert.equal(report.highWaterMarkSol, 1);
   assert.ok((report.equitySol ?? 0) > 0);
+  assert.equal(report.solCrashPause.active, false);
+});
+
+test("1h volume, 15m buy pressure, and a 60% five-minute run-up gate entries", () => {
+  assert.equal(hourVolumeOk(10_000, 20_000), true);
+  assert.equal(hourVolumeOk(10_000, 100_000), false);
+  assert.equal(evaluateMomentum(passingFacts({ volume1hUsd: 10_000, marketCapUsd: 100_000 })).reason, "volume_1h");
+  assert.equal(evaluateMomentum(passingFacts({ volume1hUsd: 15_000 })).action, "buy");
+  assert.equal(evaluateMomentum(passingFacts({ volume1hUsd: null })).reason, "volume_1h_unavailable");
+  assert.equal(evaluateMomentum(passingFacts({ txns15mComplete: false, buys15m: null, sells15m: null })).reason, "txns_15m_unavailable");
+  assert.equal(evaluateMomentum(passingFacts({ buys15m: 4, sells15m: 4 })).reason, "txns_15m");
+  assert.equal(evaluateMomentum(passingFacts({ buys15m: 5, sells15m: 4 })).action, "buy");
+  assert.equal(evaluateMomentum(passingFacts({ priceChange5mPct: 61, candleMove5mPct: 1 })).reason, "fomo");
+  assert.equal(evaluateMomentum(passingFacts({ priceChange5mPct: 10, candleMove5mPct: 70 })).reason, "fomo");
+  assert.equal(evaluateMomentum(passingFacts({ priceChange5mPct: 60, candleMove5mPct: 60 })).action, "buy");
+  assert.equal(evaluateMomentum(passingFacts({ priceChange5mPct: null, candleMove5mPct: null })).reason, "fomo_unavailable");
+});
+
+test("a 3% drop from the 60-minute SOL high pauses buys, and a stale feed does not", () => {
+  const guard = new SolCrashGuard();
+  const start = 1_000_000;
+  const first = guard.observe(100, start, start);
+  assert.equal(first.active, false);
+  assert.equal(first.kind, null);
+  const crashed = guard.observe(96, start + 60_000, start + 60_000);
+  assert.equal(crashed.kind, "start");
+  assert.equal(guard.blocksBuys(start + 60_000), true);
+  assert.equal(guard.blocksBuys(start + 60_000 + 20 * 60_000), true);
+  const extended = guard.observe(96, start + 120_000, start + 120_000);
+  assert.equal(extended.kind, "extend");
+  assert.ok(extended.pauseUntilMs > crashed.pauseUntilMs);
+  const quiet = guard.observe(96, start + 130_000, start + 130_000);
+  assert.equal(quiet.kind, null);
+  assert.equal(quiet.active, true);
+  const staleAt = start + 60_000 + 6 * 60_000;
+  const stale = guard.observe(null, start + 60_000, staleAt);
+  assert.equal(stale.kind, "stale");
+  assert.equal(guard.blocksBuys(staleAt), true);
+  const ended = guard.observe(99, extended.pauseUntilMs + 1_000, extended.pauseUntilMs + 1_000);
+  assert.equal(ended.kind, "end");
+  assert.equal(ended.active, false);
 });

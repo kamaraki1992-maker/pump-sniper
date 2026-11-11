@@ -11,14 +11,18 @@ import type { TradeReason } from "../types.js";
  * - Bundled supply is the display-token size of buys, not net of sells, in
  *   the create slot and the next two slots, from wallets other than the
  *   creator. If those early prints were not observed, the check fails closed.
- * - Unique makers and the 15m buy/sell volume come from one GeckoTerminal
- *   trade page. A full page that does not reach the back of the window is
- *   incomplete and fails closed.
+ * - Unique makers, 15m buy/sell volume, and 15m buy/sell transaction counts
+ *   come from one GeckoTerminal trade page (`kind` is buy or sell). DexScreener
+ *   has no 15-minute bucket. A full page that does not reach the back of the
+ *   window, or a row with no side, fails closed.
+ * - The 5-minute run-up is DexScreener `priceChange.m5`, and also the latest
+ *   5-minute candle open versus the current price when that candle exists.
+ *   Either one above 60% blocks the buy.
  * - "Higher lows" means the last three closed 5m lows are strictly rising.
  * - Confidence is the average of seven 0–100 components and is only logged.
  *   A minimum-threshold metric scores 50 at the threshold and 100 at twice
  *   the threshold. A band scores 100 at its midpoint and 0 at either edge.
- *   Size is `MOMENTUM_SIZE_PCT` of balance, capped at $30.
+   *   Size is `MOMENTUM_SIZE_PCT` of available cash, capped at `MOMENTUM_MAX_USD`.
  */
 
 export const MOMENTUM = {
@@ -30,6 +34,9 @@ export const MOMENTUM = {
   maxAgeMs: 24 * 60 * 60 * 1000,
   minMcapUsd: 50_000,
   maxMcapUsd: 400_000,
+  minVolume1hUsd: 15_000,
+  volume1hToMcap: 0.3,
+  maxRunup5mPct: 60,
   volumeToLiquidity: 1.5,
   buySellRatio: 1.8,
   minMakers1h: 150,
@@ -44,11 +51,13 @@ export const MOMENTUM = {
   staleMs: 4 * 60 * 60 * 1000,
   staleMinGain: 0.15,
   killDrawdown: 0.25,
-  tp1Multiple: 2,
-  tp1OfOriginal: 0.5,
-  tp2Multiple: 5,
-  tp2OfOriginal: 0.25,
-  moonbagTrailDrop: 0.3,
+  tp1Gain: 0.5,
+  tp1OfOriginal: 0.25,
+  tp2Gain: 1,
+  tp2OfOriginal: 0.35,
+  tp3Gain: 3,
+  tp3OfOriginal: 0.25,
+  moonbagTrailDrop: 0.25,
   moonbagSellToBuy: 4,
   slippageMcapUsd: 150_000,
   slippageLowPct: 15,
@@ -88,8 +97,17 @@ export interface MomentumFacts {
   pairCreatedAtMs: number | null;
   marketCapUsd: number;
   volume5mUsd: number;
+  volume1hUsd: number | null;
   buys5m: number;
   sells5m: number;
+  /** Buy and sell transaction counts over the last 15 minutes. */
+  buys15m: number | null;
+  sells15m: number | null;
+  txns15mComplete: boolean;
+  /** DexScreener `priceChange.m5`, in percent. Null when the field is missing. */
+  priceChange5mPct: number | null;
+  /** Latest 5m candle open versus the current price, in percent. */
+  candleMove5mPct: number | null;
   makers1h: number | null;
   /** False when the trade page does not cover the full hour. */
   makersComplete: boolean;
@@ -304,9 +322,24 @@ export function momentumSafety(facts: MomentumFacts): string | null {
   return null;
 }
 
+/** $15k in the last hour, or more than 30% of market cap. */
+export function hourVolumeOk(volume1hUsd: number, marketCapUsd: number): boolean {
+  return (
+    volume1hUsd >= MOMENTUM.minVolume1hUsd ||
+    (marketCapUsd > 0 && volume1hUsd > marketCapUsd * MOMENTUM.volume1hToMcap)
+  );
+}
+
 /** First failing entry trigger, or null when every trigger holds. */
 export function momentumEntry(facts: MomentumFacts, candles: readonly Candle[]): string | null {
   if (!(facts.marketCapUsd >= MOMENTUM.minMcapUsd && facts.marketCapUsd <= MOMENTUM.maxMcapUsd)) return "mcap";
+  if (facts.volume1hUsd == null) return "volume_1h_unavailable";
+  if (!hourVolumeOk(facts.volume1hUsd, facts.marketCapUsd)) return "volume_1h";
+  if (!facts.txns15mComplete || facts.buys15m == null || facts.sells15m == null) return "txns_15m_unavailable";
+  if (!(facts.buys15m > facts.sells15m)) return "txns_15m";
+  const runup = fiveMinuteRunupPct(facts.priceChange5mPct, facts.candleMove5mPct);
+  if (runup == null) return "fomo_unavailable";
+  if (runup > MOMENTUM.maxRunup5mPct) return "fomo";
   if (!(facts.liquidityUsd > 0) || !(facts.volume5mUsd >= facts.liquidityUsd * MOMENTUM.volumeToLiquidity)) {
     return "volume";
   }
@@ -353,6 +386,24 @@ export function momentumSize(input: {
   return { ok: true, sizeSol, sizeUsd, pct };
 }
 
+/**
+ * The larger of DexScreener's 5-minute change and the latest candle's
+ * open-to-current move. Null when neither is available.
+ */
+export function fiveMinuteRunupPct(dexPct: number | null, candlePct: number | null): number | null {
+  if (dexPct == null && candlePct == null) return null;
+  return Math.max(dexPct ?? Number.NEGATIVE_INFINITY, candlePct ?? Number.NEGATIVE_INFINITY);
+}
+
+/** Open of the newest 5m candle versus `price`, when that candle is recent. */
+export function candleMove5mPct(candles: readonly Candle[], nowMs: number, price: number): number | null {
+  if (!(price > 0) || candles.length === 0) return null;
+  let latest = candles[0]!;
+  for (const candle of candles) if (candle.ts >= latest.ts) latest = candle;
+  if (!(latest.open > 0) || nowMs - latest.ts > 10 * 60 * 1000) return null;
+  return ((price - latest.open) / latest.open) * 100;
+}
+
 /** Stop price from the peak. Once +40% has printed, the floor is +5% and does not fall. */
 export function momentumStopPrice(entryPriceSol: number, peakPriceSol: number): number {
   const peak = Math.max(peakPriceSol, entryPriceSol);
@@ -361,9 +412,17 @@ export function momentumStopPrice(entryPriceSol: number, peakPriceSol: number): 
   return entryPriceSol * (1 - MOMENTUM.stopDrop);
 }
 
+/** Share of the tokens still held that equals `ofOriginal` of the original position. */
+export function originalFraction(ofOriginal: number, alreadySold: number): number {
+  const remaining = 1 - alreadySold;
+  if (!(remaining > 0)) return 1;
+  return Math.min(1, ofOriginal / remaining);
+}
+
 /**
- * Exits in order. Partials are skipped once taken. The moonbag checks run
- * only after both partials. One call returns one exit.
+ * Exits in order. One call returns one exit. Take-profits are fractions of
+ * the original position: 25% at +50%, 35% at +100%, 25% at +300%. The last
+ * 15% is the moonbag.
  */
 export function momentumExit(input: {
   entryPriceSol: number;
@@ -371,6 +430,7 @@ export function momentumExit(input: {
   priceSol: number;
   tp1Taken: boolean;
   tp2Taken: boolean;
+  tp3Taken: boolean;
   sellVolume15mUsd: number | null;
   buyVolume15mUsd: number | null;
   volume15mComplete: boolean;
@@ -382,15 +442,19 @@ export function momentumExit(input: {
   if (!(entry > 0) || !(price > 0)) return null;
   const peak = Math.max(input.peakPriceSol, price);
   if (price <= momentumStopPrice(entry, peak)) return { reason: "momentum_sl", sellFraction: 1 };
-  if (!input.tp1Taken && price >= entry * MOMENTUM.tp1Multiple) {
-    return { reason: "momentum_tp1", sellFraction: MOMENTUM.tp1OfOriginal };
+  if (!input.tp1Taken && price >= entry * (1 + MOMENTUM.tp1Gain)) {
+    return { reason: "momentum_tp1", sellFraction: originalFraction(MOMENTUM.tp1OfOriginal, 0) };
   }
-  if (input.tp1Taken && !input.tp2Taken && price >= entry * MOMENTUM.tp2Multiple) {
-    const remainingShare = 1 - MOMENTUM.tp1OfOriginal;
-    return { reason: "momentum_tp2", sellFraction: MOMENTUM.tp2OfOriginal / remainingShare };
+  if (input.tp1Taken && !input.tp2Taken && price >= entry * (1 + MOMENTUM.tp2Gain)) {
+    return { reason: "momentum_tp2", sellFraction: originalFraction(MOMENTUM.tp2OfOriginal, MOMENTUM.tp1OfOriginal) };
   }
-  if (input.tp1Taken && input.tp2Taken) {
-    const peak = Math.max(input.peakPriceSol, price);
+  if (input.tp1Taken && input.tp2Taken && !input.tp3Taken && price >= entry * (1 + MOMENTUM.tp3Gain)) {
+    return {
+      reason: "momentum_tp3",
+      sellFraction: originalFraction(MOMENTUM.tp3OfOriginal, MOMENTUM.tp1OfOriginal + MOMENTUM.tp2OfOriginal),
+    };
+  }
+  if (input.tp1Taken && input.tp2Taken && input.tp3Taken) {
     if (price <= peak * (1 - MOMENTUM.moonbagTrailDrop)) return { reason: "momentum_moonbag", sellFraction: 1 };
     const buy = input.buyVolume15mUsd;
     const sell = input.sellVolume15mUsd;

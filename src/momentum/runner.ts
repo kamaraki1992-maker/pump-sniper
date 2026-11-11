@@ -9,10 +9,12 @@ import type { Executor, MarketGraduation, MarketLaunch, MarketTrade, Position, T
 import type { ChainFacts } from "./chain.js";
 import type { DexPair, MomentumMarket } from "./market.js";
 import { EquityBook, positionValueSol } from "./equity.js";
+import { SolCrashGuard } from "./sol-crash.js";
 import { ATA_RENT_SOL, momentumPaperBuy, momentumPaperSell, reservesFromPair, swapFeeBps } from "./paper.js";
 import {
   bundledInsiderPct,
   clampPriorityFee,
+  candleMove5mPct,
   evaluateMomentum,
   liveAvailableSol,
   momentumExit,
@@ -42,6 +44,8 @@ export interface MomentumDeps {
   trades: TradeLog;
   log: Logger;
   solUsd: () => number | null;
+  /** Last SOL/USD quote, including one older than the buy freshness window. */
+  solLast?: () => { price: number | null; atMs: number | null };
   now: () => Date;
   market: MomentumMarket;
   chain: (mint: string, creator: string | null) => Promise<ChainFacts>;
@@ -67,11 +71,14 @@ export class MomentumRunner {
   private readonly selling = new Set<string>();
   private readonly daily: DailyLossBook;
   private readonly equity: EquityBook;
+  private readonly solCrash: SolCrashGuard;
   private killLogged = false;
+  private pauseLogged = false;
 
   constructor(private readonly deps: MomentumDeps) {
     this.daily = deps.daily ?? new DailyLossBook(`${deps.config.dataDir}/daily-pnl.json`);
     this.equity = new EquityBook(`${deps.config.dataDir}/equity-hwm.json`, deps.config.killFile);
+    this.solCrash = new SolCrashGuard(`${deps.config.dataDir}/sol-crash.json`);
   }
 
   noteLaunch(event: MarketLaunch): void {
@@ -107,6 +114,21 @@ export class MomentumRunner {
   async tick(): Promise<void> {
     await this.manageExits();
     await this.markEquity();
+    const nowMs = this.deps.now().getTime();
+    const last = this.deps.solLast?.() ?? {
+      price: this.deps.solUsd(),
+      atMs: this.deps.solUsd() == null ? null : nowMs,
+    };
+    const pause = this.solCrash.observe(last.price, last.atMs, nowMs);
+    if (pause.kind === "start" || pause.kind === "extend" || pause.kind === "end") {
+      this.deps.log.info("sol_crash_pause", {
+        state: pause.kind,
+        until: new Date(pause.pauseUntilMs).toISOString(),
+        high: pause.high,
+        price: pause.price,
+      });
+    }
+    if (pause.kind === "stale") this.deps.log.info("sol_price_stale", { blocked: false });
     if (this.equity.killed()) {
       if (!this.killLogged) {
         this.killLogged = true;
@@ -123,6 +145,14 @@ export class MomentumRunner {
       this.deps.log.info("momentum", { decision: "hold", reason: "daily_stop" });
       return;
     }
+    if (this.solCrash.blocksBuys(nowMs)) {
+      if (!this.pauseLogged) {
+        this.pauseLogged = true;
+        this.deps.log.info("momentum", { decision: "hold", reason: "sol_crash_pause" });
+      }
+      return;
+    }
+    this.pauseLogged = false;
     await this.enqueue();
     const batch = this.queue.splice(0, PER_TICK);
     for (const mint of batch) {
@@ -229,8 +259,14 @@ export class MomentumRunner {
       pairCreatedAtMs: pair.pairCreatedAtMs,
       marketCapUsd: pair.marketCapUsd,
       volume5mUsd: pair.volume5mUsd,
+      volume1hUsd: pair.volume1hUsd,
       buys5m: pair.buys5m,
       sells5m: pair.sells5m,
+      buys15m: trades?.buys15m ?? null,
+      sells15m: trades?.sells15m ?? null,
+      txns15mComplete: trades?.txns15mComplete ?? false,
+      priceChange5mPct: pair.priceChange5mPct,
+      candleMove5mPct: candleMove5mPct(candles, nowMs, pair.priceUsd),
       makers1h: trades?.makers1h ?? null,
       makersComplete: trades?.makersComplete ?? false,
       price: pair.priceUsd,
@@ -351,6 +387,7 @@ export class MomentumRunner {
       momentumOriginalTokens: fill.tokenAmount,
       momentumTp1Taken: false,
       momentumTp2Taken: false,
+      momentumTp3Taken: false,
       momentumPool: pool,
       graduated: true,
     };
@@ -380,6 +417,7 @@ export class MomentumRunner {
         priceSol,
         tp1Taken: position.momentumTp1Taken === true,
         tp2Taken: position.momentumTp2Taken === true,
+        tp3Taken: position.momentumTp3Taken === true,
         sellVolume15mUsd: trades?.sellVolume15mUsd ?? null,
         buyVolume15mUsd: trades?.buyVolume15mUsd ?? null,
         volume15mComplete: trades?.volume15mComplete ?? false,
@@ -487,6 +525,7 @@ export class MomentumRunner {
         current.realizedPnlSol = total ?? current.realizedPnlSol;
         if (reason === "momentum_tp1") current.momentumTp1Taken = true;
         if (reason === "momentum_tp2") current.momentumTp2Taken = true;
+        if (reason === "momentum_tp3") current.momentumTp3Taken = true;
         return;
       }
       this.deps.positions.close(current.mint);
