@@ -138,7 +138,7 @@ export class LiveExecutor implements Executor {
       const sim = await this.ports.simulate(tx);
       if (sim.err) return;
       const cuLimit = cuLimitFromConsumed(sim.unitsConsumed);
-      const priorityFeeSol = await this.priorityFeeSol(tx, cuLimit);
+      const priorityFeeSol = await this.priorityFeeSol(order, tx, cuLimit);
       const tables = await this.ports.lookupTables(tx);
       const blockhash = this.ports.blockhash ? await this.ports.blockhash() : tx.message.recentBlockhash;
       this.armed.set(order.mint, { raw, units: sim.unitsConsumed, priorityFeeSol, blockhash, tables });
@@ -196,7 +196,7 @@ export class LiveExecutor implements Executor {
     if (sim.err) return blank(order, classifySimError(sim.err));
 
     const cuLimit = cuLimitFromConsumed(sim.unitsConsumed);
-    const priorityFeeSol = await this.priorityFeeSol(tx, cuLimit);
+    const priorityFeeSol = await this.priorityFeeSol(order, tx, cuLimit);
     let prepared: VersionedTransaction;
     try {
       const tables = await this.ports.lookupTables(tx);
@@ -246,7 +246,10 @@ export class LiveExecutor implements Executor {
     return liveFillFromConfirm(order, sent.signature, confirm, estimate);
   }
 
-  private async priorityFeeSol(tx: VersionedTransaction, cuLimit: number): Promise<number> {
+  private async priorityFeeSol(order: OrderRequest, tx: VersionedTransaction, cuLimit: number): Promise<number> {
+    if (order.priorityFeeSol != null && order.priorityFeeSol >= 0 && Number.isFinite(order.priorityFeeSol)) {
+      return order.priorityFeeSol;
+    }
     const fallback = this.ports.config.priorityFeeSol;
     if (!this.ports.priorityFee) return fallback;
     try {

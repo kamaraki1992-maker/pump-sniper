@@ -1,6 +1,6 @@
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
-import type { Mode } from "./types.js";
+import type { Mode, Strategy } from "./types.js";
 
 /**
  * Caps live in code on purpose. Env values outside these bounds abort startup.
@@ -36,6 +36,8 @@ export interface PaperModel {
 
 export interface AppConfig {
   mode: Mode;
+  /** `sniper` watches new launches. `momentum` trades graduated pump.fun mints. */
+  strategy: Strategy;
   buySizeMinUsd: number;
   buySizeMaxUsd: number;
   /** Buy cap. Also the value used when older code reads a single slippage. */
@@ -151,6 +153,10 @@ export interface AppConfig {
   rpcUrl: string;
   /** Top-10 and mint-authority reads. Falls back to `rpcUrl` when unset. */
   rugCheckRpcUrl: string;
+  /** Seconds between momentum candidate polls. */
+  momentumPollSec: number;
+  /** Closed 5m candles whose high is the local resistance. */
+  momentumResistanceCandles: number;
   jitoBlockEngineUrl: string;
   solPriceUrl: string;
   dataDir: string;
@@ -241,8 +247,16 @@ export function requiredBuyBalanceSol(config: AppConfig, buySize: number, openPo
   return buySize + txFee + tip + exitReserve + openPositions * exitReserve;
 }
 
+function strategyOf(value: string | undefined): Strategy {
+  const strategy = (value ?? "").trim().toLowerCase();
+  if (strategy === "" || strategy === "sniper") return "sniper";
+  if (strategy === "momentum") return "momentum";
+  throw new ConfigError("STRATEGY must be sniper or momentum");
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const mode: Mode = env.MODE === "live" ? "live" : "paper";
+  const strategy = strategyOf(env.STRATEGY);
   const buySizeMinUsd = num(env.BUY_SIZE_MIN_USD, 5, "BUY_SIZE_MIN_USD");
   const buySizeMaxUsd = num(env.BUY_SIZE_MAX_USD, HARD_CAPS.maxBuyUsd, "BUY_SIZE_MAX_USD");
   const legacySlippage = optionalNum(env.MAX_SLIPPAGE_PCT, "MAX_SLIPPAGE_PCT");
@@ -333,6 +347,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const sellPressureRatio = num(env.SELL_PRESSURE_RATIO, 3, "SELL_PRESSURE_RATIO");
   const sellPressureWindowSec = num(env.SELL_PRESSURE_WINDOW_SEC, 30, "SELL_PRESSURE_WINDOW_SEC");
   const safetyCheckTimeoutMs = num(env.SAFETY_CHECK_TIMEOUT_MS, 250, "SAFETY_CHECK_TIMEOUT_MS");
+  const momentumPollSec = Math.floor(num(env.MOMENTUM_POLL_SEC, 20, "MOMENTUM_POLL_SEC"));
+  const momentumResistanceCandles = Math.floor(
+    num(env.MOMENTUM_RESISTANCE_CANDLES, 6, "MOMENTUM_RESISTANCE_CANDLES"),
+  );
   const grpcUrlRaw = str(env.GRPC_URL, "");
   const grpcTokenPresent = Boolean(env.GRPC_TOKEN?.trim());
   const paperSlippagePct = num(env.PAPER_SLIPPAGE_PCT, 2, "PAPER_SLIPPAGE_PCT");
@@ -522,6 +540,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!(safetyCheckTimeoutMs > 0)) {
     throw new ConfigError("SAFETY_CHECK_TIMEOUT_MS must be positive");
   }
+  if (!Number.isInteger(momentumPollSec) || momentumPollSec < 5) {
+    throw new ConfigError("MOMENTUM_POLL_SEC must be an integer >= 5");
+  }
+  if (!Number.isInteger(momentumResistanceCandles) || momentumResistanceCandles < 2) {
+    throw new ConfigError("MOMENTUM_RESISTANCE_CANDLES must be an integer >= 2");
+  }
+  if (strategy === "momentum" && mode === "paper" && paperStartBalanceSol == null) {
+    throw new ConfigError("STRATEGY=momentum in paper mode requires PAPER_START_BALANCE_SOL");
+  }
   const slippageCeiling = Math.max(buySlippagePct, sellSlippagePct);
   if (!(paperSlippagePct >= 0) || paperSlippagePct > slippageCeiling) {
     throw new ConfigError("PAPER_SLIPPAGE_PCT must be between 0 and the buy or sell slippage cap");
@@ -543,6 +570,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rugCheckRpcUrl = str(env.RUG_CHECK_RPC_URL, rpcUrl);
   return {
     mode,
+    strategy,
     buySizeMinUsd,
     buySizeMaxUsd,
     maxSlippagePct: buySlippagePct,
@@ -619,6 +647,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     tradeApiUrl: str(env.TRADE_API_URL, "https://pumpdev.io/api/bundle"),
     rpcUrl,
     rugCheckRpcUrl,
+    momentumPollSec,
+    momentumResistanceCandles,
     jitoBlockEngineUrl: str(
       env.JITO_BLOCK_ENGINE_URL,
       "https://mainnet.block-engine.jito.wtf/api/v1/bundles",

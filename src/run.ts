@@ -21,6 +21,9 @@ import { installProcessRedaction, rpcApiKey, rpcHost } from "./redact.js";
 import { TradeLog } from "./report.js";
 import { SolPriceFeed } from "./sol-price.js";
 import { createRpcSafetyCheck } from "./safety.js";
+import { readChainFacts } from "./momentum/chain.js";
+import { HttpMomentumMarket } from "./momentum/market.js";
+import { MomentumRunner } from "./momentum/runner.js";
 import { HeliusFeed } from "./helius-feed.js";
 import { PumpDevStream } from "./stream.js";
 import type { MarketEvent } from "./types.js";
@@ -39,10 +42,13 @@ export interface Runtime {
   log: Logger;
   bot: SniperBot;
   positions: PositionBook;
+  trades: TradeLog;
   sol: SolPriceFeed;
   executor: Executor;
   subscription: { stream: LiveStream | null };
   stopRpcPressure: () => void;
+  paperBalance?: PaperBalance;
+  walletBalanceSol?: () => Promise<number>;
 }
 
 /** Optional ceiling. Absent or invalid keeps the tier's own subscription limit. */
@@ -87,6 +93,12 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
   const log = new Logger(secrets);
   const positions = new PositionBook(config.positionsPath);
   const trades = new TradeLog(config.tradesPath, secrets);
+  const paperBalance =
+    config.mode === "paper" &&
+    config.paperStartBalanceSol != null &&
+    (config.buySizePctOfBalance != null || config.strategy === "momentum")
+      ? new PaperBalance(`${config.dataDir}/paper-balance.json`, config.paperStartBalanceSol)
+      : undefined;
   const sol = new SolPriceFeed(config.solPriceUrl);
   await sol.refresh();
   const rpcStats = createRpcStats();
@@ -168,9 +180,7 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     unsubscribeMint: (mint) => subscription.stream?.unsubscribeTrades([mint]),
     bought: new BoughtMints(`${config.dataDir}/bought-mints.json`),
     ...(walletBalanceSol ? { walletBalanceSol } : {}),
-    ...(config.mode === "paper" && config.buySizePctOfBalance != null && config.paperStartBalanceSol != null
-      ? { paperBalance: new PaperBalance(`${config.dataDir}/paper-balance.json`, config.paperStartBalanceSol) }
-      : {}),
+    ...(paperBalance && config.buySizePctOfBalance != null ? { paperBalance } : {}),
     holders,
     metadataSocials: new MetadataSocials({
       attemptTimeoutMs: config.metadataAttemptTimeoutMs,
@@ -186,7 +196,19 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
       bot.onCurveReserves(mint, realSol, reserves, complete);
     curveWatch.start();
   }
-  return { config, log, bot, positions, sol, executor, subscription, stopRpcPressure: stopPressureLog };
+  return {
+    config,
+    log,
+    bot,
+    positions,
+    trades,
+    sol,
+    executor,
+    subscription,
+    stopRpcPressure: stopPressureLog,
+    ...(paperBalance ? { paperBalance } : {}),
+    ...(walletBalanceSol ? { walletBalanceSol } : {}),
+  };
 }
 
 function openDataFeed(runtime: Runtime): LiveStream {
@@ -236,8 +258,89 @@ export function attachStream(runtime: Runtime): LiveStream {
   return stream;
 }
 
+function attachMomentum(runtime: Runtime, runner: MomentumRunner): LiveStream | null {
+  if (runtime.config.feed === "helius" && !runtime.config.rpcWsUrl) {
+    runtime.log.info("momentum feed", { source: "dexscreener" });
+    return null;
+  }
+  const stream = openDataFeed(runtime);
+  runtime.subscription.stream = stream;
+  runtime.log.info("stream", { source: runtime.config.feed, feed: runtime.config.feed });
+  stream.start((event) => {
+    if (event.kind === "launch") runner.noteLaunch(event);
+    else if (event.kind === "graduation") runner.noteGraduation(event);
+    else runner.noteTrade(event);
+  });
+  return stream;
+}
+
+export async function runMomentum(runtime: Runtime, options: { maxRuntimeMs?: number } = {}): Promise<void> {
+  const { config, log, positions, sol, executor, trades } = runtime;
+  const removeGuards = installProcessGuards(log);
+  const runner = new MomentumRunner({
+    config,
+    executor,
+    positions,
+    trades,
+    log,
+    solUsd: () => sol.fresh(),
+    now: () => new Date(),
+    market: new HttpMomentumMarket(config.momentumPollSec * 1000),
+    chain: (mint, creator) => readChainFacts(config.rugCheckRpcUrl, mint, creator),
+    ...(runtime.paperBalance ? { paperBalance: runtime.paperBalance } : {}),
+    ...(runtime.walletBalanceSol ? { walletBalanceSol: runtime.walletBalanceSol } : {}),
+  });
+  log.info("momentum start", {
+    mode: config.mode,
+    pollSec: config.momentumPollSec,
+    resistanceCandles: config.momentumResistanceCandles,
+    maxOpenPositions: config.maxOpenPositions,
+  });
+  const stream = attachMomentum(runtime, runner);
+  let stopped = false;
+  const shutdown = (why: string) => {
+    if (stopped) return;
+    stopped = true;
+    log.info("shutdown", { why });
+    stream?.stop();
+    runtime.stopRpcPressure();
+    removeGuards();
+    positions.save(sol.price(), config.paper, new Date().toISOString());
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => shutdown("sigterm"));
+  process.on("SIGINT", () => shutdown("sigint"));
+  const stopWatch = setInterval(() => {
+    if (existsSync(config.stopFile)) shutdown("stop-file");
+  }, 500);
+  const priceWatch = setInterval(() => {
+    void sol.refresh();
+    positions.save(sol.price(), config.paper, new Date().toISOString());
+  }, 5_000);
+  const pollWatch = setInterval(() => {
+    void runner.tick().catch((error: unknown) => {
+      log.error("momentum tick failed", { error: error instanceof Error ? error.message : "tick" });
+    });
+  }, config.momentumPollSec * 1000);
+  stopWatch.unref();
+  priceWatch.unref();
+  pollWatch.unref();
+  void runner.tick().catch((error: unknown) => {
+    log.error("momentum tick failed", { error: error instanceof Error ? error.message : "tick" });
+  });
+  if (options.maxRuntimeMs && options.maxRuntimeMs > 0) {
+    const timer = setTimeout(() => shutdown("max-runtime"), options.maxRuntimeMs);
+    timer.unref();
+  }
+  await new Promise(() => {});
+}
+
 export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promise<void> {
   const runtime = await buildRuntime();
+  if (runtime.config.strategy === "momentum") {
+    await runMomentum(runtime, options);
+    return;
+  }
   const { config, log, bot, positions, sol } = runtime;
   const removeGuards = installProcessGuards(log);
   const balanceSol = await bot.reportedBalanceSol();

@@ -83,6 +83,8 @@ test("bundle body matches the Lightning trade fields and omits the private key",
 
   const graduated = buildBundleBody("Pubkey111", { ...order(), reason: "tp", pool: "pump-amm" }, config);
   assert.equal(graduated.pool, "pump-amm");
+  const raydium = buildBundleBody("Pubkey111", { ...order(), reason: "entry", pool: "raydium" }, config);
+  assert.equal(raydium.pool, "raydium");
 });
 
 test("a base58 bundle payload decodes", () => {

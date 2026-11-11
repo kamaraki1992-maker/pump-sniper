@@ -1,5 +1,7 @@
 export type Mode = "paper" | "live";
 
+export type Strategy = "sniper" | "momentum";
+
 export type TradeSide = "buy" | "sell";
 
 export type TradeStatus = "filled" | "failed";
@@ -19,7 +21,11 @@ export type TradeReason =
   | "fast_drop"
   | "early_no_momentum"
   | "profit_lock"
-  | "no_socials_time_stop";
+  | "no_socials_time_stop"
+  | "momentum_sl"
+  | "momentum_tp1"
+  | "momentum_tp2"
+  | "momentum_moonbag";
 
 export interface MarketLaunch {
   kind: "launch";
@@ -90,8 +96,13 @@ export interface OrderRequest {
   tokenAmount?: number;
   /** Share of the remaining position to sell. 1 or omitted closes the position. */
   sellFraction?: number;
-  /** Set on a graduated sell so the bundle is built against PumpSwap. */
-  pool?: "pump-amm" | "auto";
+  /**
+   * Graduated route. PumpPortal accepts `pump-amm`, `raydium`, and `auto`.
+   * The Lightning bundle body forwards this field unchanged.
+   */
+  pool?: "pump-amm" | "raydium" | "auto";
+  /** When set, paper and live use this priority fee instead of the dynamic quote. */
+  priorityFeeSol?: number;
   /** Computed Jito tip for this order. Falls back to the config tip when omitted. */
   tipSol?: number;
   /** Stop-like exits use this order's slippage instead of the smaller paper default. */
@@ -201,6 +212,14 @@ export interface Position {
   creatorTokens?: number | null;
   /** Entered without verified socials. Uses the no-socials time stop. */
   noSocials?: boolean;
+  /** Managed by STRATEGY=momentum. The sniper exits do not apply. */
+  momentum?: boolean;
+  /** Token amount of the original fill. Partials are fractions of this. */
+  momentumOriginalTokens?: number;
+  momentumTp1Taken?: boolean;
+  momentumTp2Taken?: boolean;
+  /** Graduated route sent on the Lightning bundle. */
+  momentumPool?: "pump-amm" | "raydium" | "auto";
 }
 
 export interface Executor {
