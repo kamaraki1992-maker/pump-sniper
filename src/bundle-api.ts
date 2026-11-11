@@ -31,7 +31,7 @@ export interface BundleBody {
    * Graduated route. PumpPortal's trade-local docs list `pump-amm`, `raydium`,
    * and `auto`. The bundle body forwards the same field.
    */
-  pool?: "pump-amm" | "raydium" | "auto";
+  pool?: "pump" | "pump-amm" | "raydium" | "auto";
 }
 
 /**

@@ -102,7 +102,7 @@ export interface OrderRequest {
    * Graduated route. PumpPortal accepts `pump-amm`, `raydium`, and `auto`.
    * The Lightning bundle body forwards this field unchanged.
    */
-  pool?: "pump-amm" | "raydium" | "auto";
+  pool?: "pump" | "pump-amm" | "raydium" | "auto";
   /** When set, paper and live use this priority fee instead of the dynamic quote. */
   priorityFeeSol?: number;
   /** Momentum fee tier. Unset keeps the sniper quote. */
@@ -170,6 +170,8 @@ export interface TradeRecord {
   noSocials?: boolean;
   /** Itemized momentum paper costs. Absent on sniper rows. */
   costs?: TradeCosts;
+  /** Momentum entry that opened the position. Copied onto its sells. */
+  entryType?: "breakout" | "pullback" | null;
 }
 
 export interface TradeCosts {
@@ -241,7 +243,8 @@ export interface Position {
   momentumTp2Taken?: boolean;
   momentumTp3Taken?: boolean;
   /** Graduated route sent on the Lightning bundle. */
-  momentumPool?: "pump-amm" | "raydium" | "auto";
+  momentumPool?: "pump" | "pump-amm" | "raydium" | "auto";
+  momentumEntryType?: "breakout" | "pullback";
 }
 
 export interface Executor {

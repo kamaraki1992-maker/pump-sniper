@@ -83,7 +83,17 @@ export function parseDexPair(payload: unknown, mint: string): DexPair | null {
     const address = base && typeof base.address === "string" ? base.address : null;
     if (address !== mint) continue;
     const dexId = typeof row.dexId === "string" ? row.dexId : "";
-    if (dexId !== "pumpswap" && dexId !== "raydium" && dexId !== "raydium-cpmm" && dexId !== "pump-amm") continue;
+    if (
+      dexId !== "pumpfun" &&
+      dexId !== "pump.fun" &&
+      dexId !== "pump" &&
+      dexId !== "pumpswap" &&
+      dexId !== "raydium" &&
+      dexId !== "raydium-cpmm" &&
+      dexId !== "pump-amm"
+    ) {
+      continue;
+    }
     const pairAddress = typeof row.pairAddress === "string" ? row.pairAddress : "";
     const liquidityRow = asRecord(row.liquidity);
     const liquidity = num(liquidityRow?.usd) ?? 0;

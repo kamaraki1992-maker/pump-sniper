@@ -5,9 +5,12 @@ import type { TradeReason } from "../types.js";
  * Momentum rules. These are fixed. `STRATEGY=sniper` does not read them.
  *
  * Approximations, called out where the public data does not match the spec:
- * - PumpSwap (`pumpswap`) pools are treated as burned-LP graduation pools.
- *   pump.fun burns that LP when it migrates. A Raydium pool passes only when
- *   this process saw the pump.fun graduation for the mint. Other venues fail.
+ * - A pump.fun bonding-curve pair (`pumpfun`) is still program-owned, so the
+ *   LP-burn check passes without a graduation. Its liquidity is DexScreener
+ *   `liquidity.usd` when that is present, otherwise twice the wSOL reserve
+ *   times the SOL price. Trades use pool `pump`. PumpSwap (`pumpswap`) is the
+ *   burned-LP graduation pool and uses pool `pump-amm`. A Raydium pool passes
+ *   only when this process saw the pump.fun graduation.
  * - Bundled supply is the display-token size of buys, not net of sells, in
  *   the create slot and the next two slots, from wallets other than the
  *   creator. If those early prints were not observed, the check fails closed.
@@ -26,14 +29,14 @@ import type { TradeReason } from "../types.js";
  */
 
 export const MOMENTUM = {
-  minLiquidityUsd: 15_000,
+  minLiquidityUsd: 10_000,
   maxTop10Pct: 25,
   maxDevPct: 4,
   maxBundlePct: 15,
-  minAgeMs: 10 * 60 * 1000,
-  maxAgeMs: 24 * 60 * 60 * 1000,
-  minMcapUsd: 50_000,
-  maxMcapUsd: 400_000,
+  minAgeMs: 3 * 60 * 1000,
+  maxAgeMs: 48 * 60 * 60 * 1000,
+  minMcapUsd: 30_000,
+  maxMcapUsd: 800_000,
   minVolume1hUsd: 15_000,
   volume1hToMcap: 0.3,
   maxRunup5mPct: 60,
@@ -48,15 +51,18 @@ export const MOMENTUM = {
   /** Peak gain that moves the stop from -25% to +5%. The stop never moves down. */
   lockGain: 0.4,
   lockStop: 0.05,
-  staleMs: 4 * 60 * 60 * 1000,
-  staleMinGain: 0.15,
+  staleMs: 90 * 60 * 1000,
+  staleMinGain: 0.12,
   killDrawdown: 0.25,
-  tp1Gain: 0.5,
-  tp1OfOriginal: 0.25,
-  tp2Gain: 1,
-  tp2OfOriginal: 0.35,
-  tp3Gain: 3,
-  tp3OfOriginal: 0.25,
+  tp1Gain: 0.4,
+  tp1OfOriginal: 0.35,
+  tp2Gain: 0.9,
+  tp2OfOriginal: 0.4,
+  pullbackMin: 0.15,
+  pullbackMax: 0.25,
+  pullbackRsiPrev: 45,
+  pullbackRsiMin: 40,
+  pullbackRsiMax: 60,
   moonbagTrailDrop: 0.25,
   moonbagSellToBuy: 4,
   slippageMcapUsd: 150_000,
@@ -124,12 +130,15 @@ export interface MomentumFacts {
   sellVolume15mUsd: number | null;
   buyVolume15mUsd: number | null;
   volume15mComplete: boolean;
+  /** Minutes of 5m candles used as the pullback high. */
+  pullbackLookbackMin: number;
 }
 
 export interface MomentumDecision {
   action: "buy" | "hold";
   reason: string;
   confidence: number | null;
+  entryType: "breakout" | "pullback" | null;
 }
 
 export interface MomentumExit {
@@ -208,11 +217,22 @@ export function bundledInsiderPct(input: {
   return (bought / input.supplyTokens) * 100;
 }
 
-export function momentumPool(dexId: string): "pump-amm" | "raydium" | null {
+export function momentumPool(dexId: string): "pump" | "pump-amm" | "raydium" | null {
   const id = dexId.toLowerCase();
+  if (id === "pumpfun" || id === "pump.fun" || id === "pump") return "pump";
   if (id === "pumpswap" || id === "pump-amm") return "pump-amm";
   if (id === "raydium" || id === "raydium-cpmm") return "raydium";
   return null;
+}
+
+/**
+ * USD liquidity for the safety check. DexScreener's figure wins. A bonding
+ * curve with no USD figure uses both sides of the wSOL reserve.
+ */
+export function curveLiquidityUsd(quoteSol: number | null, solUsd: number | null, reportedUsd: number): number {
+  if (reportedUsd > 0) return reportedUsd;
+  if (quoteSol != null && quoteSol > 0 && solUsd != null && solUsd > 0) return quoteSol * solUsd * 2;
+  return 0;
 }
 
 export function momentumSlippagePct(marketCapUsd: number): number {
@@ -330,8 +350,8 @@ export function hourVolumeOk(volume1hUsd: number, marketCapUsd: number): boolean
   );
 }
 
-/** First failing entry trigger, or null when every trigger holds. */
-export function momentumEntry(facts: MomentumFacts, candles: readonly Candle[]): string | null {
+/** Market cap, hour volume, 15-minute transaction pressure, and the 60% run-up cap. */
+export function momentumSharedEntry(facts: MomentumFacts): string | null {
   if (!(facts.marketCapUsd >= MOMENTUM.minMcapUsd && facts.marketCapUsd <= MOMENTUM.maxMcapUsd)) return "mcap";
   if (facts.volume1hUsd == null) return "volume_1h_unavailable";
   if (!hourVolumeOk(facts.volume1hUsd, facts.marketCapUsd)) return "volume_1h";
@@ -340,6 +360,11 @@ export function momentumEntry(facts: MomentumFacts, candles: readonly Candle[]):
   const runup = fiveMinuteRunupPct(facts.priceChange5mPct, facts.candleMove5mPct);
   if (runup == null) return "fomo_unavailable";
   if (runup > MOMENTUM.maxRunup5mPct) return "fomo";
+  return null;
+}
+
+/** Breakout-only triggers. Null when every one holds. */
+export function momentumBreakout(facts: MomentumFacts, candles: readonly Candle[]): string | null {
   if (!(facts.liquidityUsd > 0) || !(facts.volume5mUsd >= facts.liquidityUsd * MOMENTUM.volumeToLiquidity)) {
     return "volume";
   }
@@ -358,14 +383,64 @@ export function momentumEntry(facts: MomentumFacts, candles: readonly Candle[]):
   return null;
 }
 
+/** Max high of the 5m candles whose open is inside the lookback. */
+export function pullbackHigh(candles: readonly Candle[], nowMs: number, lookbackMin: number): number | null {
+  const start = nowMs - lookbackMin * 60 * 1000;
+  let high = 0;
+  for (const candle of candles) {
+    if (candle.ts < start) continue;
+    if (candle.high > high) high = candle.high;
+  }
+  return high > 0 ? high : null;
+}
+
+/** True when price is between 15% and 25% under `high`, inclusive. */
+export function inPullbackBand(price: number, high: number): boolean {
+  if (!(price > 0) || !(high > price)) return false;
+  const drop = (high - price) / high;
+  return drop + 1e-9 >= MOMENTUM.pullbackMin && drop <= MOMENTUM.pullbackMax + 1e-9;
+}
+
+/** Previous closed RSI was at or under 45, and the latest RSI is higher and inside 40–60. */
+export function rsiBounce(previous: number | null, current: number | null): boolean {
+  if (previous == null || current == null) return false;
+  return (
+    previous <= MOMENTUM.pullbackRsiPrev &&
+    current > previous &&
+    current >= MOMENTUM.pullbackRsiMin &&
+    current <= MOMENTUM.pullbackRsiMax
+  );
+}
+
+/** Pullback-only triggers. Null when every one holds. */
+export function momentumPullback(facts: MomentumFacts, candles: readonly Candle[]): string | null {
+  const high = pullbackHigh(facts.candles, facts.nowMs, facts.pullbackLookbackMin);
+  if (high == null) return "pullback_history";
+  if (!inPullbackBand(facts.price, high)) return "pullback_band";
+  if (!facts.volume15mComplete || facts.buyVolume15mUsd == null || facts.sellVolume15mUsd == null) {
+    return "volume_15m_unavailable";
+  }
+  if (!(facts.buyVolume15mUsd > facts.sellVolume15mUsd)) return "volume_15m";
+  const closes = candles.map((candle) => candle.close);
+  if (closes.length < MOMENTUM.rsiPeriod + 2) return "rsi_bounce_history";
+  const previous = rsi(closes.slice(0, -1));
+  const current = rsi(closes);
+  if (!rsiBounce(previous, current)) return "rsi_bounce";
+  return null;
+}
+
 export function evaluateMomentum(facts: MomentumFacts): MomentumDecision {
   const candles = closedCandles(facts.candles, facts.nowMs);
   const confidence = momentumConfidence({ ...facts, candles }, candles);
   const safety = momentumSafety(facts);
-  if (safety) return { action: "hold", reason: safety, confidence };
-  const entry = momentumEntry(facts, candles);
-  if (entry) return { action: "hold", reason: entry, confidence };
-  return { action: "buy", reason: "breakout", confidence };
+  if (safety) return { action: "hold", reason: safety, confidence, entryType: null };
+  const shared = momentumSharedEntry(facts);
+  if (shared) return { action: "hold", reason: shared, confidence, entryType: null };
+  const breakout = momentumBreakout(facts, candles);
+  if (!breakout) return { action: "buy", reason: "breakout", confidence, entryType: "breakout" };
+  const pullback = momentumPullback(facts, candles);
+  if (!pullback) return { action: "buy", reason: "pullback", confidence, entryType: "pullback" };
+  return { action: "hold", reason: breakout, confidence, entryType: null };
 }
 
 export function momentumSize(input: {
@@ -421,8 +496,7 @@ export function originalFraction(ofOriginal: number, alreadySold: number): numbe
 
 /**
  * Exits in order. One call returns one exit. Take-profits are fractions of
- * the original position: 25% at +50%, 35% at +100%, 25% at +300%. The last
- * 15% is the moonbag.
+ * the original position: 35% at +40% and 40% at +90%. The last 25% is the moonbag.
  */
 export function momentumExit(input: {
   entryPriceSol: number;
@@ -430,7 +504,6 @@ export function momentumExit(input: {
   priceSol: number;
   tp1Taken: boolean;
   tp2Taken: boolean;
-  tp3Taken: boolean;
   sellVolume15mUsd: number | null;
   buyVolume15mUsd: number | null;
   volume15mComplete: boolean;
@@ -448,13 +521,7 @@ export function momentumExit(input: {
   if (input.tp1Taken && !input.tp2Taken && price >= entry * (1 + MOMENTUM.tp2Gain)) {
     return { reason: "momentum_tp2", sellFraction: originalFraction(MOMENTUM.tp2OfOriginal, MOMENTUM.tp1OfOriginal) };
   }
-  if (input.tp1Taken && input.tp2Taken && !input.tp3Taken && price >= entry * (1 + MOMENTUM.tp3Gain)) {
-    return {
-      reason: "momentum_tp3",
-      sellFraction: originalFraction(MOMENTUM.tp3OfOriginal, MOMENTUM.tp1OfOriginal + MOMENTUM.tp2OfOriginal),
-    };
-  }
-  if (input.tp1Taken && input.tp2Taken && input.tp3Taken) {
+  if (input.tp1Taken && input.tp2Taken) {
     if (price <= peak * (1 - MOMENTUM.moonbagTrailDrop)) return { reason: "momentum_moonbag", sellFraction: 1 };
     const buy = input.buyVolume15mUsd;
     const sell = input.sellVolume15mUsd;

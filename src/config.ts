@@ -157,6 +157,8 @@ export interface AppConfig {
   momentumPollSec: number;
   /** Closed 5m candles whose high is the local resistance. */
   momentumResistanceCandles: number;
+  /** Minutes of 5m candles used as the pullback high. */
+  momentumPullbackLookbackMin: number;
   /** Share of available cash for each momentum buy. Confidence does not change it. */
   momentumSizePct: number;
   /** Momentum notional cap. Replaces the sniper $30 cap. */
@@ -176,6 +178,8 @@ export interface AppConfig {
   momentumJitoTipMaxSol: number;
   /** PumpSwap LP plus protocol fee, in basis points. */
   momentumPumpswapFeeBps: number;
+  /** Bonding-curve fee, in basis points. pump.fun charges about 1%. */
+  momentumPumpFeeBps: number;
   /** Raydium swap fee, in basis points. */
   momentumRaydiumFeeBps: number;
   /** Alternative paper bankroll. Converted with the live SOL/USD price when the balance file is created. */
@@ -390,6 +394,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const momentumResistanceCandles = Math.floor(
     num(env.MOMENTUM_RESISTANCE_CANDLES, 6, "MOMENTUM_RESISTANCE_CANDLES"),
   );
+  const momentumPullbackLookbackMin = Math.floor(
+    num(env.MOMENTUM_PULLBACK_LOOKBACK_MIN, 60, "MOMENTUM_PULLBACK_LOOKBACK_MIN"),
+  );
   const momentumSizePct = num(env.MOMENTUM_SIZE_PCT, 20, "MOMENTUM_SIZE_PCT");
   const momentumMaxUsd = num(env.MOMENTUM_MAX_USD, 100, "MOMENTUM_MAX_USD");
   const gasReserveUsd = num(env.GAS_RESERVE_USD, 4, "GAS_RESERVE_USD");
@@ -400,6 +407,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const momentumJitoTipMinSol = num(env.MOMENTUM_JITO_TIP_MIN_SOL, 0.0001, "MOMENTUM_JITO_TIP_MIN_SOL");
   const momentumJitoTipMaxSol = num(env.MOMENTUM_JITO_TIP_MAX_SOL, 0.0003, "MOMENTUM_JITO_TIP_MAX_SOL");
   const momentumPumpswapFeeBps = num(env.MOMENTUM_PUMPSWAP_FEE_BPS, 25, "MOMENTUM_PUMPSWAP_FEE_BPS");
+  const momentumPumpFeeBps = num(env.MOMENTUM_PUMP_FEE_BPS, 100, "MOMENTUM_PUMP_FEE_BPS");
   const momentumRaydiumFeeBps = num(env.MOMENTUM_RAYDIUM_FEE_BPS, 25, "MOMENTUM_RAYDIUM_FEE_BPS");
   const paperStartBalanceUsd = optionalNum(env.PAPER_START_BALANCE_USD, "PAPER_START_BALANCE_USD");
   const heliusSenderUrl = str(env.HELIUS_SENDER_URL, "") || null;
@@ -599,6 +607,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!Number.isInteger(momentumResistanceCandles) || momentumResistanceCandles < 2) {
     throw new ConfigError("MOMENTUM_RESISTANCE_CANDLES must be an integer >= 2");
   }
+  if (!Number.isInteger(momentumPullbackLookbackMin) || momentumPullbackLookbackMin < 5) {
+    throw new ConfigError("MOMENTUM_PULLBACK_LOOKBACK_MIN must be an integer >= 5");
+  }
   if (
     strategy === "momentum" &&
     mode === "paper" &&
@@ -628,7 +639,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   ) {
     throw new ConfigError("MOMENTUM_JITO_TIP_MIN_SOL and MOMENTUM_JITO_TIP_MAX_SOL must sit inside 0 to 0.005");
   }
-  if (momentumPumpswapFeeBps < 0 || momentumPumpswapFeeBps > 500 || momentumRaydiumFeeBps < 0 || momentumRaydiumFeeBps > 500) {
+  if (
+    momentumPumpswapFeeBps < 0 ||
+    momentumPumpswapFeeBps > 500 ||
+    momentumPumpFeeBps < 0 ||
+    momentumPumpFeeBps > 500 ||
+    momentumRaydiumFeeBps < 0 ||
+    momentumRaydiumFeeBps > 500
+  ) {
     throw new ConfigError("momentum swap fee bps must be between 0 and 500");
   }
   if (paperStartBalanceUsd != null && !(paperStartBalanceUsd > 0)) {
@@ -734,6 +752,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     rugCheckRpcUrl,
     momentumPollSec,
     momentumResistanceCandles,
+    momentumPullbackLookbackMin,
     momentumSizePct,
     momentumMaxUsd,
     gasReserveUsd,
@@ -744,6 +763,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     momentumJitoTipMinSol,
     momentumJitoTipMaxSol,
     momentumPumpswapFeeBps,
+    momentumPumpFeeBps,
     momentumRaydiumFeeBps,
     paperStartBalanceUsd,
     heliusSenderUrl,

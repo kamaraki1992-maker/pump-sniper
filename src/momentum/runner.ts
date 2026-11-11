@@ -15,6 +15,7 @@ import {
   bundledInsiderPct,
   clampPriorityFee,
   candleMove5mPct,
+  curveLiquidityUsd,
   evaluateMomentum,
   liveAvailableSol,
   momentumExit,
@@ -220,14 +221,15 @@ export class MomentumRunner {
     const honeypot = this.deps.honeypot
       ? await this.deps.honeypot(mint).catch(() => ({ ok: false, reason: "honeypot_unsimulated" }))
       : { ok: false, reason: "honeypot_unsimulated" };
-    const facts = this.facts(pair, candles, trades, chain, nowMs, honeypot, pair.socialsOk);
+    const facts = this.facts(pair, candles, trades, chain, nowMs, honeypot, pair.socialsOk, solUsd);
     const decision = evaluateMomentum(facts);
     this.logDecision(mint, decision.action, decision.reason, decision.confidence, {
       mcap: pair.marketCapUsd,
-      liq: pair.liquidityUsd,
+      liq: facts.liquidityUsd,
+      entryType: decision.entryType,
     });
-    if (decision.action !== "buy" || decision.confidence == null) return;
-    await this.buy(pair, facts, decision.confidence, solUsd);
+    if (decision.action !== "buy" || decision.confidence == null || decision.entryType == null) return;
+    await this.buy(pair, facts, decision.confidence, solUsd, decision.entryType);
   }
 
   private facts(
@@ -238,6 +240,7 @@ export class MomentumRunner {
     nowMs: number,
     honeypot: { ok: boolean; reason: string | null },
     socialsOk: boolean,
+    solUsd: number,
   ): MomentumFacts {
     const memory = this.launches.get(pair.mint);
     const bundlePct = memory?.incomplete
@@ -250,7 +253,9 @@ export class MomentumRunner {
         });
     return {
       nowMs,
-      liquidityUsd: pair.liquidityUsd,
+      liquidityUsd: momentumPool(pair.dexId) === "pump"
+        ? curveLiquidityUsd(pair.quoteAmount, solUsd, pair.liquidityUsd)
+        : pair.liquidityUsd,
       dexId: pair.dexId,
       sawGraduation: this.graduated.has(pair.mint),
       top10Pct: chain.top10Pct,
@@ -280,10 +285,17 @@ export class MomentumRunner {
       sellVolume15mUsd: trades?.sellVolume15mUsd ?? null,
       buyVolume15mUsd: trades?.buyVolume15mUsd ?? null,
       volume15mComplete: trades?.volume15mComplete ?? false,
+      pullbackLookbackMin: this.deps.config.momentumPullbackLookbackMin,
     };
   }
 
-  private async buy(pair: DexPair, facts: MomentumFacts, confidence: number, solUsd: number): Promise<void> {
+  private async buy(
+    pair: DexPair,
+    facts: MomentumFacts,
+    confidence: number,
+    solUsd: number,
+    entryType: "breakout" | "pullback",
+  ): Promise<void> {
     const parts = await this.balance(solUsd);
     const sized = momentumSize({
       availableSol: parts.availableSol,
@@ -364,6 +376,7 @@ export class MomentumRunner {
       confidence: confidence / 100,
       entryScore: confidence,
       bundle: fees.useJito ? "jito" : null,
+      entryType,
       ...(costs ? { costs } : {}),
     });
     if (fill.status !== "filled") return;
@@ -387,8 +400,8 @@ export class MomentumRunner {
       momentumOriginalTokens: fill.tokenAmount,
       momentumTp1Taken: false,
       momentumTp2Taken: false,
-      momentumTp3Taken: false,
       momentumPool: pool,
+      momentumEntryType: entryType,
       graduated: true,
     };
     this.deps.positions.open(position);
@@ -417,7 +430,6 @@ export class MomentumRunner {
         priceSol,
         tp1Taken: position.momentumTp1Taken === true,
         tp2Taken: position.momentumTp2Taken === true,
-        tp3Taken: position.momentumTp3Taken === true,
         sellVolume15mUsd: trades?.sellVolume15mUsd ?? null,
         buyVolume15mUsd: trades?.buyVolume15mUsd ?? null,
         volume15mComplete: trades?.volume15mComplete ?? false,
@@ -511,6 +523,7 @@ export class MomentumRunner {
         costSol: fill.status === "filled" ? costAllocated : current.costSol,
         triggerPriceSol: quote,
         bundle: fees.useJito ? "jito" : null,
+        entryType: current.momentumEntryType ?? null,
         ...(costs ? { costs } : {}),
       });
       if (fill.status !== "filled") return;
@@ -525,7 +538,6 @@ export class MomentumRunner {
         current.realizedPnlSol = total ?? current.realizedPnlSol;
         if (reason === "momentum_tp1") current.momentumTp1Taken = true;
         if (reason === "momentum_tp2") current.momentumTp2Taken = true;
-        if (reason === "momentum_tp3") current.momentumTp3Taken = true;
         return;
       }
       this.deps.positions.close(current.mint);

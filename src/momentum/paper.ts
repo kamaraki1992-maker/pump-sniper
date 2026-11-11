@@ -20,9 +20,10 @@ export interface SwapQuote {
   swapFeeSol: number;
 }
 
-/** PumpSwap uses the LP+protocol bps. Raydium uses its own bps. */
+/** Bonding curve uses the pump.fun fee. PumpSwap uses LP plus protocol. Raydium uses its own. */
 export function swapFeeBps(config: AppConfig, dexId: string): number {
   const id = dexId.toLowerCase();
+  if (id === "pump" || id === "pumpfun" || id === "pump.fun") return config.momentumPumpFeeBps;
   if (id === "raydium" || id === "raydium-cpmm") return config.momentumRaydiumFeeBps;
   return config.momentumPumpswapFeeBps;
 }

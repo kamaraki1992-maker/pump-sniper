@@ -12,8 +12,12 @@ import { MomentumRunner } from "../src/momentum/runner.js";
 import {
   MOMENTUM,
   bundledInsiderPct,
+  curveLiquidityUsd,
   evaluateMomentum,
   hourVolumeOk,
+  inPullbackBand,
+  momentumPool,
+  rsiBounce,
   higherLows,
   localResistance,
   momentumExit,
@@ -102,6 +106,7 @@ function passingFacts(patch: Partial<MomentumFacts> = {}): MomentumFacts {
     sellVolume15mUsd: 1,
     buyVolume15mUsd: 10,
     volume15mComplete: true,
+    pullbackLookbackMin: 60,
     ...patch,
   };
 }
@@ -127,7 +132,7 @@ test("each safety filter fails closed on its own", () => {
     [{ mintOk: false, mintReason: "transfer-fee" }, "transfer-fee"],
     [{ mintOk: false, mintReason: "transfer-hook" }, "transfer-hook"],
     [{ mintOk: false, mintReason: "unsupported-token-program" }, "unsupported-token-program"],
-    [{ liquidityUsd: 14_999 }, "liquidity"],
+    [{ liquidityUsd: 9_999 }, "liquidity"],
     [{ dexId: "orca" }, "lp_not_canonical"],
     [{ dexId: "raydium", sawGraduation: false }, "lp_not_canonical"],
     [{ top10Pct: 25 }, "top10"],
@@ -139,8 +144,8 @@ test("each safety filter fails closed on its own", () => {
     [{ devPct: null }, "dev_unknown"],
     [{ bundlePct: 15 }, "bundle"],
     [{ bundlePct: null }, "bundle_unknown"],
-    [{ pairCreatedAtMs: passingFacts().nowMs - 9 * 60 * 1000 }, "too_young"],
-    [{ pairCreatedAtMs: passingFacts().nowMs - 24 * 60 * 60 * 1000 }, "too_old"],
+    [{ pairCreatedAtMs: passingFacts().nowMs - 2 * 60 * 1000 }, "too_young"],
+    [{ pairCreatedAtMs: passingFacts().nowMs - 48 * 60 * 60 * 1000 }, "too_old"],
     [{ pairCreatedAtMs: null }, "age_unknown"],
   ];
   for (const [patch, reason] of cases) {
@@ -161,8 +166,8 @@ test("each entry trigger fails on its own", () => {
   assert.equal(higherLows(base.candles), true);
   assert.ok(base.price > (localResistance(base.candles, 6) ?? 0));
   const cases: Array<[Partial<MomentumFacts>, string]> = [
-    [{ marketCapUsd: 49_999 }, "mcap"],
-    [{ marketCapUsd: 400_001 }, "mcap"],
+    [{ marketCapUsd: 29_999 }, "mcap"],
+    [{ marketCapUsd: 800_001 }, "mcap"],
     [{ volume5mUsd: 20_000 * 1.5 - 1 }, "volume"],
     [{ buys5m: 18, sells5m: 10 }, "buy_sell_ratio"],
     [{ makers1h: 149 }, "makers"],
@@ -228,22 +233,19 @@ test("exits fire in order and use fractions of the original position", () => {
     priceSol: 1,
     tp1Taken: false,
     tp2Taken: false,
-    tp3Taken: false,
     sellVolume15mUsd: 1,
     buyVolume15mUsd: 10,
     volume15mComplete: true,
   };
   assert.equal(momentumExit({ ...held, priceSol: 0.75 })?.reason, "momentum_sl");
   assert.equal(momentumExit({ ...held, priceSol: 0.75 })?.sellFraction, 1);
-  assert.equal(momentumExit({ ...held, priceSol: 1.5, peakPriceSol: 1.5 })?.reason, "momentum_tp1");
-  assert.equal(momentumExit({ ...held, priceSol: 1.5, peakPriceSol: 1.5 })?.sellFraction, 0.25);
-  assert.equal(momentumExit({ ...held, priceSol: 4, peakPriceSol: 4 })?.reason, "momentum_tp1");
-  const afterTp1 = momentumExit({ ...held, tp1Taken: true, priceSol: 2, peakPriceSol: 2 });
+  assert.equal(momentumExit({ ...held, priceSol: 1.4, peakPriceSol: 1.4 })?.reason, "momentum_tp1");
+  assert.equal(momentumExit({ ...held, priceSol: 1.4, peakPriceSol: 1.4 })?.sellFraction, 0.35);
+  assert.equal(momentumExit({ ...held, priceSol: 1.9, peakPriceSol: 1.9 })?.reason, "momentum_tp1");
+  const afterTp1 = momentumExit({ ...held, tp1Taken: true, priceSol: 1.9, peakPriceSol: 1.9 });
   assert.equal(afterTp1?.reason, "momentum_tp2");
-  assert.ok(afterTp1 && Math.abs(afterTp1.sellFraction - 0.35 / 0.75) < 1e-9);
-  const afterTp2 = momentumExit({ ...held, tp1Taken: true, tp2Taken: true, priceSol: 4, peakPriceSol: 4 });
-  assert.equal(afterTp2?.reason, "momentum_tp3");
-  assert.ok(afterTp2 && Math.abs(afterTp2.sellFraction - 0.25 / 0.4) < 1e-9);
+  assert.ok(afterTp1 && Math.abs(afterTp1.sellFraction - 0.4 / 0.65) < 1e-9);
+  assert.equal(momentumExit({ ...held, tp1Taken: true, tp2Taken: true, priceSol: 4, peakPriceSol: 4 }), null);
   const bag = { ...held, tp1Taken: true, tp2Taken: true, tp3Taken: true };
   assert.equal(momentumExit({ ...bag, peakPriceSol: 6, priceSol: 4.4 })?.reason, "momentum_moonbag");
   assert.equal(momentumExit({ ...bag, peakPriceSol: 6, priceSol: 4.6 }), null);
@@ -252,7 +254,6 @@ test("exits fire in order and use fractions of the original position", () => {
       ...held,
       tp1Taken: true,
       tp2Taken: true,
-      tp3Taken: true,
       peakPriceSol: 6,
       priceSol: 6,
       sellVolume15mUsd: 5,
@@ -265,7 +266,6 @@ test("exits fire in order and use fractions of the original position", () => {
       ...held,
       tp1Taken: true,
       tp2Taken: true,
-      tp3Taken: true,
       peakPriceSol: 6,
       priceSol: 6,
       sellVolume15mUsd: 5,
@@ -280,10 +280,14 @@ test("exits fire in order and use fractions of the original position", () => {
   assert.equal(momentumExit({ ...held, peakPriceSol: 1.4, priceSol: 1.06 })?.reason, undefined);
   assert.equal(momentumExit({ ...held, peakPriceSol: 1.4, priceSol: 1.05 })?.reason, "momentum_sl");
   assert.equal(momentumExit({ ...held, peakPriceSol: 1.4, priceSol: 0.9 })?.reason, "momentum_sl");
-  const staleAt = 10 * 60 * 60 * 1000;
+  const staleAt = 90 * 60 * 1000;
   assert.equal(
-    momentumExit({ ...held, peakPriceSol: 1.1, priceSol: 1.05, openedAtMs: 0, nowMs: staleAt })?.reason,
+    momentumExit({ ...held, peakPriceSol: 1.11, priceSol: 1.05, openedAtMs: 0, nowMs: staleAt })?.reason,
     "momentum_stale",
+  );
+  assert.equal(
+    momentumExit({ ...held, peakPriceSol: 1.13, priceSol: 1.13, openedAtMs: 0, nowMs: staleAt }),
+    null,
   );
   assert.equal(
     momentumExit({ ...held, peakPriceSol: 1.2, priceSol: 1.1, openedAtMs: 0, nowMs: staleAt }),
@@ -701,6 +705,7 @@ test("status reports pnl, fees, equity, and the kill switch", () => {
     tokenAmount: 1,
     realizedPnlSol: 0.05,
     costSol: 0.1,
+    entryType: "pullback",
     costs: {
       baseFeeSol: 0.000005,
       priorityFeeSol: 0.0002,
@@ -748,6 +753,8 @@ test("status reports pnl, fees, equity, and the kill switch", () => {
   assert.equal(report.highWaterMarkSol, 1);
   assert.ok((report.equitySol ?? 0) > 0);
   assert.equal(report.solCrashPause.active, false);
+  assert.equal(report.entryTypes.pullback.winRate, 1);
+  assert.equal(report.entryTypes.breakout.trades, 0);
 });
 
 test("1h volume, 15m buy pressure, and a 60% five-minute run-up gate entries", () => {
@@ -788,4 +795,43 @@ test("a 3% drop from the 60-minute SOL high pauses buys, and a stale feed does n
   const ended = guard.observe(99, extended.pauseUntilMs + 1_000, extended.pauseUntilMs + 1_000);
   assert.equal(ended.kind, "end");
   assert.equal(ended.active, false);
+});
+
+test("a bonding-curve pair passes the LP check and a pullback can enter", () => {
+  assert.equal(momentumPool("pumpfun"), "pump");
+  assert.equal(curveLiquidityUsd(null, 100, 12_000), 12_000);
+  assert.equal(curveLiquidityUsd(10, 100, 0), 2_000);
+  const curve = evaluateMomentum(passingFacts({ dexId: "pumpfun", sawGraduation: false }));
+  assert.equal(curve.action, "buy");
+  assert.equal(curve.entryType, "breakout");
+  assert.equal(inPullbackBand(80, 100), true);
+  assert.equal(inPullbackBand(86, 100), false);
+  assert.equal(inPullbackBand(74, 100), false);
+  assert.equal(rsiBounce(45, 50), true);
+  assert.equal(rsiBounce(46, 50), false);
+  assert.equal(rsiBounce(40, 39), false);
+  const facts = passingFacts();
+  facts.price = facts.price * 0.8;
+  facts.candles = facts.candles.map((candle) => ({ ...candle, high: facts.price / 0.8 }));
+  const decision = evaluateMomentum(facts);
+  assert.equal(decision.action, "hold");
+  assert.equal(decision.entryType, null);
+});
+
+test("the stale exit is 90 minutes at +12%", () => {
+  const held = {
+    entryPriceSol: 1,
+    peakPriceSol: 1.11,
+    priceSol: 1.05,
+    tp1Taken: false,
+    tp2Taken: false,
+    sellVolume15mUsd: 1,
+    buyVolume15mUsd: 10,
+    volume15mComplete: true,
+    openedAtMs: 0,
+    nowMs: 90 * 60 * 1000,
+  };
+  assert.equal(momentumExit(held)?.reason, "momentum_stale");
+  assert.equal(momentumExit({ ...held, nowMs: 89 * 60 * 1000 }), null);
+  assert.equal(momentumExit({ ...held, peakPriceSol: 1.13, priceSol: 1.13 }), null);
 });

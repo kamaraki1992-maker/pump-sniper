@@ -34,6 +34,17 @@ export interface StatusReport {
   killSwitch: { active: boolean; reason: string | null };
   sessionStart: string | null;
   solCrashPause: { active: boolean; until: string | null; high: number | null; price: number | null };
+  entryTypes: {
+    breakout: EntryTypeStats;
+    pullback: EntryTypeStats;
+  };
+}
+
+export interface EntryTypeStats {
+  trades: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
 }
 
 function readJson<T>(path: string): T | null {
@@ -73,6 +84,21 @@ export function buildStatus(input: {
   const sells = filled.filter((row) => row.side === "sell" && typeof row.realizedPnlSol === "number");
   const wins = sells.filter((row) => (row.realizedPnlSol ?? 0) > 0).length;
   const losses = sells.filter((row) => (row.realizedPnlSol ?? 0) < 0).length;
+  const entryTypes = {
+    breakout: emptyEntryStats(),
+    pullback: emptyEntryStats(),
+  };
+  for (const sell of sells) {
+    const kind = sellEntryType(sell, filled);
+    if (!kind) continue;
+    const bucket = entryTypes[kind];
+    bucket.trades += 1;
+    if ((sell.realizedPnlSol ?? 0) > 0) bucket.wins += 1;
+    if ((sell.realizedPnlSol ?? 0) < 0) bucket.losses += 1;
+  }
+  for (const bucket of Object.values(entryTypes)) {
+    bucket.winRate = bucket.wins + bucket.losses > 0 ? bucket.wins / (bucket.wins + bucket.losses) : null;
+  }
   const netPnlSol = sells.reduce((sum, row) => sum + (row.realizedPnlSol ?? 0), 0);
   const fees = {
     baseFeeSol: 0,
@@ -151,6 +177,7 @@ export function buildStatus(input: {
     drawdownPct: equitySol != null && equity ? drawdownPct(equitySol, equity.hwmSol) : null,
     killSwitch: { active: kill, reason: killBody?.reason ?? null },
     sessionStart: equity?.sessionStart ?? null,
+    entryTypes,
     solCrashPause: {
       active: pauseUntil > nowMs,
       until: pauseUntil > 0 ? new Date(pauseUntil).toISOString() : null,
@@ -158,6 +185,20 @@ export function buildStatus(input: {
       price: typeof crash?.price === "number" ? crash.price : null,
     },
   };
+}
+
+function emptyEntryStats(): EntryTypeStats {
+  return { trades: 0, wins: 0, losses: 0, winRate: null };
+}
+
+function sellEntryType(sell: TradeRecord, trades: TradeRecord[]): "breakout" | "pullback" | null {
+  if (sell.entryType === "breakout" || sell.entryType === "pullback") return sell.entryType;
+  let found: "breakout" | "pullback" | null = null;
+  for (const row of trades) {
+    if (row.side !== "buy" || row.mint !== sell.mint || row.timestamp > sell.timestamp) continue;
+    if (row.entryType === "breakout" || row.entryType === "pullback") found = row.entryType;
+  }
+  return found;
 }
 
 function round(value: number | null, digits: number): number | null {
