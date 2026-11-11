@@ -37,6 +37,8 @@ export interface ScalpDeps {
   walletBalanceSol?: () => Promise<number>;
   reclaimRent?: (mint: string) => Promise<{ closed: boolean; rentSol: number; reason: string }>;
   gate: (mint: string, hint: ScalpHint) => Promise<ScalpGateFacts | "timeout">;
+  /** Local trade subscription. The Helius program feed filters to these mints. */
+  watch?: (mint: string) => void;
   daily?: DailyLossBook;
 }
 
@@ -53,6 +55,7 @@ interface LaunchMemory {
  * runs only after a spike, inside SCALP_GATE_MS. Exits use the same prints.
  */
 export class ScalpRunner {
+  private readonly watched = new Set<string>();
   private readonly prints = new Map<string, ScalpPrint[]>();
   private readonly launches = new Map<string, LaunchMemory>();
   private readonly gating = new Set<string>();
@@ -77,10 +80,34 @@ export class ScalpRunner {
       buys: prior?.buys ?? [],
       incomplete: prior?.incomplete ?? false,
     });
+    this.watch(event.mint);
+  }
+
+  /** A mint found on DexScreener or the launch feed. Later prints are eligible. */
+  watch(mint: string): void {
+    if (this.watched.has(mint)) return;
+    this.watched.add(mint);
+    this.deps.watch?.(mint);
+    this.deps.log.info("scalp", { mint, decision: "watch", reason: "candidate" });
+  }
+
+  /** DexScreener boosted and profiled Solana mints, plus anything already watched. */
+  async discover(): Promise<void> {
+    try {
+      const mints = await this.deps.market.candidates();
+      for (const mint of mints) this.watch(mint);
+    } catch (error) {
+      this.deps.log.info("scalp", {
+        decision: "skip",
+        reason: "discovery_unavailable",
+        error: error instanceof Error ? error.message : "market",
+      });
+    }
   }
 
   noteTrade(event: MarketTrade): void {
     if (!(event.priceSol != null && event.priceSol > 0)) return;
+    if (!this.watched.has(event.mint) && this.deps.positions.get(event.mint)?.strategy !== "scalp") return;
     const memory = this.launches.get(event.mint);
     if (memory && event.txType === "buy" && memory.slot != null && event.slot != null) {
       if (event.slot >= memory.slot && event.slot <= memory.slot + 2 && event.trader !== memory.creator) {
@@ -112,6 +139,7 @@ export class ScalpRunner {
   }
 
   async tick(): Promise<void> {
+    await this.discover();
     this.checkClocks();
     await this.markEquity();
     const nowMs = this.deps.now().getTime();

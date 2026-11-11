@@ -398,13 +398,13 @@ function attachScalp(runtime: Runtime, runner: ScalpRunner): LiveStream | null {
   }
   const stream = new HeliusFeed(runtime.config.rpcWsUrl, runtime.log, {
     stallMs: runtime.config.feedStallSec * 1000,
-    allTrades: true,
     pumpSwap: true,
   });
   runtime.subscription.stream = stream;
   runtime.log.info("stream", { source: "helius", feed: "scalp" });
   stream.start((event) => {
     if (event.kind === "launch") runner.noteLaunch(event);
+    else if (event.kind === "graduation") runner.watch(event.mint);
     else if (event.kind === "trade") runner.noteTrade(event);
   });
   return stream;
@@ -425,6 +425,7 @@ export async function runScalp(runtime: Runtime, options: { maxRuntimeMs?: numbe
     now: () => new Date(),
     market,
     gate: createScalpGate(config, market),
+    watch: (mint) => runtime.subscription.stream?.subscribeTrades([mint]),
     ...(runtime.paperBalance ? { paperBalance: runtime.paperBalance } : {}),
     ...(runtime.walletBalanceSol ? { walletBalanceSol: runtime.walletBalanceSol } : {}),
     ...(runtime.reclaimRent ? { reclaimRent: runtime.reclaimRent } : {}),
@@ -437,6 +438,7 @@ export async function runScalp(runtime: Runtime, options: { maxRuntimeMs?: numbe
     maxOpenPositions: config.maxOpenPositions,
   });
   const stream = attachScalp(runtime, runner);
+  void runner.discover();
   let stopped = false;
   const shutdown = (why: string) => {
     if (stopped) return;

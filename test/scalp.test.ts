@@ -131,6 +131,19 @@ test("the safety gate fails closed and a paper spike buys at the fixed priority 
     }),
   });
   const mint = "MintScalp111";
+  runner.noteTrade({
+    kind: "trade",
+    mint: "NotWatched",
+    txType: "buy",
+    trader: "buyer",
+    signature: "ignored",
+    solQuoted: true,
+    priceSol: 2,
+    marketCapSol: 400,
+    vSolSol: 40,
+    vTokens: 1_000_000,
+  });
+  runner.watch(mint);
   for (let i = 0; i < 10; i += 1) {
     const trade: MarketTrade = {
       kind: "trade",
@@ -149,6 +162,7 @@ test("the safety gate fails closed and a paper spike buys at the fixed priority 
   }
   await new Promise((resolve) => setTimeout(resolve, 20));
   const open = positions.get(mint);
+  assert.equal(positions.get("NotWatched"), undefined);
   assert.equal(open?.strategy, "scalp");
   const buy = trades.readAll().at(-1);
   assert.equal(buy?.strategy, "scalp");
