@@ -190,6 +190,14 @@ export interface AppConfig {
   scalpMaxCostPct: number;
   /** Sell the whole scalp position when the leftover would be worth less than this. */
   scalpMinRemainderSol: number;
+  /** Buys at least this large required before a scalp entry. */
+  scalpMinLargeBuys: number;
+  /** A buy of this many dollars counts as large. */
+  scalpLargeBuyUsd: number;
+  /** A buy strictly above this many SOL counts as large. */
+  scalpLargeBuySol: number;
+  /** How far back the large-buy count looks, in seconds. */
+  scalpLargeBuyWindowSec: number;
   /** Raydium swap fee, in basis points. */
   momentumRaydiumFeeBps: number;
   /** Alternative paper bankroll. Converted with the live SOL/USD price when the balance file is created. */
@@ -424,6 +432,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const scalpGateMs = num(env.SCALP_GATE_MS, 1_500, "SCALP_GATE_MS");
   const scalpMaxCostPct = num(env.SCALP_MAX_COST_PCT, 4, "SCALP_MAX_COST_PCT");
   const scalpMinRemainderSol = num(env.SCALP_MIN_REMAINDER_SOL, 0.01, "SCALP_MIN_REMAINDER_SOL");
+  const scalpMinLargeBuys = Math.floor(num(env.SCALP_MIN_LARGE_BUYS, 2, "SCALP_MIN_LARGE_BUYS"));
+  const scalpLargeBuyUsd = num(env.SCALP_LARGE_BUY_USD, 300, "SCALP_LARGE_BUY_USD");
+  const scalpLargeBuySol = num(env.SCALP_LARGE_BUY_SOL, 2, "SCALP_LARGE_BUY_SOL");
+  const scalpLargeBuyWindowSec = num(env.SCALP_LARGE_BUY_WINDOW_SEC, 120, "SCALP_LARGE_BUY_WINDOW_SEC");
   const momentumRaydiumFeeBps = num(env.MOMENTUM_RAYDIUM_FEE_BPS, 25, "MOMENTUM_RAYDIUM_FEE_BPS");
   const paperStartBalanceUsd = optionalNum(env.PAPER_START_BALANCE_USD, "PAPER_START_BALANCE_USD");
   const heliusSenderUrl = str(env.HELIUS_SENDER_URL, "") || null;
@@ -649,6 +661,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!(scalpGateMs >= 250)) throw new ConfigError("SCALP_GATE_MS must be at least 250");
   if (!(scalpMaxCostPct > 0) || scalpMaxCostPct > 100) throw new ConfigError("SCALP_MAX_COST_PCT must be between 0 and 100");
   if (!(scalpMinRemainderSol >= 0)) throw new ConfigError("SCALP_MIN_REMAINDER_SOL must be >= 0");
+  if (!(scalpMinLargeBuys >= 1)) throw new ConfigError("SCALP_MIN_LARGE_BUYS must be at least 1");
+  if (!(scalpLargeBuyUsd > 0)) throw new ConfigError("SCALP_LARGE_BUY_USD must be positive");
+  if (!(scalpLargeBuySol > 0)) throw new ConfigError("SCALP_LARGE_BUY_SOL must be positive");
+  if (!(scalpLargeBuyWindowSec > 0)) throw new ConfigError("SCALP_LARGE_BUY_WINDOW_SEC must be positive");
   if (!(momentumPriorityFeeSol > 0) || momentumPriorityFeeSol > momentumTurboFeeSol) {
     throw new ConfigError("MOMENTUM_PRIORITY_FEE_SOL must be > 0 and at most MOMENTUM_TURBO_FEE_SOL");
   }
@@ -792,6 +808,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     scalpGateMs,
     scalpMaxCostPct,
     scalpMinRemainderSol,
+    scalpMinLargeBuys,
+    scalpLargeBuyUsd,
+    scalpLargeBuySol,
+    scalpLargeBuyWindowSec,
     momentumRaydiumFeeBps,
     paperStartBalanceUsd,
     heliusSenderUrl,

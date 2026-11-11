@@ -34,6 +34,14 @@ export interface ScalpPrint {
   atMs: number;
   priceSol: number;
   side: "buy" | "sell";
+  solAmount?: number | null;
+}
+
+export interface ScalpLargeBuy {
+  sol: number;
+  usd: number | null;
+  /** Which bar this buy cleared. `both` means it cleared the USD floor and the SOL floor. */
+  via: "usd" | "sol" | "both";
 }
 
 export interface ScalpSpike {
@@ -56,6 +64,31 @@ export function scalpSpike(prints: readonly ScalpPrint[], nowMs: number): ScalpS
   if (rise < SCALP.minRise) return { ok: false, reason: "spike", risePct: rise * 100, buys };
   if (buys < SCALP.consecutiveBuys) return { ok: false, reason: "consecutive_buys", risePct: rise * 100, buys };
   return { ok: true, reason: "spike", risePct: rise * 100, buys };
+}
+
+/**
+ * Buys in the window that are at least `minUsd` at the live SOL price, or
+ * strictly above `minSol`. Either bar is enough, so the lower one is the
+ * one that actually qualifies the print.
+ */
+export function scalpLargeBuys(
+  prints: readonly ScalpPrint[],
+  nowMs: number,
+  input: { windowMs: number; minUsd: number; minSol: number; minCount: number; solUsd: number | null },
+): { ok: boolean; buys: ScalpLargeBuy[] } {
+  const solUsd = input.solUsd != null && input.solUsd > 0 ? input.solUsd : null;
+  const buys: ScalpLargeBuy[] = [];
+  for (const print of prints) {
+    if (print.side !== "buy" || print.atMs < nowMs - input.windowMs || print.atMs > nowMs) continue;
+    const sol = print.solAmount ?? 0;
+    if (!(sol > 0)) continue;
+    const usd = solUsd != null ? sol * solUsd : null;
+    const byUsd = usd != null && usd >= input.minUsd;
+    const bySol = sol > input.minSol;
+    if (!byUsd && !bySol) continue;
+    buys.push({ sol, usd, via: byUsd && bySol ? "both" : byUsd ? "usd" : "sol" });
+  }
+  return { ok: buys.length >= input.minCount, buys };
 }
 
 /** Buys at the end of the tape. A sell resets the count. */

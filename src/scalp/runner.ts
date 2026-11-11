@@ -12,7 +12,7 @@ import { TOTAL_SUPPLY_TOKENS } from "../pricing.js";
 import { berlinDay, type TradeLog } from "../report.js";
 import type { Executor, MarketLaunch, MarketTrade, Position, TradeReason } from "../types.js";
 import type { ScalpGateFacts } from "./rules.js";
-import { SCALP, scalpExecutionFee, scalpExit, scalpGate, scalpRemainderNetSol, scalpRoundTripCost, scalpSpike, type ScalpPrint } from "./rules.js";
+import { SCALP, scalpExecutionFee, scalpExit, scalpGate, scalpLargeBuys, scalpRemainderNetSol, scalpRoundTripCost, scalpSpike, type ScalpPrint } from "./rules.js";
 import { bundledInsiderPct } from "../momentum/rules.js";
 import { WSOL_MINT } from "../pricing.js";
 
@@ -118,11 +118,17 @@ export class ScalpRunner {
         else memory.buys.push({ slot: event.slot, trader: event.trader, tokens });
       }
     }
-    const row: ScalpPrint = { atMs: this.deps.now().getTime(), priceSol: event.priceSol, side: event.txType };
+    const row: ScalpPrint = {
+      atMs: this.deps.now().getTime(),
+      priceSol: event.priceSol,
+      side: event.txType,
+      solAmount: event.solAmount ?? null,
+    };
     const tape = this.prints.get(event.mint) ?? [];
     tape.push(row);
-    const cutoff = row.atMs - 2 * 60 * 1000;
-    this.prints.set(event.mint, tape.filter((print) => print.atMs >= cutoff).slice(-40));
+    const keepMs = Math.max(SCALP.windowMs * 2, this.deps.config.scalpLargeBuyWindowSec * 1000);
+    const cutoff = row.atMs - keepMs;
+    this.prints.set(event.mint, tape.filter((print) => print.atMs >= cutoff));
     const position = this.deps.positions.get(event.mint);
     if (position?.strategy === "scalp") {
       void this.mark(position, event.priceSol, event);
@@ -182,13 +188,28 @@ export class ScalpRunner {
     const spike = scalpSpike(this.prints.get(event.mint) ?? [], nowMs);
     this.deps.log.info("scalp", { mint: event.mint, decision: spike.ok ? "spike" : "skip", reason: spike.reason, risePct: spike.risePct, buys: spike.buys });
     if (!spike.ok) return;
+    const solUsd = this.deps.solUsd();
+    if (!(solUsd != null && solUsd > 0)) {
+      this.deps.log.info("scalp", { mint: event.mint, decision: "skip", reason: "no_price" });
+      return;
+    }
+    const large = scalpLargeBuys(this.prints.get(event.mint) ?? [], nowMs, {
+      windowMs: this.deps.config.scalpLargeBuyWindowSec * 1000,
+      minUsd: this.deps.config.scalpLargeBuyUsd,
+      minSol: this.deps.config.scalpLargeBuySol,
+      minCount: this.deps.config.scalpMinLargeBuys,
+      solUsd,
+    });
+    this.deps.log.info("scalp", {
+      mint: event.mint,
+      decision: large.ok ? "large_buys" : "skip",
+      reason: large.ok ? "large_buys" : "no_large_buyers",
+      count: large.buys.length,
+      sizes: large.buys,
+    });
+    if (!large.ok) return;
     this.gating.add(event.mint);
     try {
-      const solUsd = this.deps.solUsd();
-      if (!(solUsd != null && solUsd > 0)) {
-        this.deps.log.info("scalp", { mint: event.mint, decision: "skip", reason: "no_price" });
-        return;
-      }
       const memory = this.launches.get(event.mint);
       const liquidityUsd = this.liquidityUsd(event, solUsd);
       const bundlePct = memory?.incomplete

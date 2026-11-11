@@ -13,7 +13,7 @@ import { PositionBook } from "../src/positions.js";
 import { TradeLog } from "../src/report.js";
 import { ScalpRunner } from "../src/scalp/runner.js";
 import { ATA_RENT_SOL } from "../src/momentum/paper.js";
-import { SCALP, scalpExecutionFee, scalpExit, scalpGate, scalpRemainderNetSol, scalpRoundTripCost, scalpSpike, type ScalpPrint } from "../src/scalp/rules.js";
+import { SCALP, scalpExecutionFee, scalpExit, scalpGate, scalpLargeBuys, scalpRemainderNetSol, scalpRoundTripCost, scalpSpike, type ScalpPrint } from "../src/scalp/rules.js";
 import type { MarketTrade } from "../src/types.js";
 import { WSOL_MINT } from "../src/pricing.js";
 
@@ -98,6 +98,10 @@ test("the safety gate fails closed and a paper spike buys at the fixed priority 
     KILL_FILE: join(dir, "KILL"),
   });
   assert.equal(config.scalpPriorityFeeSol, 0.0002);
+  assert.equal(config.scalpMinLargeBuys, 2);
+  assert.equal(config.scalpLargeBuyUsd, 300);
+  assert.equal(config.scalpLargeBuySol, 2);
+  assert.equal(config.scalpLargeBuyWindowSec, 120);
   assert.equal(config.scalpMaxHoldMin, 30);
   assert.equal(config.maxOpenPositions, 4);
   const positions = new PositionBook(join(dir, "positions.json"));
@@ -157,7 +161,7 @@ test("the safety gate fails closed and a paper spike buys at the fixed priority 
       marketCapSol: 400,
       vSolSol: 400,
       vTokens: 1_000_000,
-      solAmount: 0.1,
+      solAmount: i >= 8 ? 2.5 : 0.1,
     };
     runner.noteTrade(trade);
   }
@@ -231,6 +235,102 @@ test("the safety gate fails closed and a paper spike buys at the fixed priority 
   assert.ok(Math.abs((runner["deps"].paperBalance?.cash() ?? 0) - (parked + ATA_RENT_SOL - config.paper.baseFeeSol)) < 1e-9);
 });
 
+test("a scalp entry needs two large buys in the last two minutes", async () => {
+  const now = 2_000_000;
+  const bars = {
+    windowMs: 120_000,
+    minUsd: 300,
+    minSol: 2,
+    minCount: 2,
+    solUsd: 150,
+  };
+  const print = (sol: number, side: "buy" | "sell", atMs: number): ScalpPrint => ({
+    atMs,
+    priceSol: 1,
+    side,
+    solAmount: sol,
+  });
+  const both = scalpLargeBuys(
+    [print(1.5, "buy", now), print(3, "buy", now), print(5, "sell", now), print(4, "buy", now - 120_001)],
+    now,
+    bars,
+  );
+  assert.equal(both.ok, false);
+  assert.deepEqual(both.buys.map((buy) => buy.via), ["both"]);
+  assert.equal(both.buys[0]?.usd, 450);
+  const enough = scalpLargeBuys(
+    [print(2, "buy", now), print(2.01, "buy", now - 120_000), print(3, "buy", now)],
+    now,
+    { ...bars, solUsd: 100 },
+  );
+  assert.equal(enough.ok, true);
+  assert.deepEqual(enough.buys.map((buy) => buy.via), ["sol", "both"]);
+  assert.equal(scalpLargeBuys([print(2, "buy", now)], now, { ...bars, solUsd: 150 }).buys[0]?.via, "usd");
+
+  const dir = mkdtempSync(join(tmpdir(), "scalp-large-"));
+  const config = loadConfig({
+    STRATEGY: "scalp",
+    PAPER_START_BALANCE_SOL: "10",
+    DATA_DIR: dir,
+    KILL_FILE: join(dir, "KILL"),
+  });
+  const notes: Array<Record<string, unknown>> = [];
+  const log = new Logger();
+  log.info = (message, fields) => {
+    notes.push({ message, ...fields });
+  };
+  const positions = new PositionBook(join(dir, "positions.json"));
+  const runner = new ScalpRunner({
+    config,
+    executor: new PaperExecutor(config.paper),
+    positions,
+    trades: new TradeLog(join(dir, "trades.jsonl")),
+    log,
+    solUsd: () => 100,
+    now: () => new Date(now),
+    market: {
+      async candidates() { return []; },
+      async pair() { return null; },
+      async candles() { return []; },
+      async trades() { return null; },
+    },
+    gate: async () => ({
+      ageMs: 2 * 60 * 1000,
+      liquidityUsd: 20_000,
+      mintOk: true,
+      mintReason: null,
+      honeypotOk: true,
+      honeypotReason: null,
+      top10Pct: 10,
+      devPct: 1,
+      bundlePct: 1,
+      socialsOk: true,
+    }),
+  });
+  const mint = "MintLarge111";
+  runner.watch(mint);
+  for (let i = 0; i < 10; i += 1) {
+    runner.noteTrade({
+      kind: "trade",
+      mint,
+      txType: "buy",
+      trader: "buyer",
+      signature: `small-${i}`,
+      solQuoted: true,
+      priceSol: 1 + i * 0.02,
+      marketCapSol: 400,
+      vSolSol: 400,
+      vTokens: 1_000_000,
+      solAmount: 0.4,
+    });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(positions.get(mint), undefined);
+  const skip = notes.find((row) => row.reason === "no_large_buyers");
+  assert.equal(skip?.count, 0);
+  assert.deepEqual(skip?.sizes, []);
+});
+
 test("a round trip above 4% is skipped as fee_drag", async () => {
   const dir = mkdtempSync(join(tmpdir(), "scalp-drag-"));
   const config = loadConfig({
@@ -287,7 +387,7 @@ test("a round trip above 4% is skipped as fee_drag", async () => {
       marketCapSol: 400,
       vSolSol: 0.2,
       vTokens: 1_000_000,
-      solAmount: 0.05,
+      solAmount: i >= 8 ? 3 : 0.05,
     });
   }
   await new Promise((resolve) => setTimeout(resolve, 30));
