@@ -18,6 +18,11 @@ export interface DexPair {
   buys5m: number;
   sells5m: number;
   pairCreatedAtMs: number | null;
+  /** Token side of the pool, in display units. */
+  baseAmount: number | null;
+  /** Quote side of the pool, in quote-token units. */
+  quoteAmount: number | null;
+  quoteMint: string | null;
 }
 
 export interface TradeWindow {
@@ -70,7 +75,9 @@ export function parseDexPair(payload: unknown, mint: string): DexPair | null {
     const dexId = typeof row.dexId === "string" ? row.dexId : "";
     if (dexId !== "pumpswap" && dexId !== "raydium" && dexId !== "raydium-cpmm" && dexId !== "pump-amm") continue;
     const pairAddress = typeof row.pairAddress === "string" ? row.pairAddress : "";
-    const liquidity = num(asRecord(row.liquidity)?.usd) ?? 0;
+    const liquidityRow = asRecord(row.liquidity);
+    const liquidity = num(liquidityRow?.usd) ?? 0;
+    const quoteToken = asRecord(row.quoteToken);
     const txns = asRecord(asRecord(row.txns)?.m5);
     const created = num(row.pairCreatedAt);
     const pair: DexPair = {
@@ -86,6 +93,9 @@ export function parseDexPair(payload: unknown, mint: string): DexPair | null {
       buys5m: num(txns?.buys) ?? 0,
       sells5m: num(txns?.sells) ?? 0,
       pairCreatedAtMs: created,
+      baseAmount: num(liquidityRow?.base),
+      quoteAmount: num(liquidityRow?.quote),
+      quoteMint: typeof quoteToken?.address === "string" ? quoteToken.address : null,
     };
     if (!best || pair.liquidityUsd > best.liquidityUsd) best = pair;
   }

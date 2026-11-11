@@ -87,6 +87,33 @@ test("bundle body matches the Lightning trade fields and omits the private key",
   assert.equal(raydium.pool, "raydium");
 });
 
+test("a momentum order with jito off is a normal transaction at the high fee cap", async () => {
+  let bundled = 0;
+  const payer = Keypair.generate();
+  const { ports: base } = ports({
+    sendBundle: async (tx) => {
+      bundled += 1;
+      return { bundleId: "bundle", signature: bs58.encode(tx.signatures[0] ?? new Uint8Array()) };
+    },
+    sendTransaction: async (tx) => ({ signature: bs58.encode(tx.signatures[0] ?? new Uint8Array()) }),
+    confirm: async () => ({ state: "landed", solDelta: null }),
+    priorityFee: async () => 0.001,
+    publicKey: payer.publicKey,
+    sign: (tx) => tx.sign([payer]),
+    buildUnsignedTx: async () => unsigned(payer.publicKey),
+  });
+  const result = await new LiveExecutor(base).buy({
+    ...order(),
+    useJito: false,
+    feeLevel: "high",
+    tipSol: 0.004,
+  });
+  assert.equal(bundled, 0);
+  assert.equal(result.status, "filled");
+  assert.equal(result.jitoTipSol, 0);
+  assert.ok(result.feesSol <= base.config.momentumTurboFeeSol + base.config.paper.baseFeeSol + 1e-12);
+});
+
 test("a base58 bundle payload decodes", () => {
   const bytes = unsigned(Keypair.generate().publicKey);
   const decoded = parseBundleTransaction({

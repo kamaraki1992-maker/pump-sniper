@@ -3,6 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { Keypair, PublicKey } from "@solana/web3.js";
 import { ConfigError, loadConfig } from "../src/config.js";
 import { PaperExecutor } from "../src/executor-paper.js";
 import { Logger } from "../src/logger.js";
@@ -15,13 +16,18 @@ import {
   higherLows,
   localResistance,
   momentumExit,
+  clampPriorityFee,
+  momentumFees,
   momentumSize,
   momentumSlippagePct,
   rsi,
-  turboFees,
   type Candle,
   type MomentumFacts,
 } from "../src/momentum/rules.js";
+import { ATA_RENT_SOL, constantProductBuy, momentumPaperBuy, momentumPaperSell, solFromUsdBalance } from "../src/momentum/paper.js";
+import { closeAccountInstruction, rentDecision, withheldTransferFee } from "../src/momentum/rent.js";
+import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "../src/safety.js";
+import { WSOL_MINT } from "../src/pricing.js";
 import { PaperBalance } from "../src/paper-balance.js";
 import { PositionBook } from "../src/positions.js";
 import { TradeLog } from "../src/report.js";
@@ -178,22 +184,18 @@ test("bundled insider supply counts non-creator buys in the create slot plus two
   assert.equal(bundledInsiderPct({ supplyTokens: 1, createSlot: null, creator: "dev", buys: [] }), null);
 });
 
-test("sizing stays on 3% or 5% and keeps the $30 and 0.005 SOL caps", () => {
-  const base = momentumSize({ balanceSol: 10, solUsd: 100, confidence: 50 });
-  assert.equal(base.ok && base.pct, 3);
-  assert.equal(base.ok && base.sizeUsd, 30);
-  const high = momentumSize({ balanceSol: 10, solUsd: 100, confidence: 85.1 });
-  assert.equal(high.ok && high.pct, 5);
-  assert.equal(high.ok && high.sizeUsd, 30);
-  const edge = momentumSize({ balanceSol: 1, solUsd: 200, confidence: 90 });
-  assert.equal(edge.ok && edge.pct, 5);
-  assert.equal(edge.ok && edge.sizeUsd, 10);
-  assert.equal(edge.ok && edge.sizeSol, 0.05);
-  const tiny = momentumSize({ balanceSol: 0.09, solUsd: 100, confidence: 90 });
+test("sizing is 20% of balance and keeps the $30 and 0.005 SOL caps", () => {
+  const capped = momentumSize({ balanceSol: 10, solUsd: 100, sizePct: 20 });
+  assert.equal(capped.ok && capped.pct, 20);
+  assert.equal(capped.ok && capped.sizeUsd, 30);
+  const same = momentumSize({ balanceSol: 10, solUsd: 100, sizePct: 20 });
+  assert.equal(same.ok && same.sizeSol, capped.ok ? capped.sizeSol : 0);
+  const small = momentumSize({ balanceSol: 0.32, solUsd: 100, sizePct: 20 });
+  assert.equal(small.ok && small.pct, 20);
+  assert.equal(small.ok && small.sizeUsd, 6.4);
+  const tiny = momentumSize({ balanceSol: 0.02, solUsd: 100, sizePct: 20 });
   assert.equal(tiny.ok, false);
   if (!tiny.ok) assert.equal(tiny.reason, "buy_size_min");
-  const at85 = momentumSize({ balanceSol: 1, solUsd: 200, confidence: 85 });
-  assert.equal(at85.ok && at85.pct, 3);
 });
 
 test("exits fire in order and use fractions of the original position", () => {
@@ -254,10 +256,137 @@ test("exits fire in order and use fractions of the original position", () => {
 test("slippage is 15% under $150k and 8% at or above it", () => {
   assert.equal(momentumSlippagePct(149_999), 15);
   assert.equal(momentumSlippagePct(150_000), 8);
-  const config = loadConfig({ PAPER_START_BALANCE_SOL: "1" });
-  const turbo = turboFees(config);
-  assert.equal(turbo.tipSol, config.jitoTipMaxSol);
-  assert.equal(turbo.priorityFeeSol, Math.max(config.priorityFeeSol, config.priorityFeeMaxLamports / 1e9));
+});
+
+test("momentum fees use the medium and high caps and do not change sniper tips", () => {
+  const config = loadConfig({ STRATEGY: "momentum", PAPER_START_BALANCE_SOL: "1" });
+  const normal = momentumFees(config, 0.1, false);
+  const turbo = momentumFees(config, 0.1, true);
+  assert.equal(normal.useJito, false);
+  assert.equal(normal.tipSol, 0);
+  assert.equal(normal.feeLevel, "medium");
+  assert.equal(normal.priorityCapSol, 0.00005);
+  assert.equal(turbo.feeLevel, "high");
+  assert.equal(turbo.priorityCapSol, 0.0002);
+  assert.equal(clampPriorityFee(0.001, 0.00005), 0.00005);
+  assert.equal(clampPriorityFee(0.00001, 0.00005), 0.00001);
+  assert.equal(clampPriorityFee(Number.NaN, 0.0002), 0.0002);
+  const jito = loadConfig({
+    STRATEGY: "momentum",
+    PAPER_START_BALANCE_SOL: "1",
+    MOMENTUM_USE_JITO: "true",
+  });
+  assert.equal(momentumFees(jito, 0.001, true).tipSol, 0.0001);
+  assert.equal(momentumFees(jito, 1, false).tipSol, 0.0003);
+  assert.equal(jito.jitoTipMinSol, loadConfig({}).jitoTipMinSol);
+});
+
+test("paper momentum charges swap impact, rent, and the close fee", () => {
+  const buy = constantProductBuy({ baseTokens: 1_000, quoteSol: 100 }, 10, 25);
+  assert.ok(buy);
+  assert.equal(buy?.swapFeeSol, 0.025);
+  assert.ok((buy?.impactPct ?? 0) > 0);
+  const config = loadConfig({ STRATEGY: "momentum", PAPER_START_BALANCE_SOL: "1" });
+  const filled = momentumPaperBuy({
+    sizeSol: 10,
+    slippagePct: 50,
+    reserves: { baseTokens: 1_000, quoteSol: 100 },
+    feeBps: config.momentumPumpswapFeeBps,
+    baseFeeSol: 0.000005,
+    priorityFeeSol: 0.00002,
+    tipSol: 0,
+  });
+  assert.equal(filled.fill.status, "filled");
+  assert.equal(filled.costs.ataRentSol, -ATA_RENT_SOL);
+  assert.equal(filled.costs.priorityFeeSol, 0.00002);
+  assert.equal(filled.costs.baseFeeSol, 0.000005);
+  assert.equal(filled.costs.swapFeeSol, 0.025);
+  assert.ok(filled.fill.cashflowSol > 10 + ATA_RENT_SOL);
+  const wide = constantProductBuy({ baseTokens: 10_000, quoteSol: 1_000 }, 10, 25);
+  const thin = constantProductBuy({ baseTokens: 200, quoteSol: 20 }, 10, 25);
+  assert.ok(wide && thin && thin.impactPct > wide.impactPct);
+  const raydium = momentumPaperSell({
+    tokenAmount: filled.fill.tokenAmount,
+    slippagePct: 50,
+    reserves: { baseTokens: 1_000, quoteSol: 100 },
+    feeBps: config.momentumRaydiumFeeBps,
+    baseFeeSol: 0.000005,
+    priorityFeeSol: 0.00005,
+    tipSol: 0,
+    closeAccount: true,
+  });
+  assert.equal(raydium.costs.ataRentSol, ATA_RENT_SOL);
+  assert.equal(raydium.costs.closeFeeSol, 0.000005);
+  assert.equal(raydium.costs.tipSol, 0);
+  const partial = momentumPaperSell({
+    tokenAmount: 1,
+    slippagePct: 50,
+    reserves: { baseTokens: 1_000, quoteSol: 100 },
+    feeBps: 25,
+    baseFeeSol: 0.000005,
+    priorityFeeSol: 0,
+    tipSol: 0,
+    closeAccount: false,
+  });
+  assert.equal(partial.costs.ataRentSol, 0);
+  assert.equal(partial.costs.closeFeeSol, 0);
+  const blocked = momentumPaperBuy({
+    sizeSol: 80,
+    slippagePct: 1,
+    reserves: { baseTokens: 1_000, quoteSol: 100 },
+    feeBps: 25,
+    baseFeeSol: 0,
+    priorityFeeSol: 0,
+    tipSol: 0,
+  });
+  assert.equal(blocked.fill.error, "price_impact");
+});
+
+test("rent is reclaimed only for an empty burner account without withheld fees", () => {
+  const burner = Keypair.generate();
+  const other = Keypair.generate();
+  const data = Buffer.alloc(165);
+  data.set(burner.publicKey.toBytes(), 32);
+  const empty = rentDecision(
+    { program: TOKEN_PROGRAM_ID, owner: burner.publicKey.toBase58(), amount: 0n, lamports: 2_039_280, data },
+    burner.publicKey.toBase58(),
+  );
+  assert.equal(empty.close, true);
+  assert.equal(empty.rentSol, ATA_RENT_SOL);
+  const held = rentDecision(
+    { program: TOKEN_PROGRAM_ID, owner: burner.publicKey.toBase58(), amount: 1n, lamports: 2_039_280, data },
+    burner.publicKey.toBase58(),
+  );
+  assert.equal(held.reason, "balance");
+  const stranger = rentDecision(
+    { program: TOKEN_PROGRAM_ID, owner: other.publicKey.toBase58(), amount: 0n, lamports: 2_039_280, data },
+    burner.publicKey.toBase58(),
+  );
+  assert.equal(stranger.reason, "owner");
+  const extended = Buffer.alloc(178);
+  extended.set(data);
+  extended.writeUInt16LE(2, 166);
+  extended.writeUInt16LE(8, 168);
+  extended.writeBigUInt64LE(5n, 170);
+  assert.equal(withheldTransferFee(extended), 5n);
+  const withheld = rentDecision(
+    {
+      program: TOKEN_2022_PROGRAM_ID,
+      owner: burner.publicKey.toBase58(),
+      amount: 0n,
+      lamports: 2_039_280,
+      data: extended,
+    },
+    burner.publicKey.toBase58(),
+  );
+  assert.equal(withheld.reason, "withheld_fees");
+  const mint = Keypair.generate().publicKey;
+  const ata = Keypair.generate().publicKey;
+  const ix = closeAccountInstruction(ata, burner.publicKey, burner.publicKey, new PublicKey(TOKEN_PROGRAM_ID));
+  assert.equal(ix.data[0], 9);
+  assert.equal(ix.keys[1]?.pubkey.toBase58(), burner.publicKey.toBase58());
+  assert.equal(ix.keys[2]?.isSigner, true);
+  assert.equal(mint.toBase58().length > 0, true);
 });
 
 test("strategy defaults to sniper and momentum is selected by env", () => {
@@ -268,7 +397,24 @@ test("strategy defaults to sniper and momentum is selected by env", () => {
   assert.equal(momentum.strategy, "momentum");
   assert.equal(momentum.momentumPollSec, 25);
   assert.throws(() => loadConfig({ STRATEGY: "grid" }), ConfigError);
-  assert.throws(() => loadConfig({ STRATEGY: "momentum" }), /PAPER_START_BALANCE_SOL/);
+  assert.throws(() => loadConfig({ STRATEGY: "momentum" }), /PAPER_START_BALANCE_SOL or PAPER_START_BALANCE_USD/);
+  const usd = loadConfig({ STRATEGY: "momentum", PAPER_START_BALANCE_USD: "32" });
+  assert.equal(usd.paperStartBalanceUsd, 32);
+  assert.equal(usd.maxOpenPositions, 4);
+  assert.equal(loadConfig({}).maxOpenPositions, 5);
+  assert.equal(usd.momentumSizePct, 20);
+  assert.equal(usd.momentumUseJito, false);
+  assert.equal(usd.momentumPriorityFeeSol, 0.00005);
+  assert.equal(usd.momentumTurboFeeSol, 0.0002);
+  assert.equal(usd.priorityFeeMaxLamports, loadConfig({}).priorityFeeMaxLamports);
+  assert.equal(usd.jitoTipMaxSol, loadConfig({}).jitoTipMaxSol);
+  const jito = loadConfig({
+    STRATEGY: "momentum",
+    PAPER_START_BALANCE_SOL: "1",
+    MOMENTUM_USE_JITO: "true",
+  });
+  assert.equal(jito.momentumUseJito, true);
+  assert.equal(solFromUsdBalance(32, 160), 0.2);
   assert.throws(() => loadConfig({ MOMENTUM_POLL_SEC: "4" }), ConfigError);
 });
 
@@ -374,6 +520,9 @@ test("a paper momentum tick buys a breakout and the stop sells the position", as
           buys5m: facts.buys5m,
           sells5m: facts.sells5m,
           pairCreatedAtMs: facts.pairCreatedAtMs,
+          baseAmount: 1_000_000,
+          quoteAmount: 1_000_000,
+          quoteMint: WSOL_MINT,
         };
       },
       async candles() {
@@ -390,6 +539,7 @@ test("a paper momentum tick buys a breakout and the stop sells the position", as
       },
     },
     chain: async () => ({ mintOk: true, mintReason: null, top10Pct: 10, devPct: 1 }),
+    quoteFee: async () => 0.001,
   });
   const launch: MarketLaunch = {
     kind: "launch",
@@ -414,8 +564,14 @@ test("a paper momentum tick buys a breakout and the stop sells the position", as
   const open = positions.get("Mint1");
   assert.ok(open?.momentum);
   assert.equal(open?.momentumPool, "pump-amm");
-  assert.equal(trades.readAll().at(-1)?.reason, "entry");
-  assert.equal(trades.readAll().at(-1)?.entryScore != null && trades.readAll().at(-1)!.entryScore! > 0, true);
+  const buy = trades.readAll().at(-1);
+  assert.equal(buy?.reason, "entry");
+  assert.equal(buy?.entryScore != null && buy.entryScore > 0, true);
+  assert.equal(buy?.costs?.priorityFeeSol, 0.0002);
+  assert.equal(buy?.costs?.tipSol, 0);
+  assert.equal(buy?.costs?.ataRentSol, -ATA_RENT_SOL);
+  assert.ok((buy?.costs?.swapFeeSol ?? 0) > 0);
+  assert.ok((buy?.costs?.priceImpactPct ?? 0) > 0);
   assert.ok(balance.cash() < 10);
   const entry = open!.entryPriceSol;
   priceUsd = entry * 100 * 0.7;
@@ -424,6 +580,9 @@ test("a paper momentum tick buys a breakout and the stop sells the position", as
   const sell = trades.readAll().at(-1);
   assert.equal(sell?.reason, "momentum_sl");
   assert.equal(sell?.side, "sell");
-  assert.equal(sell?.bundle, "jito");
-  assert.ok((sell?.jitoTipSol ?? 0) > 0);
+  assert.equal(sell?.bundle, null);
+  assert.equal(sell?.jitoTipSol, 0);
+  assert.equal(sell?.costs?.priorityFeeSol, 0.0002);
+  assert.equal(sell?.costs?.ataRentSol, ATA_RENT_SOL);
+  assert.equal(sell?.costs?.closeFeeSol, config.paper.baseFeeSol);
 });

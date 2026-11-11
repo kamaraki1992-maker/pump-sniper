@@ -1,4 +1,4 @@
-import { clampBuyUsd, reservedPriorityFeeSol, type AppConfig } from "../config.js";
+import { clampBuyUsd, type AppConfig } from "../config.js";
 import type { TradeReason } from "../types.js";
 
 /**
@@ -15,9 +15,10 @@ import type { TradeReason } from "../types.js";
  *   trade page. A full page that does not reach the back of the window is
  *   incomplete and fails closed.
  * - "Higher lows" means the last three closed 5m lows are strictly rising.
- * - Confidence is the average of seven 0–100 components. A minimum-threshold
- *   metric scores 50 at the threshold and 100 at twice the threshold. A band
- *   scores 100 at its midpoint and 0 at either edge.
+ * - Confidence is the average of seven 0–100 components and is only logged.
+ *   A minimum-threshold metric scores 50 at the threshold and 100 at twice
+ *   the threshold. A band scores 100 at its midpoint and 0 at either edge.
+ *   Size is `MOMENTUM_SIZE_PCT` of balance, capped at $30.
  */
 
 export const MOMENTUM = {
@@ -36,9 +37,6 @@ export const MOMENTUM = {
   rsiMin: 55,
   rsiMax: 72,
   higherLowCandles: 3,
-  baseSizePct: 3,
-  highSizePct: 5,
-  highConfidence: 85,
   stopDrop: 0.25,
   tp1Multiple: 2,
   tp1OfOriginal: 0.5,
@@ -192,12 +190,26 @@ export function momentumSlippagePct(marketCapUsd: number): number {
   return marketCapUsd < MOMENTUM.slippageMcapUsd ? MOMENTUM.slippageLowPct : MOMENTUM.slippageHighPct;
 }
 
-/** Upper end of the already-clamped dynamic tip and priority-fee range. */
-export function turboFees(config: AppConfig): { tipSol: number; priorityFeeSol: number } {
-  return {
-    tipSol: config.jitoTipMaxSol,
-    priorityFeeSol: reservedPriorityFeeSol(config),
-  };
+/**
+ * Momentum fee choice. Sniper tips and priority caps are not read.
+ * A missing Helius estimate is charged at the cap so paper does not understate it.
+ */
+export function momentumFees(
+  config: AppConfig,
+  tradeSol: number,
+  turbo: boolean,
+): { tipSol: number; priorityCapSol: number; feeLevel: "medium" | "high"; useJito: boolean } {
+  const feeLevel = turbo ? "high" : "medium";
+  const priorityCapSol = turbo ? config.momentumTurboFeeSol : config.momentumPriorityFeeSol;
+  if (!config.momentumUseJito) return { tipSol: 0, priorityCapSol, feeLevel, useJito: false };
+  const raw = (Number.isFinite(tradeSol) && tradeSol > 0 ? tradeSol : 0) * config.jitoTipPct;
+  const tipSol = Math.min(config.momentumJitoTipMaxSol, Math.max(config.momentumJitoTipMinSol, raw));
+  return { tipSol, priorityCapSol, feeLevel, useJito: true };
+}
+
+export function clampPriorityFee(estimateSol: number, capSol: number): number {
+  if (!(estimateSol >= 0) || !Number.isFinite(estimateSol)) return capSol;
+  return Math.min(estimateSol, capSol);
 }
 
 function clampScore(value: number): number {
@@ -302,12 +314,12 @@ export function evaluateMomentum(facts: MomentumFacts): MomentumDecision {
 export function momentumSize(input: {
   balanceSol: number;
   solUsd: number;
-  confidence: number;
+  sizePct: number;
 }): { ok: true; sizeSol: number; sizeUsd: number; pct: number } | { ok: false; reason: string } {
-  if (!(input.solUsd > 0) || !(input.balanceSol > 0) || !Number.isFinite(input.confidence)) {
+  if (!(input.solUsd > 0) || !(input.balanceSol > 0) || !(input.sizePct > 0)) {
     return { ok: false, reason: "no_price" };
   }
-  const pct = input.confidence > MOMENTUM.highConfidence ? MOMENTUM.highSizePct : MOMENTUM.baseSizePct;
+  const pct = input.sizePct;
   const rawUsd = input.balanceSol * (pct / 100) * input.solUsd;
   const sizeUsd = clampBuyUsd(rawUsd);
   const sizeSol = sizeUsd / input.solUsd;

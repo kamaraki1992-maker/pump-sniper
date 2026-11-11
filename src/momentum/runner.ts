@@ -1,22 +1,23 @@
 import type { AppConfig } from "../config.js";
 import { DailyLossBook } from "../daily-loss.js";
-import { tipForTrade } from "../tip.js";
 import type { Logger } from "../logger.js";
 import type { PaperBalance } from "../paper-balance.js";
 import type { PositionBook } from "../positions.js";
 import { TOTAL_SUPPLY_TOKENS } from "../pricing.js";
 import { berlinDay, type TradeLog } from "../report.js";
-import type { Executor, MarketGraduation, MarketLaunch, MarketTrade, Position, TradeReason } from "../types.js";
+import type { Executor, MarketGraduation, MarketLaunch, MarketTrade, Position, TradeCosts, TradeReason } from "../types.js";
 import type { ChainFacts } from "./chain.js";
 import type { DexPair, MomentumMarket } from "./market.js";
+import { ATA_RENT_SOL, momentumPaperBuy, momentumPaperSell, reservesFromPair, swapFeeBps } from "./paper.js";
 import {
   bundledInsiderPct,
+  clampPriorityFee,
   evaluateMomentum,
   momentumExit,
+  momentumFees,
   momentumPool,
   momentumSize,
   momentumSlippagePct,
-  turboFees,
   type Candle,
   type EarlyBuy,
   type MomentumFacts,
@@ -45,6 +46,10 @@ export interface MomentumDeps {
   paperBalance?: PaperBalance;
   walletBalanceSol?: () => Promise<number>;
   daily?: DailyLossBook;
+  /** Helius priority-fee estimate. Missing or failed quotes use the momentum cap. */
+  quoteFee?: (level: "medium" | "high", mint: string) => Promise<number>;
+  /** Live-only. Paper credits the rent inside the simulated fill. */
+  reclaimRent?: (mint: string) => Promise<{ closed: boolean; rentSol: number; reason: string }>;
 }
 
 /**
@@ -217,13 +222,18 @@ export class MomentumRunner {
 
   private async buy(pair: DexPair, facts: MomentumFacts, confidence: number, solUsd: number): Promise<void> {
     const parts = await this.balance();
-    const sized = momentumSize({ balanceSol: parts.balanceSol, solUsd, confidence });
+    const sized = momentumSize({
+      balanceSol: parts.balanceSol,
+      solUsd,
+      sizePct: this.deps.config.momentumSizePct,
+    });
     if (!sized.ok) {
       this.logDecision(pair.mint, "hold", sized.reason, confidence);
       return;
     }
-    const turbo = turboFees(this.deps.config);
-    const overhead = turbo.priorityFeeSol + this.deps.config.paper.baseFeeSol + turbo.tipSol;
+    const fees = momentumFees(this.deps.config, sized.sizeSol, true);
+    const priorityFeeSol = await this.prioritySol(fees.feeLevel, fees.priorityCapSol, pair.mint);
+    const overhead = priorityFeeSol + this.deps.config.paper.baseFeeSol + fees.tipSol + ATA_RENT_SOL;
     if (!(parts.freeSol >= sized.sizeSol + overhead)) {
       this.logDecision(pair.mint, "hold", "insufficient_balance", confidence);
       return;
@@ -232,20 +242,39 @@ export class MomentumRunner {
     if (!pool) return;
     const quotePriceSol = pair.priceUsd / solUsd;
     const memory = this.launches.get(pair.mint);
-    const fill = await this.deps.executor.buy({
-      mint: pair.mint,
-      name: pair.name,
-      symbol: pair.symbol,
-      creator: memory?.creator ?? "",
-      sizeSol: sized.sizeSol,
-      quotePriceSol,
-      slippagePct: momentumSlippagePct(pair.marketCapUsd),
-      reason: "entry",
-      pool,
-      tipSol: turbo.tipSol,
-      priorityFeeSol: turbo.priorityFeeSol,
-      useQuotedSlippage: true,
-    });
+    const slippagePct = momentumSlippagePct(pair.marketCapUsd);
+    let fill;
+    let costs: TradeCosts | undefined;
+    if (this.deps.config.mode === "paper") {
+      const paper = momentumPaperBuy({
+        sizeSol: sized.sizeSol,
+        slippagePct,
+        reserves: reservesFromPair(pair.baseAmount, pair.quoteAmount, pair.quoteMint),
+        feeBps: swapFeeBps(this.deps.config, pair.dexId),
+        baseFeeSol: this.deps.config.paper.baseFeeSol,
+        priorityFeeSol,
+        tipSol: fees.tipSol,
+      });
+      fill = paper.fill;
+      costs = paper.costs;
+    } else {
+      fill = await this.deps.executor.buy({
+        mint: pair.mint,
+        name: pair.name,
+        symbol: pair.symbol,
+        creator: memory?.creator ?? "",
+        sizeSol: sized.sizeSol,
+        quotePriceSol,
+        slippagePct,
+        reason: "entry",
+        pool,
+        tipSol: fees.tipSol,
+        feeLevel: fees.feeLevel,
+        useJito: fees.useJito,
+        useQuotedSlippage: true,
+      });
+    }
+    this.logCosts(pair.mint, costs);
     this.deps.trades.append({
       timestamp: this.deps.now().toISOString(),
       mode: this.deps.config.mode,
@@ -269,6 +298,8 @@ export class MomentumRunner {
       costSol: fill.status === "filled" ? fill.cashflowSol : null,
       confidence: confidence / 100,
       entryScore: confidence,
+      bundle: fees.useJito ? "jito" : null,
+      ...(costs ? { costs } : {}),
     });
     if (fill.status !== "filled") return;
     if (this.deps.config.mode === "paper") this.deps.paperBalance?.add(-fill.cashflowSol);
@@ -325,7 +356,7 @@ export class MomentumRunner {
         volume15mComplete: trades?.volume15mComplete ?? false,
       });
       if (!exit) continue;
-      await this.sell(position, exit.reason, exit.sellFraction, priceSol, pair.marketCapUsd);
+      await this.sell(position, exit.reason, exit.sellFraction, priceSol, pair);
     }
   }
 
@@ -334,7 +365,7 @@ export class MomentumRunner {
     reason: TradeReason,
     fraction: number,
     quote: number,
-    marketCapUsd: number,
+    pair: DexPair,
   ): Promise<void> {
     this.selling.add(position.mint);
     try {
@@ -343,26 +374,45 @@ export class MomentumRunner {
       const before = current.tokenAmount;
       const portion = Math.min(1, Math.max(0, fraction));
       const requested = portion >= 0.999 ? before : before * portion;
-      const turbo = reason === "momentum_sl" || reason === "entry";
-      const fees = turbo ? turboFees(this.deps.config) : null;
-      const proceeds = quote * requested;
-      const fill = await this.deps.executor.sell({
-        mint: current.mint,
-        name: current.name,
-        symbol: current.symbol,
-        creator: current.creator,
-        sizeSol: current.costSol,
-        quotePriceSol: quote,
-        slippagePct: momentumSlippagePct(marketCapUsd),
-        reason,
-        tokenAmount: requested,
-        sellFraction: portion,
-        pool: current.momentumPool ?? "pump-amm",
-        tipSol: fees ? fees.tipSol : tipForTrade(this.deps.config, proceeds, false),
-        ...(fees ? { priorityFeeSol: fees.priorityFeeSol } : {}),
-        useQuotedSlippage: true,
-        hot: turbo,
-      });
+      const closing = portion >= 0.999;
+      const fees = momentumFees(this.deps.config, quote * requested, reason === "momentum_sl");
+      const priorityFeeSol = await this.prioritySol(fees.feeLevel, fees.priorityCapSol, current.mint);
+      const slippagePct = momentumSlippagePct(pair.marketCapUsd);
+      let fill;
+      let costs: TradeCosts | undefined;
+      if (this.deps.config.mode === "paper") {
+        const paper = momentumPaperSell({
+          tokenAmount: requested,
+          slippagePct,
+          reserves: reservesFromPair(pair.baseAmount, pair.quoteAmount, pair.quoteMint),
+          feeBps: swapFeeBps(this.deps.config, pair.dexId),
+          baseFeeSol: this.deps.config.paper.baseFeeSol,
+          priorityFeeSol,
+          tipSol: fees.tipSol,
+          closeAccount: closing,
+        });
+        fill = paper.fill;
+        costs = paper.costs;
+      } else {
+        fill = await this.deps.executor.sell({
+          mint: current.mint,
+          name: current.name,
+          symbol: current.symbol,
+          creator: current.creator,
+          sizeSol: current.costSol,
+          quotePriceSol: quote,
+          slippagePct,
+          reason,
+          tokenAmount: requested,
+          sellFraction: portion,
+          pool: current.momentumPool ?? "pump-amm",
+          tipSol: fees.tipSol,
+          feeLevel: fees.feeLevel,
+          useJito: fees.useJito,
+          useQuotedSlippage: true,
+        });
+      }
+      this.logCosts(current.mint, costs);
       const sold = Math.min(before, fill.tokenAmount > 0 ? fill.tokenAmount : requested);
       const share = before > 0 ? sold / before : 1;
       const costAllocated = current.costSol * share;
@@ -390,7 +440,8 @@ export class MomentumRunner {
         realizedPnlTotalSol: total,
         costSol: fill.status === "filled" ? costAllocated : current.costSol,
         triggerPriceSol: quote,
-        bundle: "jito",
+        bundle: fees.useJito ? "jito" : null,
+        ...(costs ? { costs } : {}),
       });
       if (fill.status !== "filled") return;
       if (this.deps.config.mode === "paper") this.deps.paperBalance?.add(fill.cashflowSol);
@@ -407,6 +458,15 @@ export class MomentumRunner {
         return;
       }
       this.deps.positions.close(current.mint);
+      if (this.deps.reclaimRent) {
+        const rent = await this.deps.reclaimRent(current.mint);
+        this.deps.log.info("rent reclaimed", {
+          mint: current.mint,
+          rentSol: rent.rentSol,
+          closed: rent.closed,
+          reason: rent.reason,
+        });
+      }
     } finally {
       this.selling.delete(position.mint);
     }
@@ -428,6 +488,26 @@ export class MomentumRunner {
     if (max == null) return false;
     const realized = this.daily.realized(this.deps.config.mode, berlinDay(this.deps.now().toISOString()));
     return realized <= -max;
+  }
+
+  private async prioritySol(level: "medium" | "high", cap: number, mint: string): Promise<number> {
+    if (!this.deps.quoteFee) return cap;
+    try {
+      return clampPriorityFee(await this.deps.quoteFee(level, mint), cap);
+    } catch {
+      return cap;
+    }
+  }
+
+  private logCosts(mint: string, costs: TradeCosts | undefined): void {
+    if (!costs) return;
+    this.deps.log.info("momentum costs", { mint, ...costs });
+    if (costs.ataRentSol < 0) {
+      this.deps.log.info("rent debited", { mint, rentSol: -costs.ataRentSol });
+    }
+    if (costs.ataRentSol > 0) {
+      this.deps.log.info("rent reclaimed", { mint, rentSol: costs.ataRentSol, closeFeeSol: costs.closeFeeSol });
+    }
   }
 
   private logDecision(

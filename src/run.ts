@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { Connection, Keypair } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 import { BoughtMints } from "./bought.js";
 import { SniperBot } from "./bot.js";
@@ -8,7 +8,7 @@ import { ConfigError, loadConfig, type AppConfig } from "./config.js";
 import { cuLimitFromConsumed } from "./compute.js";
 import { PaperExecutor } from "./executor-paper.js";
 import { PaperBalance } from "./paper-balance.js";
-import { createLivePorts, LiveExecutor } from "./executor-live.js";
+import { confirmSignature, createLivePorts, LiveExecutor } from "./executor-live.js";
 import { PriorityFeeEstimator } from "./priority-fee.js";
 import { RpcHolderCheck } from "./holders.js";
 import { installProcessGuards } from "./guards.js";
@@ -23,6 +23,8 @@ import { SolPriceFeed } from "./sol-price.js";
 import { createRpcSafetyCheck } from "./safety.js";
 import { readChainFacts } from "./momentum/chain.js";
 import { HttpMomentumMarket } from "./momentum/market.js";
+import { solFromUsdBalance } from "./momentum/paper.js";
+import { reclaimEmptyAta } from "./momentum/rent.js";
 import { MomentumRunner } from "./momentum/runner.js";
 import { HeliusFeed } from "./helius-feed.js";
 import { PumpDevStream } from "./stream.js";
@@ -49,6 +51,8 @@ export interface Runtime {
   stopRpcPressure: () => void;
   paperBalance?: PaperBalance;
   walletBalanceSol?: () => Promise<number>;
+  quoteFee?: (level: "medium" | "high", mint: string) => Promise<number>;
+  reclaimRent?: (mint: string) => Promise<{ closed: boolean; rentSol: number; reason: string }>;
 }
 
 /** Optional ceiling. Absent or invalid keeps the tier's own subscription limit. */
@@ -93,14 +97,34 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
   const log = new Logger(secrets);
   const positions = new PositionBook(config.positionsPath);
   const trades = new TradeLog(config.tradesPath, secrets);
-  const paperBalance =
-    config.mode === "paper" &&
-    config.paperStartBalanceSol != null &&
-    (config.buySizePctOfBalance != null || config.strategy === "momentum")
-      ? new PaperBalance(`${config.dataDir}/paper-balance.json`, config.paperStartBalanceSol)
-      : undefined;
   const sol = new SolPriceFeed(config.solPriceUrl);
   await sol.refresh();
+  const startedSolUsd = sol.fresh() ?? sol.price();
+  const paperStartSol =
+    config.paperStartBalanceSol ??
+    (config.paperStartBalanceUsd != null ? solFromUsdBalance(config.paperStartBalanceUsd, startedSolUsd ?? 0) : null);
+  if (
+    config.strategy === "momentum" &&
+    config.mode === "paper" &&
+    config.paperStartBalanceSol == null &&
+    config.paperStartBalanceUsd != null &&
+    paperStartSol == null
+  ) {
+    throw new ConfigError("PAPER_START_BALANCE_USD needs a live SOL/USD price");
+  }
+  if (config.paperStartBalanceSol == null && paperStartSol != null && config.paperStartBalanceUsd != null) {
+    log.info("paper start balance", {
+      usd: config.paperStartBalanceUsd,
+      solUsd: startedSolUsd,
+      sol: paperStartSol,
+    });
+  }
+  const paperBalance =
+    config.mode === "paper" &&
+    paperStartSol != null &&
+    (config.buySizePctOfBalance != null || config.strategy === "momentum")
+      ? new PaperBalance(`${config.dataDir}/paper-balance.json`, paperStartSol)
+      : undefined;
   const rpcStats = createRpcStats();
   const rpcFetch = createRpcFetch({
     rps: config.heliusRps,
@@ -134,10 +158,21 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     config.priorityFeeCacheMs,
     rpcFetch,
   );
-  const quotePriorityFee = (accountKeys: string[], cuLimit: number) =>
-    priorityFees.quote(accountKeys, cuLimit).then((quote) => quote.sol);
+  const quotePriorityFee = (accountKeys: string[], cuLimit: number, level?: "medium" | "high") => {
+    if (level === "medium" || level === "high") {
+      const capSol = level === "high" ? config.momentumTurboFeeSol : config.momentumPriorityFeeSol;
+      return priorityFees
+        .quote(accountKeys, cuLimit, {
+          level: level === "high" ? "High" : "Medium",
+          maxLamports: Math.round(capSol * 1e9),
+        })
+        .then((quote) => quote.sol);
+    }
+    return priorityFees.quote(accountKeys, cuLimit).then((quote) => quote.sol);
+  };
   let executor: Executor;
   let walletBalanceSol: (() => Promise<number>) | undefined;
+  let reclaimRent: Runtime["reclaimRent"] = undefined;
   if (config.mode === "live") {
     const keypair = loadLiveKeypair();
     log.info("live mode", { pubkey: keypair.publicKey.toBase58() });
@@ -152,6 +187,18 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     walletBalanceSol = async () => {
       const lamports = await connection.getBalance(keypair.publicKey, "processed");
       return lamports / 1e9;
+    };
+    reclaimRent = async (mint: string) => {
+      const result = await reclaimEmptyAta({
+        connection,
+        owner: keypair,
+        mint: new PublicKey(mint),
+        blockhash: async () => (await connection.getLatestBlockhash("processed")).blockhash,
+        send: (tx) => connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 }),
+        confirm: async (signature) =>
+          (await confirmSignature(connection, signature, config.confirmTimeoutMs)).state === "landed",
+      });
+      return { closed: result.closed, rentSol: result.rentSol, reason: result.reason };
     };
   } else {
     log.info("paper mode");
@@ -208,6 +255,8 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
     stopRpcPressure: stopPressureLog,
     ...(paperBalance ? { paperBalance } : {}),
     ...(walletBalanceSol ? { walletBalanceSol } : {}),
+    quoteFee: (level, mint) => quotePriorityFee([mint], 200_000, level),
+    ...(reclaimRent ? { reclaimRent } : {}),
   };
 }
 
@@ -289,6 +338,8 @@ export async function runMomentum(runtime: Runtime, options: { maxRuntimeMs?: nu
     chain: (mint, creator) => readChainFacts(config.rugCheckRpcUrl, mint, creator),
     ...(runtime.paperBalance ? { paperBalance: runtime.paperBalance } : {}),
     ...(runtime.walletBalanceSol ? { walletBalanceSol: runtime.walletBalanceSol } : {}),
+    ...(runtime.quoteFee ? { quoteFee: runtime.quoteFee } : {}),
+    ...(runtime.reclaimRent ? { reclaimRent: runtime.reclaimRent } : {}),
   });
   log.info("momentum start", {
     mode: config.mode,

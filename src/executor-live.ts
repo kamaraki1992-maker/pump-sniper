@@ -25,9 +25,11 @@ export interface LivePorts {
   simulate(tx: VersionedTransaction): Promise<{ unitsConsumed: number | null; err: string | null }>;
   lookupTables(tx: VersionedTransaction): Promise<AddressLookupTableAccount[]>;
   sendBundle(tx: VersionedTransaction): Promise<{ bundleId: string; signature: string }>;
+  /** Normal RPC send. Momentum uses this when Jito is off. */
+  sendTransaction?: (tx: VersionedTransaction) => Promise<{ signature: string }>;
   confirm(signature: string): Promise<ConfirmResult>;
   /** Dynamic priority fee in SOL. A throw or a missing port uses PRIORITY_FEE_SOL. */
-  priorityFee?: (accountKeys: string[], cuLimit: number) => Promise<number>;
+  priorityFee?: (accountKeys: string[], cuLimit: number, level?: "medium" | "high") => Promise<number>;
   /** Fresh blockhash for a rebuilt bundle. The hot path uses the cached one. */
   blockhash?: () => Promise<string>;
   tipAccount: PublicKey;
@@ -148,6 +150,7 @@ export class LiveExecutor implements Executor {
   }
 
   private tipSol(order: OrderRequest): number {
+    if (order.useJito === false) return 0;
     return order.tipSol != null && order.tipSol >= 0 && Number.isFinite(order.tipSol)
       ? order.tipSol
       : this.ports.config.jitoTipSol;
@@ -230,7 +233,13 @@ export class LiveExecutor implements Executor {
 
     let sent: { bundleId: string; signature: string };
     try {
-      sent = await this.ports.sendBundle(prepared);
+      if (order.useJito === false) {
+        if (!this.ports.sendTransaction) return blank(order, "send-unavailable");
+        const tx = await this.ports.sendTransaction(prepared);
+        sent = { bundleId: "", signature: tx.signature };
+      } else {
+        sent = await this.ports.sendBundle(prepared);
+      }
     } catch (error) {
       return blank(order, error instanceof Error ? error.message : "bundle-send-failed");
     }
@@ -247,6 +256,17 @@ export class LiveExecutor implements Executor {
   }
 
   private async priorityFeeSol(order: OrderRequest, tx: VersionedTransaction, cuLimit: number): Promise<number> {
+    if (order.feeLevel && this.ports.priorityFee) {
+      const cap = order.feeLevel === "high" ? this.ports.config.momentumTurboFeeSol : this.ports.config.momentumPriorityFeeSol;
+      try {
+        const keys = tx.message.staticAccountKeys.map((key) => key.toBase58());
+        const quoted = await this.ports.priorityFee(keys, cuLimit, order.feeLevel);
+        if (quoted >= 0 && Number.isFinite(quoted)) return Math.min(quoted, cap);
+      } catch {
+        return cap;
+      }
+      return cap;
+    }
     if (order.priorityFeeSol != null && order.priorityFeeSol >= 0 && Number.isFinite(order.priorityFeeSol)) {
       return order.priorityFeeSol;
     }
@@ -292,6 +312,10 @@ export function createLivePorts(
         unitsConsumed: result.value.unitsConsumed ?? null,
         err: err ? JSON.stringify(err) : null,
       };
+    },
+    sendTransaction: async (tx) => {
+      const signature = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
+      return { signature };
     },
     sendBundle: async (tx) => {
       const signature = bs58.encode(tx.signatures[0] ?? new Uint8Array());

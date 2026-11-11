@@ -38,6 +38,8 @@ interface RpcEnvelope {
  * `getRecentPrioritizationFees` at the 90th percentile, then `PRIORITY_FEE_SOL`.
  * The total is clamped to `maxLamports`. A successful read is reused for `cacheMs`.
  */
+export type PriorityLevel = "Medium" | "High";
+
 export class PriorityFeeEstimator {
   private cached: { at: number; key: string; microLamports: number; source: "helius" | "recent" } | null = null;
 
@@ -50,11 +52,17 @@ export class PriorityFeeEstimator {
     private readonly now: () => number = Date.now,
   ) {}
 
-  async quote(accountKeys: readonly string[], cuLimit: number): Promise<PriorityFeeQuote> {
+  async quote(
+    accountKeys: readonly string[],
+    cuLimit: number,
+    opts?: { level?: PriorityLevel; maxLamports?: number },
+  ): Promise<PriorityFeeQuote> {
+    const level = opts?.level ?? "High";
+    const maxLamports = opts?.maxLamports ?? this.maxLamports;
     const limit = cuLimit > 0 ? Math.floor(cuLimit) : FALLBACK_CU_LIMIT;
-    const sampled = await this.sample(accountKeys);
+    const sampled = await this.sample(accountKeys, level);
     if (sampled.source === "fallback") {
-      const lamports = Math.max(0, Math.min(Math.round(this.fallbackSol * 1e9), Math.floor(this.maxLamports)));
+      const lamports = Math.max(0, Math.min(Math.round(this.fallbackSol * 1e9), Math.floor(maxLamports)));
       return {
         microLamports: microLamportsForFee(lamports / 1e9, limit),
         totalLamports: lamports,
@@ -62,7 +70,7 @@ export class PriorityFeeEstimator {
         source: "fallback",
       };
     }
-    const microLamports = clampMicroLamports(sampled.microLamports, limit, this.maxLamports);
+    const microLamports = clampMicroLamports(sampled.microLamports, limit, maxLamports);
     const totalLamports = Math.floor((microLamports * limit) / 1_000_000);
     return {
       microLamports,
@@ -74,18 +82,19 @@ export class PriorityFeeEstimator {
 
   private async sample(
     accountKeys: readonly string[],
+    level: PriorityLevel,
   ): Promise<{ microLamports: number; source: "helius" | "recent" | "fallback" }> {
-    const key = [...accountKeys].sort().join(",");
+    const key = `${level}:${[...accountKeys].sort().join(",")}`;
     const hit = this.cached;
     if (hit && hit.key === key && this.cacheMs > 0 && this.now() - hit.at < this.cacheMs) {
       return { microLamports: hit.microLamports, source: hit.source };
     }
-    const helius = await this.helius(accountKeys);
+    const helius = await this.helius(accountKeys, level);
     if (helius > 0) {
       this.cached = { at: this.now(), key, microLamports: helius, source: "helius" };
       return { microLamports: helius, source: "helius" };
     }
-    const recent = await this.recent(accountKeys);
+    const recent = await this.recent(accountKeys, level === "Medium" ? 50 : PRIORITY_FEE_PERCENTILE);
     if (recent > 0) {
       this.cached = { at: this.now(), key, microLamports: recent, source: "recent" };
       return { microLamports: recent, source: "recent" };
@@ -93,9 +102,9 @@ export class PriorityFeeEstimator {
     return { microLamports: 0, source: "fallback" };
   }
 
-  private async helius(accountKeys: readonly string[]): Promise<number> {
+  private async helius(accountKeys: readonly string[], level: PriorityLevel): Promise<number> {
     try {
-      const options = { priorityLevel: "High" };
+      const options = { priorityLevel: level };
       const params =
         accountKeys.length > 0 ? [{ accountKeys: [...accountKeys], options }] : [{ options }];
       const result = await this.rpc("getPriorityFeeEstimate", params);
@@ -108,7 +117,7 @@ export class PriorityFeeEstimator {
     }
   }
 
-  private async recent(accountKeys: readonly string[]): Promise<number> {
+  private async recent(accountKeys: readonly string[], percentile: number): Promise<number> {
     try {
       const params = accountKeys.length > 0 ? [[...accountKeys]] : [];
       const result = await this.rpc("getRecentPrioritizationFees", params);
@@ -118,7 +127,7 @@ export class PriorityFeeEstimator {
         const fee = (row as { prioritizationFee?: unknown }).prioritizationFee;
         return typeof fee === "number" ? fee : 0;
       });
-      return highPercentile(fees, PRIORITY_FEE_PERCENTILE);
+      return highPercentile(fees, percentile);
     } catch {
       return 0;
     }

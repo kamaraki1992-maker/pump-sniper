@@ -157,6 +157,23 @@ export interface AppConfig {
   momentumPollSec: number;
   /** Closed 5m candles whose high is the local resistance. */
   momentumResistanceCandles: number;
+  /** Share of total balance for each momentum buy. Confidence does not change it. */
+  momentumSizePct: number;
+  /** Momentum sends a normal transaction unless this is on. Sniper stays on Jito. */
+  momentumUseJito: boolean;
+  /** Cap for the Helius Medium priority fee, in SOL. */
+  momentumPriorityFeeSol: number;
+  /** Cap for the Helius High priority fee used on breakout buys and stop-loss exits. */
+  momentumTurboFeeSol: number;
+  /** Momentum Jito tip band, used only when `momentumUseJito` is on. */
+  momentumJitoTipMinSol: number;
+  momentumJitoTipMaxSol: number;
+  /** PumpSwap LP plus protocol fee, in basis points. */
+  momentumPumpswapFeeBps: number;
+  /** Raydium swap fee, in basis points. */
+  momentumRaydiumFeeBps: number;
+  /** Alternative paper bankroll. Converted with the live SOL/USD price when the balance file is created. */
+  paperStartBalanceUsd: number | null;
   jitoBlockEngineUrl: string;
   solPriceUrl: string;
   dataDir: string;
@@ -199,6 +216,14 @@ function creatorHoldRaw(env: NodeJS.ProcessEnv): string | undefined {
     return env.MAX_CREATOR_HOLD_PCT;
   }
   return env.CREATOR_MAX_HOLD_PCT;
+}
+
+function flag(value: string | undefined, fallback: boolean, name = "flag"): boolean {
+  if (value === undefined || value.trim() === "") return fallback;
+  const raw = value.trim().toLowerCase();
+  if (raw === "1" || raw === "true") return true;
+  if (raw === "0" || raw === "false") return false;
+  throw new ConfigError(`${name} must be true or false`);
 }
 
 function str(value: string | undefined, fallback: string): string {
@@ -339,7 +364,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const heliusRps = num(env.HELIUS_RPS, 5, "HELIUS_RPS");
   const rugCheckTimeoutMs = num(env.RUG_CHECK_TIMEOUT_MS, 2_000, "RUG_CHECK_TIMEOUT_MS");
   const rpcCacheTtlMs = num(env.RPC_CACHE_TTL_MS, 3_000, "RPC_CACHE_TTL_MS");
-  const maxOpenPositions = num(env.MAX_OPEN_POSITIONS, HARD_CAPS.maxOpenPositions, "MAX_OPEN_POSITIONS");
+  const maxOpenPositions = num(
+    env.MAX_OPEN_POSITIONS,
+    strategy === "momentum" ? 4 : HARD_CAPS.maxOpenPositions,
+    "MAX_OPEN_POSITIONS",
+  );
   const maxHoldMinutes = num(env.MAX_HOLD_MINUTES, 10, "MAX_HOLD_MINUTES");
   const liqDropPct = num(env.LIQ_DROP_PCT, 20, "LIQ_DROP_PCT");
   const volumeStallSec = num(env.VOLUME_STALL_SEC, 45, "VOLUME_STALL_SEC");
@@ -351,6 +380,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const momentumResistanceCandles = Math.floor(
     num(env.MOMENTUM_RESISTANCE_CANDLES, 6, "MOMENTUM_RESISTANCE_CANDLES"),
   );
+  const momentumSizePct = num(env.MOMENTUM_SIZE_PCT, 20, "MOMENTUM_SIZE_PCT");
+  const momentumUseJito = flag(env.MOMENTUM_USE_JITO, false, "MOMENTUM_USE_JITO");
+  const momentumPriorityFeeSol = num(env.MOMENTUM_PRIORITY_FEE_SOL, 0.00005, "MOMENTUM_PRIORITY_FEE_SOL");
+  const momentumTurboFeeSol = num(env.MOMENTUM_TURBO_FEE_SOL, 0.0002, "MOMENTUM_TURBO_FEE_SOL");
+  const momentumJitoTipMinSol = num(env.MOMENTUM_JITO_TIP_MIN_SOL, 0.0001, "MOMENTUM_JITO_TIP_MIN_SOL");
+  const momentumJitoTipMaxSol = num(env.MOMENTUM_JITO_TIP_MAX_SOL, 0.0003, "MOMENTUM_JITO_TIP_MAX_SOL");
+  const momentumPumpswapFeeBps = num(env.MOMENTUM_PUMPSWAP_FEE_BPS, 25, "MOMENTUM_PUMPSWAP_FEE_BPS");
+  const momentumRaydiumFeeBps = num(env.MOMENTUM_RAYDIUM_FEE_BPS, 25, "MOMENTUM_RAYDIUM_FEE_BPS");
+  const paperStartBalanceUsd = optionalNum(env.PAPER_START_BALANCE_USD, "PAPER_START_BALANCE_USD");
   const grpcUrlRaw = str(env.GRPC_URL, "");
   const grpcTokenPresent = Boolean(env.GRPC_TOKEN?.trim());
   const paperSlippagePct = num(env.PAPER_SLIPPAGE_PCT, 2, "PAPER_SLIPPAGE_PCT");
@@ -546,8 +584,37 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!Number.isInteger(momentumResistanceCandles) || momentumResistanceCandles < 2) {
     throw new ConfigError("MOMENTUM_RESISTANCE_CANDLES must be an integer >= 2");
   }
-  if (strategy === "momentum" && mode === "paper" && paperStartBalanceSol == null) {
-    throw new ConfigError("STRATEGY=momentum in paper mode requires PAPER_START_BALANCE_SOL");
+  if (
+    strategy === "momentum" &&
+    mode === "paper" &&
+    paperStartBalanceSol == null &&
+    paperStartBalanceUsd == null
+  ) {
+    throw new ConfigError(
+      "STRATEGY=momentum in paper mode requires PAPER_START_BALANCE_SOL or PAPER_START_BALANCE_USD",
+    );
+  }
+  if (!(momentumSizePct > 0) || momentumSizePct > 100) {
+    throw new ConfigError("MOMENTUM_SIZE_PCT must be greater than 0 and at most 100");
+  }
+  if (!(momentumPriorityFeeSol > 0) || momentumPriorityFeeSol > momentumTurboFeeSol) {
+    throw new ConfigError("MOMENTUM_PRIORITY_FEE_SOL must be > 0 and at most MOMENTUM_TURBO_FEE_SOL");
+  }
+  if (!(momentumTurboFeeSol > 0) || momentumTurboFeeSol > 0.01) {
+    throw new ConfigError("MOMENTUM_TURBO_FEE_SOL must be between 0 and 0.01");
+  }
+  if (
+    !(momentumJitoTipMinSol >= 0) ||
+    momentumJitoTipMinSol > momentumJitoTipMaxSol ||
+    momentumJitoTipMaxSol > HARD_CAPS.maxJitoTipSol
+  ) {
+    throw new ConfigError("MOMENTUM_JITO_TIP_MIN_SOL and MOMENTUM_JITO_TIP_MAX_SOL must sit inside 0 to 0.005");
+  }
+  if (momentumPumpswapFeeBps < 0 || momentumPumpswapFeeBps > 500 || momentumRaydiumFeeBps < 0 || momentumRaydiumFeeBps > 500) {
+    throw new ConfigError("momentum swap fee bps must be between 0 and 500");
+  }
+  if (paperStartBalanceUsd != null && !(paperStartBalanceUsd > 0)) {
+    throw new ConfigError("PAPER_START_BALANCE_USD must be positive when set");
   }
   const slippageCeiling = Math.max(buySlippagePct, sellSlippagePct);
   if (!(paperSlippagePct >= 0) || paperSlippagePct > slippageCeiling) {
@@ -649,6 +716,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     rugCheckRpcUrl,
     momentumPollSec,
     momentumResistanceCandles,
+    momentumSizePct,
+    momentumUseJito,
+    momentumPriorityFeeSol,
+    momentumTurboFeeSol,
+    momentumJitoTipMinSol,
+    momentumJitoTipMaxSol,
+    momentumPumpswapFeeBps,
+    momentumRaydiumFeeBps,
+    paperStartBalanceUsd,
     jitoBlockEngineUrl: str(
       env.JITO_BLOCK_ENGINE_URL,
       "https://mainnet.block-engine.jito.wtf/api/v1/bundles",

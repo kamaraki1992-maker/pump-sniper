@@ -103,6 +103,10 @@ export interface OrderRequest {
   pool?: "pump-amm" | "raydium" | "auto";
   /** When set, paper and live use this priority fee instead of the dynamic quote. */
   priorityFeeSol?: number;
+  /** Momentum fee tier. Unset keeps the sniper quote. */
+  feeLevel?: "medium" | "high";
+  /** `false` sends a normal transaction. Unset keeps the Jito bundle. */
+  useJito?: boolean;
   /** Computed Jito tip for this order. Falls back to the config tip when omitted. */
   tipSol?: number;
   /** Stop-like exits use this order's slippage instead of the smaller paper default. */
@@ -160,6 +164,19 @@ export interface TradeRecord {
   bundle?: "jito" | null;
   /** Buy had no verified socials and entered through the fast lane. */
   noSocials?: boolean;
+  /** Itemized momentum paper costs. Absent on sniper rows. */
+  costs?: TradeCosts;
+}
+
+export interface TradeCosts {
+  baseFeeSol: number;
+  priorityFeeSol: number;
+  tipSol: number;
+  swapFeeSol: number;
+  priceImpactPct: number;
+  /** Negative when rent is debited, positive when it is credited back. */
+  ataRentSol: number;
+  closeFeeSol: number;
 }
 
 export interface Position {
