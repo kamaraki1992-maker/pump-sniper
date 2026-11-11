@@ -43,6 +43,27 @@ test("a 60-second spike needs a 12% to 25% rise and ten buys in a row", () => {
   assert.equal(scalpSpike(oldLow, now).ok, false);
 });
 
+test("the spike band includes 12 and 40 and rejects 40.01", () => {
+  const now = 2_000_000;
+  const band = { minPct: 12, maxPct: 40 };
+  const rise = (pct: number) => prints([1, ...Array(9).fill(1 + pct / 100)], Array(10).fill("buy"), now - 1000);
+  assert.equal(scalpSpike(rise(12), now, band).ok, true);
+  assert.equal(scalpSpike(rise(12), now, band).reason, "spike");
+  assert.equal(scalpSpike(rise(40), now, band).ok, true);
+  assert.equal(scalpSpike(rise(40.01), now, band).reason, "fomo");
+  const dir = mkdtempSync(join(tmpdir(), "scalp-band-"));
+  const config = loadConfig({
+    STRATEGY: "scalp",
+    PAPER_START_BALANCE_SOL: "1",
+    DATA_DIR: dir,
+    KILL_FILE: join(dir, "KILL"),
+    SCALP_SPIKE_MIN_PCT: "12",
+    SCALP_SPIKE_MAX_PCT: "40",
+  });
+  assert.equal(config.scalpSpikeMinPct, 12);
+  assert.equal(config.scalpSpikeMaxPct, 40);
+});
+
 test("scalp exits ratchet the stop, sell 60%, trail 10%, and honor both clocks", () => {
   const held = {
     entryPriceSol: 1,
@@ -102,6 +123,8 @@ test("the safety gate fails closed and a paper spike buys at the fixed priority 
   assert.equal(config.scalpLargeBuyUsd, 300);
   assert.equal(config.scalpLargeBuySol, 2);
   assert.equal(config.scalpLargeBuyWindowSec, 120);
+  assert.equal(config.scalpSpikeMinPct, 12);
+  assert.equal(config.scalpSpikeMaxPct, 25);
   assert.equal(config.scalpMaxHoldMin, 30);
   assert.equal(config.maxOpenPositions, 4);
   const positions = new PositionBook(join(dir, "positions.json"));
@@ -264,8 +287,11 @@ test("a scalp entry needs two large buys in the last two minutes", async () => {
     { ...bars, solUsd: 100 },
   );
   assert.equal(enough.ok, true);
-  assert.deepEqual(enough.buys.map((buy) => buy.via), ["sol", "both"]);
-  assert.equal(scalpLargeBuys([print(2, "buy", now)], now, { ...bars, solUsd: 150 }).buys[0]?.via, "usd");
+  assert.deepEqual(enough.buys.map((buy) => buy.via), ["sol", "sol", "both"]);
+  const exactSol = scalpLargeBuys([print(2, "buy", now)], now, { ...bars, solUsd: 100, minCount: 1 });
+  assert.equal(exactSol.ok, true);
+  assert.equal(exactSol.buys[0]?.via, "sol");
+  assert.equal(scalpLargeBuys([print(1.5, "buy", now)], now, { ...bars, solUsd: 200, minCount: 1 }).buys[0]?.via, "usd");
 
   const dir = mkdtempSync(join(tmpdir(), "scalp-large-"));
   const config = loadConfig({

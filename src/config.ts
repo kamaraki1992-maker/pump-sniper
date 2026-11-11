@@ -186,6 +186,10 @@ export interface AppConfig {
   scalpMaxHoldMin: number;
   /** Safety gate budget after a scalp spike. A miss skips the buy. */
   scalpGateMs: number;
+  /** Lowest 60-second rise, in percent, that counts as a scalp spike. */
+  scalpSpikeMinPct: number;
+  /** A 60-second rise above this percent is skipped as fomo. */
+  scalpSpikeMaxPct: number;
   /** Skip a scalp buy when the round trip costs more than this percent of size. */
   scalpMaxCostPct: number;
   /** Sell the whole scalp position when the leftover would be worth less than this. */
@@ -194,7 +198,7 @@ export interface AppConfig {
   scalpMinLargeBuys: number;
   /** A buy of this many dollars counts as large. */
   scalpLargeBuyUsd: number;
-  /** A buy strictly above this many SOL counts as large. */
+  /** A buy of at least this many SOL counts as large. */
   scalpLargeBuySol: number;
   /** How far back the large-buy count looks, in seconds. */
   scalpLargeBuyWindowSec: number;
@@ -430,6 +434,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const scalpPriorityFeeSol = num(env.SCALP_PRIORITY_FEE_SOL, 0.0002, "SCALP_PRIORITY_FEE_SOL");
   const scalpMaxHoldMin = num(env.SCALP_MAX_HOLD_MIN, 30, "SCALP_MAX_HOLD_MIN");
   const scalpGateMs = num(env.SCALP_GATE_MS, 1_500, "SCALP_GATE_MS");
+  const scalpSpikeMinPct = num(env.SCALP_SPIKE_MIN_PCT, 12, "SCALP_SPIKE_MIN_PCT");
+  const scalpSpikeMaxPct = num(env.SCALP_SPIKE_MAX_PCT, 25, "SCALP_SPIKE_MAX_PCT");
   const scalpMaxCostPct = num(env.SCALP_MAX_COST_PCT, 4, "SCALP_MAX_COST_PCT");
   const scalpMinRemainderSol = num(env.SCALP_MIN_REMAINDER_SOL, 0.01, "SCALP_MIN_REMAINDER_SOL");
   const scalpMinLargeBuys = Math.floor(num(env.SCALP_MIN_LARGE_BUYS, 2, "SCALP_MIN_LARGE_BUYS"));
@@ -659,6 +665,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   if (!(scalpMaxHoldMin > 0)) throw new ConfigError("SCALP_MAX_HOLD_MIN must be positive");
   if (!(scalpGateMs >= 250)) throw new ConfigError("SCALP_GATE_MS must be at least 250");
+  if (!(scalpSpikeMinPct > 0) || !(scalpSpikeMaxPct > scalpSpikeMinPct)) {
+    throw new ConfigError("SCALP_SPIKE_MIN_PCT must be > 0 and SCALP_SPIKE_MAX_PCT must be greater");
+  }
   if (!(scalpMaxCostPct > 0) || scalpMaxCostPct > 100) throw new ConfigError("SCALP_MAX_COST_PCT must be between 0 and 100");
   if (!(scalpMinRemainderSol >= 0)) throw new ConfigError("SCALP_MIN_REMAINDER_SOL must be >= 0");
   if (!(scalpMinLargeBuys >= 1)) throw new ConfigError("SCALP_MIN_LARGE_BUYS must be at least 1");
@@ -806,6 +815,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     scalpPriorityFeeSol,
     scalpMaxHoldMin,
     scalpGateMs,
+    scalpSpikeMinPct,
+    scalpSpikeMaxPct,
     scalpMaxCostPct,
     scalpMinRemainderSol,
     scalpMinLargeBuys,

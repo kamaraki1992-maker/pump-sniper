@@ -185,7 +185,10 @@ export class ScalpRunner {
       this.deps.log.info("scalp", { mint: event.mint, decision: "skip", reason: "entries_blocked" });
       return;
     }
-    const spike = scalpSpike(this.prints.get(event.mint) ?? [], nowMs);
+    const spike = scalpSpike(this.prints.get(event.mint) ?? [], nowMs, {
+      minPct: this.deps.config.scalpSpikeMinPct,
+      maxPct: this.deps.config.scalpSpikeMaxPct,
+    });
     this.deps.log.info("scalp", { mint: event.mint, decision: spike.ok ? "spike" : "skip", reason: spike.reason, risePct: spike.risePct, buys: spike.buys });
     if (!spike.ok) return;
     const solUsd = this.deps.solUsd();

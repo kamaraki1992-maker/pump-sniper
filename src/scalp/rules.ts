@@ -7,7 +7,7 @@ import type { TradeReason } from "../types.js";
  *
  * The 60-second rise is (current price - lowest price in that window) / low.
  * Ten consecutive buys means the latest ten prints are buys. A sell anywhere
- * in those ten rejects the spike. A rise above 25% is anti-FOMO, not an entry.
+ * in those ten rejects the spike. A rise above the configured max is anti-FOMO.
  */
 export const SCALP = {
   minAgeMs: 60 * 1000,
@@ -52,24 +52,30 @@ export interface ScalpSpike {
 }
 
 /** Rise from the lowest print in the trailing 60 seconds, plus the buy streak. */
-export function scalpSpike(prints: readonly ScalpPrint[], nowMs: number): ScalpSpike {
+export function scalpSpike(
+  prints: readonly ScalpPrint[],
+  nowMs: number,
+  band: { minPct: number; maxPct: number } = { minPct: SCALP.minRise * 100, maxPct: SCALP.maxRise * 100 },
+): ScalpSpike {
   const window = prints.filter((print) => print.atMs >= nowMs - SCALP.windowMs && print.atMs <= nowMs && print.priceSol > 0);
   if (window.length < 2) return { ok: false, reason: "spike_history", risePct: null, buys: streak(prints) };
   let low = window[0]!.priceSol;
   for (const print of window) if (print.priceSol < low) low = print.priceSol;
   const current = window[window.length - 1]!.priceSol;
   const rise = low > 0 ? (current - low) / low : 0;
+  const minRise = band.minPct / 100;
+  const maxRise = band.maxPct / 100;
   const buys = streak(prints);
-  if (rise > SCALP.maxRise) return { ok: false, reason: "fomo", risePct: rise * 100, buys };
-  if (rise < SCALP.minRise) return { ok: false, reason: "spike", risePct: rise * 100, buys };
+  if (rise > maxRise + 1e-9) return { ok: false, reason: "fomo", risePct: rise * 100, buys };
+  if (rise + 1e-9 < minRise) return { ok: false, reason: "spike", risePct: rise * 100, buys };
   if (buys < SCALP.consecutiveBuys) return { ok: false, reason: "consecutive_buys", risePct: rise * 100, buys };
   return { ok: true, reason: "spike", risePct: rise * 100, buys };
 }
 
 /**
  * Buys in the window that are at least `minUsd` at the live SOL price, or
- * strictly above `minSol`. Either bar is enough, so the lower one is the
- * one that actually qualifies the print.
+ * at least `minSol`. Either bar is enough, so the lower one is the one
+ * that actually qualifies the print.
  */
 export function scalpLargeBuys(
   prints: readonly ScalpPrint[],
@@ -84,7 +90,7 @@ export function scalpLargeBuys(
     if (!(sol > 0)) continue;
     const usd = solUsd != null ? sol * solUsd : null;
     const byUsd = usd != null && usd >= input.minUsd;
-    const bySol = sol > input.minSol;
+    const bySol = sol >= input.minSol;
     if (!byUsd && !bySol) continue;
     buys.push({ sol, usd, via: byUsd && bySol ? "both" : byUsd ? "usd" : "sol" });
   }
