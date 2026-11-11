@@ -414,6 +414,7 @@ export async function runScalp(runtime: Runtime, options: { maxRuntimeMs?: numbe
   const { config, log, positions, sol, executor, trades } = runtime;
   const removeGuards = installProcessGuards(log);
   const market = new HttpMomentumMarket(config.momentumPollSec * 1000);
+  const safety = createScalpGate(config, market, { log });
   const runner = new ScalpRunner({
     config,
     executor,
@@ -424,7 +425,8 @@ export async function runScalp(runtime: Runtime, options: { maxRuntimeMs?: numbe
     solLast: () => ({ price: sol.price(), atMs: sol.updatedAt() }),
     now: () => new Date(),
     market,
-    gate: createScalpGate(config, market),
+    gate: safety.check,
+    prewarm: safety.prewarm,
     watch: (mint) => runtime.subscription.stream?.subscribeTrades([mint]),
     ...(runtime.paperBalance ? { paperBalance: runtime.paperBalance } : {}),
     ...(runtime.walletBalanceSol ? { walletBalanceSol: runtime.walletBalanceSol } : {}),
@@ -435,6 +437,7 @@ export async function runScalp(runtime: Runtime, options: { maxRuntimeMs?: numbe
     priorityFeeSol: config.scalpPriorityFeeSol,
     maxHoldMin: config.scalpMaxHoldMin,
     gateMs: config.scalpGateMs,
+    simTimeoutMs: config.scalpSimTimeoutMs,
     maxOpenPositions: config.maxOpenPositions,
   });
   const stream = attachScalp(runtime, runner);

@@ -186,6 +186,8 @@ export interface AppConfig {
   scalpMaxHoldMin: number;
   /** Safety gate budget after a scalp spike. A miss skips the buy. */
   scalpGateMs: number;
+  /** Honeypot sell-simulation budget. Independent of the gate budget. */
+  scalpSimTimeoutMs: number;
   /** Lowest 60-second rise, in percent, that counts as a scalp spike. */
   scalpSpikeMinPct: number;
   /** A 60-second rise above this percent is skipped as fomo. */
@@ -433,7 +435,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const momentumPumpFeeBps = num(env.MOMENTUM_PUMP_FEE_BPS, 100, "MOMENTUM_PUMP_FEE_BPS");
   const scalpPriorityFeeSol = num(env.SCALP_PRIORITY_FEE_SOL, 0.0002, "SCALP_PRIORITY_FEE_SOL");
   const scalpMaxHoldMin = num(env.SCALP_MAX_HOLD_MIN, 30, "SCALP_MAX_HOLD_MIN");
-  const scalpGateMs = num(env.SCALP_GATE_MS, 1_500, "SCALP_GATE_MS");
+  const scalpGateMs = num(env.SCALP_GATE_MS, 3_000, "SCALP_GATE_MS");
+  const scalpSimTimeoutMs = num(env.SCALP_SIM_TIMEOUT_MS, 3_000, "SCALP_SIM_TIMEOUT_MS");
   const scalpSpikeMinPct = num(env.SCALP_SPIKE_MIN_PCT, 12, "SCALP_SPIKE_MIN_PCT");
   const scalpSpikeMaxPct = num(env.SCALP_SPIKE_MAX_PCT, 25, "SCALP_SPIKE_MAX_PCT");
   const scalpMaxCostPct = num(env.SCALP_MAX_COST_PCT, 4, "SCALP_MAX_COST_PCT");
@@ -665,6 +668,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
   if (!(scalpMaxHoldMin > 0)) throw new ConfigError("SCALP_MAX_HOLD_MIN must be positive");
   if (!(scalpGateMs >= 250)) throw new ConfigError("SCALP_GATE_MS must be at least 250");
+  if (!(scalpSimTimeoutMs >= 250)) throw new ConfigError("SCALP_SIM_TIMEOUT_MS must be at least 250");
   if (!(scalpSpikeMinPct > 0) || !(scalpSpikeMaxPct > scalpSpikeMinPct)) {
     throw new ConfigError("SCALP_SPIKE_MIN_PCT must be > 0 and SCALP_SPIKE_MAX_PCT must be greater");
   }
@@ -815,6 +819,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     scalpPriorityFeeSol,
     scalpMaxHoldMin,
     scalpGateMs,
+    scalpSimTimeoutMs,
     scalpSpikeMinPct,
     scalpSpikeMaxPct,
     scalpMaxCostPct,

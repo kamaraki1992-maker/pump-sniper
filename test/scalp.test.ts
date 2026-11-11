@@ -123,6 +123,8 @@ test("the safety gate fails closed and a paper spike buys at the fixed priority 
   assert.equal(config.scalpLargeBuyUsd, 300);
   assert.equal(config.scalpLargeBuySol, 2);
   assert.equal(config.scalpLargeBuyWindowSec, 120);
+  assert.equal(config.scalpGateMs, 3000);
+  assert.equal(config.scalpSimTimeoutMs, 3000);
   assert.equal(config.scalpSpikeMinPct, 12);
   assert.equal(config.scalpSpikeMaxPct, 25);
   assert.equal(config.scalpMaxHoldMin, 30);

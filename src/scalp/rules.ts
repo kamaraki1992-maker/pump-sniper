@@ -25,7 +25,9 @@ export const SCALP = {
   trailDrop: 0.1,
   fastHoldMs: 5 * 60 * 1000,
   fastMinGain: 0.1,
-  gateMs: 1_500,
+  gateMs: 3_000,
+  /** Start the safety reads once the 60-second rise reaches this. */
+  warmRise: 0.06,
   /** Keep the ATA this long in case the same mint is bought again. */
   ataReuseMs: 10 * 60 * 1000,
 } as const;
@@ -95,6 +97,26 @@ export function scalpLargeBuys(
     buys.push({ sol, usd, via: byUsd && bySol ? "both" : byUsd ? "usd" : "sol" });
   }
   return { ok: buys.length >= input.minCount, buys };
+}
+
+/**
+ * True once the tape is worth warming: the 60-second rise is at least 6%,
+ * or one buy has already cleared a large-buy bar.
+ */
+export function scalpWarmInterest(
+  prints: readonly ScalpPrint[],
+  nowMs: number,
+  large: { windowMs: number; minUsd: number; minSol: number; solUsd: number | null },
+): boolean {
+  const window = prints.filter((print) => print.atMs >= nowMs - SCALP.windowMs && print.atMs <= nowMs && print.priceSol > 0);
+  if (window.length >= 2) {
+    let low = window[0]!.priceSol;
+    for (const print of window) if (print.priceSol < low) low = print.priceSol;
+    const current = window[window.length - 1]!.priceSol;
+    const rise = low > 0 ? (current - low) / low : 0;
+    if (rise + 1e-9 >= SCALP.warmRise) return true;
+  }
+  return scalpLargeBuys(prints, nowMs, { ...large, minCount: 1 }).ok;
 }
 
 /** Buys at the end of the tape. A sell resets the count. */

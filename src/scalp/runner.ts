@@ -12,7 +12,7 @@ import { TOTAL_SUPPLY_TOKENS } from "../pricing.js";
 import { berlinDay, type TradeLog } from "../report.js";
 import type { Executor, MarketLaunch, MarketTrade, Position, TradeReason } from "../types.js";
 import type { ScalpGateFacts } from "./rules.js";
-import { SCALP, scalpExecutionFee, scalpExit, scalpGate, scalpLargeBuys, scalpRemainderNetSol, scalpRoundTripCost, scalpSpike, type ScalpPrint } from "./rules.js";
+import { SCALP, scalpExecutionFee, scalpExit, scalpGate, scalpLargeBuys, scalpRemainderNetSol, scalpRoundTripCost, scalpSpike, scalpWarmInterest, type ScalpPrint } from "./rules.js";
 import { bundledInsiderPct } from "../momentum/rules.js";
 import { WSOL_MINT } from "../pricing.js";
 
@@ -37,6 +37,8 @@ export interface ScalpDeps {
   walletBalanceSol?: () => Promise<number>;
   reclaimRent?: (mint: string) => Promise<{ closed: boolean; rentSol: number; reason: string }>;
   gate: (mint: string, hint: ScalpHint) => Promise<ScalpGateFacts | "timeout">;
+  /** Paper only. Starts the safety reads before the entry spike. */
+  prewarm?: (mint: string, hint: ScalpHint) => void;
   /** Local trade subscription. The Helius program feed filters to these mints. */
   watch?: (mint: string) => void;
   daily?: DailyLossBook;
@@ -51,8 +53,8 @@ interface LaunchMemory {
 }
 
 /**
- * Spike detection runs on each trade print. The DexScreener and RPC gate
- * runs only after a spike, inside SCALP_GATE_MS. Exits use the same prints.
+ * Spike detection runs on each trade print. A 6% rise or the first large
+ * buy starts the safety reads. The gate itself runs after a full spike.
  */
 export class ScalpRunner {
   private readonly watched = new Set<string>();
@@ -185,6 +187,7 @@ export class ScalpRunner {
       this.deps.log.info("scalp", { mint: event.mint, decision: "skip", reason: "entries_blocked" });
       return;
     }
+    this.warm(event, nowMs);
     const spike = scalpSpike(this.prints.get(event.mint) ?? [], nowMs, {
       minPct: this.deps.config.scalpSpikeMinPct,
       maxPct: this.deps.config.scalpSpikeMaxPct,
@@ -510,6 +513,33 @@ export class ScalpRunner {
     } finally {
       this.selling.delete(position.mint);
     }
+  }
+
+  /** Paper runs start the sell sim before the spike is complete. */
+  private warm(event: MarketTrade, nowMs: number): void {
+    if (this.deps.config.mode !== "paper" || !this.deps.prewarm) return;
+    const prints = this.prints.get(event.mint) ?? [];
+    const solUsd = this.deps.solUsd();
+    if (!scalpWarmInterest(prints, nowMs, {
+      windowMs: this.deps.config.scalpLargeBuyWindowSec * 1000,
+      minUsd: this.deps.config.scalpLargeBuyUsd,
+      minSol: this.deps.config.scalpLargeBuySol,
+      solUsd,
+    })) return;
+    const memory = this.launches.get(event.mint);
+    this.deps.prewarm(event.mint, {
+      ageMs: memory ? nowMs - memory.atMs : null,
+      liquidityUsd: solUsd != null && solUsd > 0 ? this.liquidityUsd(event, solUsd) : null,
+      bundlePct: memory?.incomplete
+        ? null
+        : bundledInsiderPct({
+            supplyTokens: TOTAL_SUPPLY_TOKENS,
+            createSlot: memory?.slot ?? null,
+            creator: memory?.creator ?? null,
+            buys: memory?.buys ?? [],
+          }),
+      creator: memory?.creator ?? null,
+    });
   }
 
   private liquidityUsd(event: MarketTrade, solUsd: number): number | null {

@@ -1,5 +1,5 @@
 import type { AppConfig } from "../config.js";
-import { readChainFacts } from "../momentum/chain.js";
+import { readChainFacts, type ChainFacts } from "../momentum/chain.js";
 import { createHoneypotCheck } from "../momentum/honeypot.js";
 import type { DexPair, MomentumMarket } from "../momentum/market.js";
 import { curveLiquidityUsd } from "../momentum/rules.js";
@@ -12,49 +12,121 @@ export interface ScalpHint {
   creator: string | null;
 }
 
+/** Reuse a warmed safety read for this long. */
+export const SCALP_SAFETY_TTL_MS = 60_000;
+
+export interface ScalpSimResult {
+  ok: boolean;
+  reason: string | null;
+  simMs: number;
+}
+
+interface SafetySlot {
+  at: number;
+  creator: string | null;
+  pair: Promise<DexPair | null>;
+  chain: Promise<ChainFacts | null>;
+  honey: Promise<ScalpSimResult>;
+  honeySettled: boolean;
+}
+
+export interface ScalpGateApi {
+  check: (mint: string, hint: ScalpHint) => Promise<ScalpGateFacts | "timeout">;
+  /** Start the sell sim and the other safety reads before the entry spike. */
+  prewarm: (mint: string, hint: ScalpHint) => void;
+}
+
+export interface ScalpGateOptions {
+  now?: () => number;
+  log?: { info(message: string, fields?: Record<string, unknown>): void };
+  honeypot?: (mint: string) => Promise<{ ok: boolean; reason: string | null }>;
+  chain?: (mint: string, creator: string | null) => Promise<ChainFacts>;
+}
+
 /**
- * DexScreener plus the rug RPC, raced against the gate budget. A timeout is a
- * skip. Successful pair and holder reads are reused for 15 seconds.
+ * Safety reads run together. The sell simulation has its own budget and is
+ * started early, then reused. A simulation that does not finish, or that
+ * shows the mint cannot be sold, stays a skip.
  */
 export function createScalpGate(
   config: AppConfig,
   market: MomentumMarket,
-  now: () => number = Date.now,
-): (mint: string, hint: ScalpHint) => Promise<ScalpGateFacts | "timeout"> {
-  const honeypot = createHoneypotCheck(config);
-  const cache = new Map<string, { at: number; pair: DexPair | null; chain: Awaited<ReturnType<typeof readChainFacts>> | null }>();
-  return async (mint, hint) => {
-    const deadline = now() + config.scalpGateMs;
-    const remain = () => Math.max(1, deadline - now());
-    const cached = cache.get(mint);
-    const fresh = cached && now() - cached.at < 15_000 ? cached : null;
-    const pairPromise = fresh
-      ? Promise.resolve(fresh.pair)
-      : withTimeout(market.pair(mint), remain(), null);
-    const chainPromise = fresh?.chain
-      ? Promise.resolve(fresh.chain)
-      : withTimeout(readChainFacts(config.rugCheckRpcUrl, mint, hint.creator), remain(), null);
-    const honeyPromise = withTimeout(honeypot(mint), remain(), null);
-    const [pair, chain, honey] = await Promise.all([pairPromise, chainPromise, honeyPromise]);
-    if (!fresh) cache.set(mint, { at: now(), pair: pair ?? null, chain });
-    if (pair === null && chain === null && honey === null && !fresh) return "timeout";
-    const ageMs = hint.ageMs ?? (pair?.pairCreatedAtMs != null ? now() - pair.pairCreatedAtMs : null);
-    const fromCurve = hint.liquidityUsd;
-    const fromDex = pair ? curveLiquidityUsd(pair.quoteAmount, null, pair.liquidityUsd) : 0;
-    const liquidityUsd = fromCurve != null && fromCurve > 0 ? fromCurve : fromDex > 0 ? fromDex : null;
-    if (!chain || !honey) return "timeout";
-    return {
-      ageMs,
-      liquidityUsd,
-      mintOk: chain.mintOk,
-      mintReason: chain.mintReason,
-      honeypotOk: honey.ok,
-      honeypotReason: honey.reason,
-      top10Pct: chain.top10Pct,
-      devPct: chain.devPct,
-      bundlePct: hint.bundlePct,
-      socialsOk: pair?.socialsOk === true,
+  options: ScalpGateOptions = {},
+): ScalpGateApi {
+  const now = options.now ?? Date.now;
+  const honeypot = options.honeypot ?? createHoneypotCheck(config);
+  const chain = options.chain ?? ((mint: string, creator: string | null) => readChainFacts(config.rugCheckRpcUrl, mint, creator));
+  const cache = new Map<string, SafetySlot>();
+
+  const loadPair = (mint: string) => withTimeout(market.pair(mint).catch(() => null), config.scalpGateMs, null);
+  const loadChain = (mint: string, creator: string | null) =>
+    withTimeout(chain(mint, creator).catch(() => null), config.scalpGateMs, null);
+  const loadHoney = (mint: string, slot: SafetySlot): Promise<ScalpSimResult> => {
+    const started = now();
+    const work = honeypot(mint).catch(() => ({ ok: false, reason: "honeypot_unsimulated" as string | null }));
+    return withTimeout(work, config.scalpSimTimeoutMs, { ok: false, reason: "honeypot_unsimulated" }).then((result) => {
+      slot.honeySettled = true;
+      return { ok: result.ok, reason: result.reason, simMs: Math.max(0, now() - started) };
+    });
+  };
+
+  const ensure = (mint: string, hint: ScalpHint): SafetySlot => {
+    const existing = cache.get(mint);
+    if (existing && now() - existing.at < SCALP_SAFETY_TTL_MS) {
+      if (hint.creator && hint.creator !== existing.creator) {
+        existing.creator = hint.creator;
+        existing.chain = loadChain(mint, hint.creator);
+      }
+      return existing;
+    }
+    const slot: SafetySlot = {
+      at: now(),
+      creator: hint.creator,
+      pair: Promise.resolve(null),
+      chain: Promise.resolve(null),
+      honey: Promise.resolve({ ok: false, reason: "honeypot_unsimulated", simMs: 0 }),
+      honeySettled: false,
     };
+    slot.pair = loadPair(mint);
+    slot.chain = loadChain(mint, hint.creator);
+    slot.honey = loadHoney(mint, slot);
+    cache.set(mint, slot);
+    return slot;
+  };
+
+  return {
+    prewarm(mint, hint) {
+      ensure(mint, hint);
+    },
+    async check(mint, hint) {
+      const slot = ensure(mint, hint);
+      const cacheHit = slot.honeySettled;
+      const [pair, chainFacts, honey] = await Promise.all([slot.pair, slot.chain, slot.honey]);
+      options.log?.info("scalp", {
+        mint,
+        decision: "sim",
+        simMs: honey.simMs,
+        cacheHit,
+        reason: honey.reason,
+      });
+      if (!chainFacts) return "timeout";
+      const ageMs = hint.ageMs ?? (pair?.pairCreatedAtMs != null ? now() - pair.pairCreatedAtMs : null);
+      const fromCurve = hint.liquidityUsd;
+      const fromDex = pair ? curveLiquidityUsd(pair.quoteAmount, null, pair.liquidityUsd) : 0;
+      const liquidityUsd = fromCurve != null && fromCurve > 0 ? fromCurve : fromDex > 0 ? fromDex : null;
+      return {
+        ageMs,
+        liquidityUsd,
+        mintOk: chainFacts.mintOk,
+        mintReason: chainFacts.mintReason,
+        honeypotOk: honey.ok,
+        honeypotReason: honey.reason,
+        top10Pct: chainFacts.top10Pct,
+        devPct: chainFacts.devPct,
+        bundlePct: hint.bundlePct,
+        socialsOk: pair?.socialsOk === true,
+      };
+    },
   };
 }
 
