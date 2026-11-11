@@ -745,6 +745,7 @@ test("status reports pnl, fees, equity, and the kill switch", () => {
   assert.equal(report.winRate, 1);
   assert.equal(report.netPnlSol, 0.05);
   assert.ok(report.grossPnlSol > report.netPnlSol);
+  assert.ok(report.feeShareOfGross != null && Math.abs(report.feeShareOfGross - (report.grossPnlSol - report.netPnlSol) / report.grossPnlSol) < 1e-12);
   assert.equal(report.fees.swapFeeSol, 0.01);
   assert.equal(report.fees.tipSol, 0.0001);
   assert.equal(report.openPositions.length, 1);

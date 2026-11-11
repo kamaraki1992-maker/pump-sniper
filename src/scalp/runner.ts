@@ -12,7 +12,7 @@ import { TOTAL_SUPPLY_TOKENS } from "../pricing.js";
 import { berlinDay, type TradeLog } from "../report.js";
 import type { Executor, MarketLaunch, MarketTrade, Position, TradeReason } from "../types.js";
 import type { ScalpGateFacts } from "./rules.js";
-import { scalpExit, scalpGate, scalpSpike, type ScalpPrint } from "./rules.js";
+import { SCALP, scalpExecutionFee, scalpExit, scalpGate, scalpRemainderNetSol, scalpRoundTripCost, scalpSpike, type ScalpPrint } from "./rules.js";
 import { bundledInsiderPct } from "../momentum/rules.js";
 import { WSOL_MINT } from "../pricing.js";
 
@@ -60,6 +60,8 @@ export class ScalpRunner {
   private readonly launches = new Map<string, LaunchMemory>();
   private readonly gating = new Set<string>();
   private readonly selling = new Set<string>();
+  /** Mint whose ATA stays open until this time, waiting for a re-entry. */
+  private readonly ataUntil = new Map<string, number>();
   private readonly daily: DailyLossBook;
   private readonly equity: EquityBook;
   private readonly solCrash: SolCrashGuard;
@@ -132,6 +134,18 @@ export class ScalpRunner {
   /** Time exits still run when the mint goes quiet. */
   checkClocks(): void {
     const nowMs = this.deps.now().getTime();
+    for (const [mint, until] of this.ataUntil) {
+      if (until > nowMs || this.deps.positions.get(mint)) continue;
+      this.ataUntil.delete(mint);
+      if (this.deps.config.mode === "paper") {
+        this.deps.paperBalance?.add(ATA_RENT_SOL - this.deps.config.paper.baseFeeSol);
+        this.deps.log.info("rent reclaimed", { mint, rentSol: ATA_RENT_SOL, reason: "ata_reuse_expired" });
+      } else if (this.deps.reclaimRent) {
+        void this.deps.reclaimRent(mint).then((rent) => {
+          this.deps.log.info("rent reclaimed", { mint, rentSol: rent.rentSol, closed: rent.closed, reason: "ata_reuse_expired" });
+        });
+      }
+    }
     for (const position of this.deps.positions.list()) {
       if (position.strategy !== "scalp" || !(position.lastMarkPriceSol > 0)) continue;
       void this.mark(position, position.lastMarkPriceSol, null, nowMs);
@@ -217,12 +231,36 @@ export class ScalpRunner {
       return;
     }
     const fees = momentumFees(this.deps.config, true);
-    const priorityFeeSol = this.deps.config.scalpPriorityFeeSol;
-    if (!(available >= sized.sizeSol + priorityFeeSol + this.deps.config.paper.baseFeeSol + fees.tipSol + ATA_RENT_SOL)) {
+    const paid = scalpExecutionFee(this.deps.config.scalpPriorityFeeSol, fees.tipSol);
+    const pool = event.venue === "pumpswap" ? "pump-amm" as const : "pump" as const;
+    const reserves = reservesFromPair(event.poolBaseTokens ?? null, event.poolQuoteSol ?? null, event.venue === "pumpswap" ? WSOL_MINT : null)
+      ?? (event.vTokens != null && event.vSolSol != null ? { baseTokens: event.vTokens, quoteSol: event.vSolSol } : null);
+    const feeBps = swapFeeBps(this.deps.config, pool === "pump" ? "pump" : "pumpswap");
+    const trip = scalpRoundTripCost({
+      sizeSol: sized.sizeSol,
+      reserves,
+      feeBps,
+      baseFeeSol: this.deps.config.paper.baseFeeSol,
+      txFeeSol: paid.priorityFeeSol + paid.tipSol,
+    });
+    if (!trip || trip.costPct * 100 > this.deps.config.scalpMaxCostPct) {
+      this.deps.log.info("scalp", {
+        mint: event.mint,
+        decision: "skip",
+        reason: "fee_drag",
+        costSol: trip?.costSol ?? null,
+        costPct: trip ? trip.costPct * 100 : null,
+        maxPct: this.deps.config.scalpMaxCostPct,
+      });
+      return;
+    }
+    const reuseAta = (this.ataUntil.get(event.mint) ?? 0) > this.deps.now().getTime();
+    if (reuseAta) this.ataUntil.delete(event.mint);
+    const rentSol = reuseAta ? 0 : ATA_RENT_SOL;
+    if (!(available >= sized.sizeSol + paid.priorityFeeSol + this.deps.config.paper.baseFeeSol + paid.tipSol + rentSol)) {
       this.deps.log.info("scalp", { mint: event.mint, decision: "skip", reason: "insufficient_balance" });
       return;
     }
-    const pool = event.venue === "pumpswap" ? "pump-amm" : "pump";
     const mcapUsd = event.marketCapSol != null ? event.marketCapSol * solUsd : liquidityUsd;
     const slippagePct = momentumSlippagePct(mcapUsd);
     const quote = event.priceSol ?? 0;
@@ -232,12 +270,12 @@ export class ScalpRunner {
       const paper = momentumPaperBuy({
         sizeSol: sized.sizeSol,
         slippagePct,
-        reserves: reservesFromPair(event.poolBaseTokens ?? null, event.poolQuoteSol ?? null, event.venue === "pumpswap" ? WSOL_MINT : null)
-          ?? (event.vTokens != null && event.vSolSol != null ? { baseTokens: event.vTokens, quoteSol: event.vSolSol } : null),
-        feeBps: swapFeeBps(this.deps.config, pool === "pump" ? "pump" : "pumpswap"),
+        reserves,
+        feeBps,
         baseFeeSol: this.deps.config.paper.baseFeeSol,
-        priorityFeeSol,
-        tipSol: fees.tipSol,
+        priorityFeeSol: paid.priorityFeeSol,
+        tipSol: paid.tipSol,
+        includeRent: !reuseAta,
       });
       fill = paper.fill;
       costs = paper.costs;
@@ -252,8 +290,8 @@ export class ScalpRunner {
         slippagePct,
         reason: "entry",
         pool,
-        tipSol: fees.tipSol,
-        priorityFeeSol,
+        tipSol: paid.tipSol,
+        priorityFeeSol: paid.priorityFeeSol,
         useJito: fees.useJito,
         mevRequired: true,
         useQuotedSlippage: true,
@@ -305,6 +343,7 @@ export class ScalpRunner {
       momentumPool: pool,
       graduated: pool === "pump-amm",
       scalpTpTaken: false,
+      scalpCostPct: trip.costPct,
       lastVSolSol: event.vSolSol,
       lastVTokens: event.vTokens,
       poolBaseTokens: event.poolBaseTokens,
@@ -319,6 +358,15 @@ export class ScalpRunner {
     if (!current) return;
     current.lastMarkPriceSol = priceSol;
     current.peakPriceSol = Math.max(current.peakPriceSol ?? priceSol, priceSol);
+    const feeBps = swapFeeBps(this.deps.config, current.momentumPool === "pump" ? "pump" : "pumpswap");
+    const paid = scalpExecutionFee(this.deps.config.scalpPriorityFeeSol, momentumFees(this.deps.config, true).tipSol);
+    const remainder = scalpRemainderNetSol({
+      tokenAmount: current.scalpTpTaken ? current.tokenAmount / (1 - SCALP.tpOfOriginal) : current.tokenAmount,
+      priceSol,
+      feeBps,
+      baseFeeSol: this.deps.config.paper.baseFeeSol,
+      txFeeSol: paid.priorityFeeSol + paid.tipSol,
+    });
     const exit = scalpExit({
       entryPriceSol: current.entryPriceSol,
       peakPriceSol: current.peakPriceSol,
@@ -327,6 +375,8 @@ export class ScalpRunner {
       openedAtMs: Date.parse(current.openedAt),
       nowMs,
       maxHoldMs: this.deps.config.scalpMaxHoldMin * 60 * 1000,
+      costPct: current.scalpCostPct ?? 0,
+      sellAll: remainder < this.deps.config.scalpMinRemainderSol,
     });
     if (!exit) return;
     await this.sell(current, exit.reason, exit.sellFraction, priceSol, event);
@@ -342,7 +392,8 @@ export class ScalpRunner {
       const requested = portion >= 0.999 ? before : before * portion;
       const closing = portion >= 0.999;
       const fees = momentumFees(this.deps.config, true);
-      const priorityFeeSol = this.deps.config.scalpPriorityFeeSol;
+      const paid = scalpExecutionFee(this.deps.config.scalpPriorityFeeSol, fees.tipSol);
+      if (closing) this.ataUntil.set(current.mint, this.deps.now().getTime() + SCALP.ataReuseMs);
       const solUsd = this.deps.solUsd();
       const mcapUsd = event?.marketCapSol != null && solUsd != null ? event.marketCapSol * solUsd : 0;
       const slippagePct = momentumSlippagePct(mcapUsd || this.deps.config.momentumMaxUsd);
@@ -363,9 +414,9 @@ export class ScalpRunner {
           reserves,
           feeBps: swapFeeBps(this.deps.config, current.momentumPool === "pump" ? "pump" : "pumpswap"),
           baseFeeSol: this.deps.config.paper.baseFeeSol,
-          priorityFeeSol,
-          tipSol: fees.tipSol,
-          closeAccount: closing,
+          priorityFeeSol: paid.priorityFeeSol,
+          tipSol: paid.tipSol,
+          closeAccount: false,
         });
         fill = paper.fill;
         costs = paper.costs;
@@ -382,8 +433,8 @@ export class ScalpRunner {
           tokenAmount: requested,
           sellFraction: portion,
           pool: current.momentumPool ?? "pump",
-          tipSol: fees.tipSol,
-          priorityFeeSol,
+          tipSol: paid.tipSol,
+          priorityFeeSol: paid.priorityFeeSol,
           useJito: fees.useJito,
           mevRequired: true,
         });
@@ -432,10 +483,6 @@ export class ScalpRunner {
         return;
       }
       this.deps.positions.close(current.mint);
-      if (this.deps.reclaimRent) {
-        const rent = await this.deps.reclaimRent(current.mint);
-        this.deps.log.info("rent reclaimed", { mint: current.mint, rentSol: rent.rentSol, closed: rent.closed });
-      }
     } finally {
       this.selling.delete(position.mint);
     }

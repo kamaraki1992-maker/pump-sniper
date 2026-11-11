@@ -12,7 +12,8 @@ import { PaperBalance } from "../src/paper-balance.js";
 import { PositionBook } from "../src/positions.js";
 import { TradeLog } from "../src/report.js";
 import { ScalpRunner } from "../src/scalp/runner.js";
-import { SCALP, scalpExit, scalpGate, scalpSpike, type ScalpPrint } from "../src/scalp/rules.js";
+import { ATA_RENT_SOL } from "../src/momentum/paper.js";
+import { SCALP, scalpExecutionFee, scalpExit, scalpGate, scalpRemainderNetSol, scalpRoundTripCost, scalpSpike, type ScalpPrint } from "../src/scalp/rules.js";
 import type { MarketTrade } from "../src/types.js";
 import { WSOL_MINT } from "../src/pricing.js";
 
@@ -140,7 +141,7 @@ test("the safety gate fails closed and a paper spike buys at the fixed priority 
     solQuoted: true,
     priceSol: 2,
     marketCapSol: 400,
-    vSolSol: 40,
+    vSolSol: 400,
     vTokens: 1_000_000,
   });
   runner.watch(mint);
@@ -154,7 +155,7 @@ test("the safety gate fails closed and a paper spike buys at the fixed priority 
       solQuoted: true,
       priceSol: 1 + i * 0.02,
       marketCapSol: 400,
-      vSolSol: 40,
+      vSolSol: 400,
       vTokens: 1_000_000,
       solAmount: 0.1,
     };
@@ -164,10 +165,12 @@ test("the safety gate fails closed and a paper spike buys at the fixed priority 
   const open = positions.get(mint);
   assert.equal(positions.get("NotWatched"), undefined);
   assert.equal(open?.strategy, "scalp");
+  assert.ok((open?.scalpCostPct ?? 0) > 0 && (open?.scalpCostPct ?? 1) < config.scalpMaxCostPct / 100);
   const buy = trades.readAll().at(-1);
   assert.equal(buy?.strategy, "scalp");
-  assert.equal(buy?.costs?.priorityFeeSol, 0.0002);
+  assert.equal(buy?.costs?.priorityFeeSol, 0.0001);
   assert.equal(buy?.jitoTipSol, 0.0001);
+  assert.ok(Math.abs((buy?.costs?.priorityFeeSol ?? 0) + (buy?.jitoTipSol ?? 0) - 0.0002) < 1e-12);
   runner.noteTrade({
     kind: "trade",
     mint,
@@ -183,6 +186,152 @@ test("the safety gate fails closed and a paper spike buys at the fixed priority 
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(positions.get(mint), undefined);
   assert.equal(trades.readAll().at(-1)?.reason, "scalp_sl");
+  const cash = runner["deps"].paperBalance?.cash() ?? 0;
+  runner.checkClocks();
+  assert.equal(runner["deps"].paperBalance?.cash(), cash);
+  now += 61_000;
+  for (let i = 0; i < 10; i += 1) {
+    runner.noteTrade({
+      kind: "trade",
+      mint,
+      txType: "buy",
+      trader: "buyer",
+      signature: `again-${i}`,
+      solQuoted: true,
+      priceSol: 1 + i * 0.015,
+      marketCapSol: 400,
+      vSolSol: 400,
+      vTokens: 1_000_000,
+      solAmount: 0.1,
+    });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const rebuy = trades.readAll().filter((row) => row.side === "buy").at(-1);
+  assert.equal(rebuy?.costs?.ataRentSol, 0);
+  assert.equal(positions.get(mint)?.strategy, "scalp");
+  runner.noteTrade({
+    kind: "trade",
+    mint,
+    txType: "sell",
+    trader: "seller",
+    signature: "stop-again",
+    solQuoted: true,
+    priceSol: (positions.get(mint)?.entryPriceSol ?? 1) * 0.8,
+    marketCapSol: 300,
+    vSolSol: 30,
+    vTokens: 1_000_000,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(positions.get(mint), undefined);
+  const parked = runner["deps"].paperBalance?.cash() ?? 0;
+  runner.checkClocks();
+  assert.equal(runner["deps"].paperBalance?.cash(), parked);
+  now += SCALP.ataReuseMs + 1_000;
+  runner.checkClocks();
+  assert.ok(Math.abs((runner["deps"].paperBalance?.cash() ?? 0) - (parked + ATA_RENT_SOL - config.paper.baseFeeSol)) < 1e-9);
+});
+
+test("a round trip above 4% is skipped as fee_drag", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "scalp-drag-"));
+  const config = loadConfig({
+    STRATEGY: "scalp",
+    PAPER_START_BALANCE_SOL: "10",
+    DATA_DIR: dir,
+    KILL_FILE: join(dir, "KILL"),
+  });
+  const notes: Array<Record<string, unknown>> = [];
+  const log = new Logger();
+  log.info = (message, fields) => {
+    notes.push({ message, ...fields });
+  };
+  const positions = new PositionBook(join(dir, "positions.json"));
+  const runner = new ScalpRunner({
+    config,
+    executor: new PaperExecutor(config.paper),
+    positions,
+    trades: new TradeLog(join(dir, "trades.jsonl")),
+    log,
+    solUsd: () => 100,
+    now: () => new Date(1_700_000_000_000),
+    market: {
+      async candidates() { return []; },
+      async pair() { return null; },
+      async candles() { return []; },
+      async trades() { return null; },
+    },
+    paperBalance: new PaperBalance(join(dir, "paper-balance.json"), 10),
+    gate: async () => ({
+      ageMs: 2 * 60 * 1000,
+      liquidityUsd: 20_000,
+      mintOk: true,
+      mintReason: null,
+      honeypotOk: true,
+      honeypotReason: null,
+      top10Pct: 10,
+      devPct: 1,
+      bundlePct: 1,
+      socialsOk: true,
+    }),
+  });
+  const mint = "MintDrag111";
+  runner.watch(mint);
+  for (let i = 0; i < 10; i += 1) {
+    runner.noteTrade({
+      kind: "trade",
+      mint,
+      txType: "buy",
+      trader: "buyer",
+      signature: `drag-${i}`,
+      solQuoted: true,
+      priceSol: 1 + i * 0.02,
+      marketCapSol: 400,
+      vSolSol: 0.2,
+      vTokens: 1_000_000,
+      solAmount: 0.05,
+    });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(positions.get(mint), undefined);
+  assert.equal(notes.some((row) => row.reason === "fee_drag" && row.costSol != null), true);
+});
+
+test("round-trip cost, net targets, one combined fee, and a tiny remainder", () => {
+  const paid = scalpExecutionFee(0.0002, 0.0001);
+  assert.equal(paid.priorityFeeSol, 0.0001);
+  assert.equal(paid.tipSol, 0.0001);
+  const trip = scalpRoundTripCost({
+    sizeSol: 0.05,
+    reserves: { baseTokens: 100, quoteSol: 1 },
+    feeBps: 100,
+    baseFeeSol: 0.000005,
+    txFeeSol: 0.0002,
+  });
+  assert.ok(trip && trip.costPct * 100 > 4);
+  const cheap = scalpRoundTripCost({
+    sizeSol: 1,
+    reserves: { baseTokens: 1_000_000, quoteSol: 100 },
+    feeBps: 25,
+    baseFeeSol: 0.000005,
+    txFeeSol: 0.0002,
+  });
+  assert.ok(cheap && cheap.costPct * 100 < 4);
+  const held = {
+    entryPriceSol: 1,
+    peakPriceSol: 1.2,
+    priceSol: 1.2,
+    tpTaken: false,
+    openedAtMs: 0,
+    nowMs: 1_000,
+    maxHoldMs: 30 * 60 * 1000,
+    costPct: 0.02,
+  };
+  assert.equal(scalpExit({ ...held, priceSol: 1.19, peakPriceSol: 1.19 }), null);
+  assert.equal(scalpExit({ ...held, priceSol: 1.2, peakPriceSol: 1.2 })?.sellFraction, 0.6);
+  assert.equal(scalpExit({ ...held, peakPriceSol: 1.14, priceSol: 1.05 })?.reason, "scalp_sl");
+  assert.equal(scalpExit({ ...held, peakPriceSol: 1.11, priceSol: 1.05, nowMs: SCALP.fastHoldMs })?.reason, "scalp_fast");
+  const tiny = scalpRemainderNetSol({ tokenAmount: 0.02, priceSol: 1, feeBps: 0, baseFeeSol: 0.000005, txFeeSol: 0.0002 });
+  assert.ok(tiny < 0.01);
+  assert.equal(scalpExit({ ...held, sellAll: true })?.sellFraction, 1);
 });
 
 test("PumpSwap create-pool then buy becomes a priced trade", () => {

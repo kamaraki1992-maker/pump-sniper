@@ -1,3 +1,4 @@
+import { constantProductBuy, constantProductSell } from "../momentum/paper.js";
 import type { TradeReason } from "../types.js";
 
 /**
@@ -25,6 +26,8 @@ export const SCALP = {
   fastHoldMs: 5 * 60 * 1000,
   fastMinGain: 0.1,
   gateMs: 1_500,
+  /** Keep the ATA this long in case the same mint is bought again. */
+  ataReuseMs: 10 * 60 * 1000,
 } as const;
 
 export interface ScalpPrint {
@@ -93,10 +96,77 @@ export function scalpGate(facts: ScalpGateFacts): { ok: boolean; reason: string 
   return { ok: true, reason: "scalp" };
 }
 
-export function scalpStopPrice(entryPriceSol: number, peakPriceSol: number): number {
+/**
+ * Priority fee is whatever is left of the 0.0002 budget after the Jito tip,
+ * so the two together are one 0.0002 SOL charge per transaction.
+ */
+export function scalpExecutionFee(totalSol: number, tipSol: number): { priorityFeeSol: number; tipSol: number } {
+  const total = Math.max(0, totalSol);
+  const tip = Math.min(total, Math.max(0, tipSol));
+  return { priorityFeeSol: total - tip, tipSol: tip };
+}
+
+export interface RoundTripEstimate {
+  costSol: number;
+  costPct: number;
+  poolFeeSol: number;
+  impactSol: number;
+  closeFeeSol: number;
+  txFeeSol: number;
+}
+
+/**
+ * Round trip in SOL: both base fees, both combined priority+tip charges,
+ * pool fees and impact both ways, and the close-account fee. The ATA rent
+ * itself comes back, so it is not part of the cost.
+ */
+export function scalpRoundTripCost(input: {
+  sizeSol: number;
+  reserves: { baseTokens: number; quoteSol: number } | null;
+  feeBps: number;
+  baseFeeSol: number;
+  txFeeSol: number;
+}): RoundTripEstimate | null {
+  const { sizeSol, reserves, feeBps, baseFeeSol, txFeeSol } = input;
+  if (!(sizeSol > 0) || !reserves || !(reserves.baseTokens > 0) || !(reserves.quoteSol > 0)) return null;
+  const buy = constantProductBuy(reserves, sizeSol, feeBps);
+  if (!buy) return null;
+  const sell = constantProductSell(reserves, buy.tokensOut, feeBps);
+  if (!sell) return null;
+  const spotValue = buy.tokensOut * buy.spotPriceSol;
+  const buyGap = Math.max(0, sizeSol - spotValue);
+  const sellGap = Math.max(0, spotValue - sell.solOut);
+  const closeFeeSol = baseFeeSol;
+  const bothWaysTx = txFeeSol * 2;
+  const costSol = baseFeeSol * 2 + bothWaysTx + buyGap + sellGap + closeFeeSol;
+  return {
+    costSol,
+    costPct: costSol / sizeSol,
+    poolFeeSol: buy.swapFeeSol + sell.swapFeeSol,
+    impactSol: Math.max(0, buyGap - buy.swapFeeSol) + Math.max(0, sellGap - sell.swapFeeSol),
+    closeFeeSol,
+    txFeeSol: bothWaysTx,
+  };
+}
+
+export function scalpRemainderNetSol(input: {
+  tokenAmount: number;
+  priceSol: number;
+  feeBps: number;
+  baseFeeSol: number;
+  txFeeSol: number;
+}): number {
+  const tokens = input.tokenAmount * (1 - SCALP.tpOfOriginal);
+  if (!(tokens > 0) || !(input.priceSol > 0)) return 0;
+  const gross = tokens * input.priceSol * (1 - input.feeBps / 10_000);
+  return gross - input.baseFeeSol - input.txFeeSol - input.baseFeeSol;
+}
+
+/** Initial stop stays a raw -12%. After the net +12% peak, the floor is a net +3%. */
+export function scalpStopPrice(entryPriceSol: number, peakPriceSol: number, costPct = 0): number {
   const peak = Math.max(peakPriceSol, entryPriceSol);
   const gain = entryPriceSol > 0 ? (peak - entryPriceSol) / entryPriceSol : 0;
-  if (gain + 1e-9 >= SCALP.lockGain) return entryPriceSol * (1 + SCALP.lockStop);
+  if (gain + 1e-9 >= SCALP.lockGain + costPct) return entryPriceSol * (1 + SCALP.lockStop + costPct);
   return entryPriceSol * (1 - SCALP.stopDrop);
 }
 
@@ -118,16 +188,23 @@ export function scalpExit(input: {
   openedAtMs: number;
   nowMs: number;
   maxHoldMs: number;
+  /** Round-trip cost as a fraction of size. Targets are net of this. */
+  costPct?: number;
+  /** When the unsold 40% is worth less than the minimum, the partial becomes a full sell. */
+  sellAll?: boolean;
 }): ScalpExit | null {
   const entry = input.entryPriceSol;
   const price = input.priceSol;
+  const cost = input.costPct ?? 0;
   if (!(entry > 0) || !(price > 0)) return null;
   const peak = Math.max(input.peakPriceSol, price);
-  if (price <= scalpStopPrice(entry, peak)) return { reason: "scalp_sl", sellFraction: 1 };
-  if (!input.tpTaken && price >= entry * (1 + SCALP.tpGain)) return { reason: "scalp_tp", sellFraction: SCALP.tpOfOriginal };
+  if (price <= scalpStopPrice(entry, peak, cost)) return { reason: "scalp_sl", sellFraction: 1 };
+  if (!input.tpTaken && price >= entry * (1 + SCALP.tpGain + cost)) {
+    return { reason: "scalp_tp", sellFraction: input.sellAll ? 1 : SCALP.tpOfOriginal };
+  }
   if (input.tpTaken && price <= peak * (1 - SCALP.trailDrop)) return { reason: "scalp_trail", sellFraction: 1 };
   const peakGain = (peak - entry) / entry;
-  if (input.nowMs - input.openedAtMs >= SCALP.fastHoldMs && peakGain + 1e-9 < SCALP.fastMinGain) {
+  if (input.nowMs - input.openedAtMs >= SCALP.fastHoldMs && peakGain + 1e-9 < SCALP.fastMinGain + cost) {
     return { reason: "scalp_fast", sellFraction: 1 };
   }
   if (input.nowMs - input.openedAtMs >= input.maxHoldMs) return { reason: "scalp_max_hold", sellFraction: 1 };

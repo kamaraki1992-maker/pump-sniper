@@ -256,6 +256,8 @@ export interface Position {
   strategy?: "sniper" | "momentum" | "scalp";
   /** Scalp already sold the 60% take-profit. The rest is on the 10% trail. */
   scalpTpTaken?: boolean;
+  /** Round-trip cost as a fraction of the scalp buy. Exit targets are net of it. */
+  scalpCostPct?: number;
 }
 
 export interface Executor {

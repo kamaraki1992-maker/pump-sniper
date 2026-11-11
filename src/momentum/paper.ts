@@ -122,18 +122,21 @@ export function momentumPaperBuy(input: {
   baseFeeSol: number;
   priorityFeeSol: number;
   tipSol: number;
+  /** False when this mint's ATA is still open from a recent scalp. */
+  includeRent?: boolean;
 }): { fill: FillResult; costs: TradeCosts } {
   if (!input.reserves) return failed("no_reserves", input.sizeSol);
   const quote = constantProductBuy(input.reserves, input.sizeSol, input.feeBps);
   if (!quote) return failed("no_reserves", input.sizeSol);
   if (quote.impactPct > input.slippagePct) return failed("price_impact", input.sizeSol);
+  const rent = input.includeRent === false ? 0 : ATA_RENT_SOL;
   const costs: TradeCosts = {
     baseFeeSol: input.baseFeeSol,
     priorityFeeSol: input.priorityFeeSol,
     tipSol: input.tipSol,
     swapFeeSol: quote.swapFeeSol,
     priceImpactPct: quote.impactPct,
-    ataRentSol: -ATA_RENT_SOL,
+    ataRentSol: -rent,
     closeFeeSol: 0,
   };
   const feesSol = quote.swapFeeSol + input.priorityFeeSol + input.baseFeeSol;
@@ -148,7 +151,7 @@ export function momentumPaperBuy(input: {
       tokenAmount: quote.tokensOut,
       feesSol,
       jitoTipSol: input.tipSol,
-      cashflowSol: input.sizeSol + input.priorityFeeSol + input.baseFeeSol + input.tipSol + ATA_RENT_SOL,
+      cashflowSol: input.sizeSol + input.priorityFeeSol + input.baseFeeSol + input.tipSol + rent,
       error: null,
     },
   };

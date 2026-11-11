@@ -11,6 +11,8 @@ export interface StatusReport {
   netPnlSol: number;
   grossPnlUsd: number | null;
   netPnlUsd: number | null;
+  /** Fees divided by gross PnL. Null when gross PnL is not positive. */
+  feeShareOfGross: number | null;
   solUsd: number | null;
   fees: {
     baseFeeSol: number;
@@ -185,6 +187,7 @@ export function buildStatus(input: {
     netPnlSol,
     grossPnlUsd: markUsd != null ? grossPnlSol * markUsd : null,
     netPnlUsd: markUsd != null ? netPnlSol * markUsd : null,
+    feeShareOfGross: grossPnlSol > 0 ? feeSol / grossPnlSol : null,
     solUsd: markUsd,
     fees,
     openPositions,
