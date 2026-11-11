@@ -87,31 +87,49 @@ test("bundle body matches the Lightning trade fields and omits the private key",
   assert.equal(raydium.pool, "raydium");
 });
 
-test("a momentum order with jito off is a normal transaction at the high fee cap", async () => {
-  let bundled = 0;
+test("live momentum refuses a public RPC send when Jito and the Helius sender are both down", async () => {
+  let publicSends = 0;
   const payer = Keypair.generate();
   const { ports: base } = ports({
-    sendBundle: async (tx) => {
-      bundled += 1;
-      return { bundleId: "bundle", signature: bs58.encode(tx.signatures[0] ?? new Uint8Array()) };
+    sendBundle: async () => {
+      throw new Error("jito down");
     },
-    sendTransaction: async (tx) => ({ signature: bs58.encode(tx.signatures[0] ?? new Uint8Array()) }),
-    confirm: async () => ({ state: "landed", solDelta: null }),
-    priorityFee: async () => 0.001,
+    sendTransaction: async (tx) => {
+      publicSends += 1;
+      return { signature: bs58.encode(tx.signatures[0] ?? new Uint8Array()) };
+    },
     publicKey: payer.publicKey,
     sign: (tx) => tx.sign([payer]),
     buildUnsignedTx: async () => unsigned(payer.publicKey),
   });
-  const result = await new LiveExecutor(base).buy({
+  const blocked = await new LiveExecutor(base).buy({
     ...order(),
-    useJito: false,
+    useJito: true,
+    mevRequired: true,
     feeLevel: "high",
-    tipSol: 0.004,
+    tipSol: 0.0001,
   });
-  assert.equal(bundled, 0);
-  assert.equal(result.status, "filled");
-  assert.equal(result.jitoTipSol, 0);
-  assert.ok(result.feesSol <= base.config.momentumTurboFeeSol + base.config.paper.baseFeeSol + 1e-12);
+  assert.equal(blocked.error, "mev_route_unavailable");
+  assert.equal(publicSends, 0);
+  let helius = 0;
+  const routed = await new LiveExecutor({
+    ...base,
+    sendHelius: async (tx) => {
+      helius += 1;
+      return { signature: bs58.encode(tx.signatures[0] ?? new Uint8Array()) };
+    },
+    confirm: async () => ({ state: "landed", solDelta: null }),
+  }).buy({
+    ...order(),
+    useJito: true,
+    mevRequired: true,
+    feeLevel: "high",
+    tipSol: 0.0001,
+  });
+  assert.equal(helius, 1);
+  assert.equal(publicSends, 0);
+  assert.equal(routed.status, "filled");
+  assert.equal(routed.jitoTipSol, 0.0001);
 });
 
 test("a base58 bundle payload decodes", () => {

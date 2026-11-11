@@ -25,7 +25,8 @@ export type TradeReason =
   | "momentum_sl"
   | "momentum_tp1"
   | "momentum_tp2"
-  | "momentum_moonbag";
+  | "momentum_moonbag"
+  | "momentum_stale";
 
 export interface MarketLaunch {
   kind: "launch";
@@ -107,6 +108,8 @@ export interface OrderRequest {
   feeLevel?: "medium" | "high";
   /** `false` sends a normal transaction. Unset keeps the Jito bundle. */
   useJito?: boolean;
+  /** Live momentum. Refuse a public-RPC send when both Jito and the Helius sender fail. */
+  mevRequired?: boolean;
   /** Computed Jito tip for this order. Falls back to the config tip when omitted. */
   tipSol?: number;
   /** Stop-like exits use this order's slippage instead of the smaller paper default. */

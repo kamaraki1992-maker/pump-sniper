@@ -157,10 +157,16 @@ export interface AppConfig {
   momentumPollSec: number;
   /** Closed 5m candles whose high is the local resistance. */
   momentumResistanceCandles: number;
-  /** Share of total balance for each momentum buy. Confidence does not change it. */
+  /** Share of available cash for each momentum buy. Confidence does not change it. */
   momentumSizePct: number;
-  /** Momentum sends a normal transaction unless this is on. Sniper stays on Jito. */
+  /** Momentum notional cap. Replaces the sniper $30 cap. */
+  momentumMaxUsd: number;
+  /** SOL-denominated gas that is never spent on a momentum trade, valued in USD. */
+  gasReserveUsd: number;
+  /** Momentum sends the swap through Jito unless this is turned off. */
   momentumUseJito: boolean;
+  /** Fixed Jito tip before the min/max clamp. */
+  momentumJitoTipSol: number;
   /** Cap for the Helius Medium priority fee, in SOL. */
   momentumPriorityFeeSol: number;
   /** Cap for the Helius High priority fee used on breakout buys and stop-loss exits. */
@@ -174,6 +180,10 @@ export interface AppConfig {
   momentumRaydiumFeeBps: number;
   /** Alternative paper bankroll. Converted with the live SOL/USD price when the balance file is created. */
   paperStartBalanceUsd: number | null;
+  /** Optional Helius staked sender. Live momentum uses it when the Jito bundle does not land. */
+  heliusSenderUrl: string | null;
+  /** Written when equity falls 25% from its high-water mark. New entries stay off until it is removed. */
+  killFile: string;
   jitoBlockEngineUrl: string;
   solPriceUrl: string;
   dataDir: string;
@@ -381,7 +391,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     num(env.MOMENTUM_RESISTANCE_CANDLES, 6, "MOMENTUM_RESISTANCE_CANDLES"),
   );
   const momentumSizePct = num(env.MOMENTUM_SIZE_PCT, 20, "MOMENTUM_SIZE_PCT");
-  const momentumUseJito = flag(env.MOMENTUM_USE_JITO, false, "MOMENTUM_USE_JITO");
+  const momentumMaxUsd = num(env.MOMENTUM_MAX_USD, 100, "MOMENTUM_MAX_USD");
+  const gasReserveUsd = num(env.GAS_RESERVE_USD, 4, "GAS_RESERVE_USD");
+  const momentumUseJito = flag(env.MOMENTUM_USE_JITO, true, "MOMENTUM_USE_JITO");
+  const momentumJitoTipSol = num(env.MOMENTUM_JITO_TIP_SOL, 0.0001, "MOMENTUM_JITO_TIP_SOL");
   const momentumPriorityFeeSol = num(env.MOMENTUM_PRIORITY_FEE_SOL, 0.00005, "MOMENTUM_PRIORITY_FEE_SOL");
   const momentumTurboFeeSol = num(env.MOMENTUM_TURBO_FEE_SOL, 0.0002, "MOMENTUM_TURBO_FEE_SOL");
   const momentumJitoTipMinSol = num(env.MOMENTUM_JITO_TIP_MIN_SOL, 0.0001, "MOMENTUM_JITO_TIP_MIN_SOL");
@@ -389,6 +402,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const momentumPumpswapFeeBps = num(env.MOMENTUM_PUMPSWAP_FEE_BPS, 25, "MOMENTUM_PUMPSWAP_FEE_BPS");
   const momentumRaydiumFeeBps = num(env.MOMENTUM_RAYDIUM_FEE_BPS, 25, "MOMENTUM_RAYDIUM_FEE_BPS");
   const paperStartBalanceUsd = optionalNum(env.PAPER_START_BALANCE_USD, "PAPER_START_BALANCE_USD");
+  const heliusSenderUrl = str(env.HELIUS_SENDER_URL, "") || null;
+  const killFile = str(env.KILL_FILE, "./KILL");
   const grpcUrlRaw = str(env.GRPC_URL, "");
   const grpcTokenPresent = Boolean(env.GRPC_TOKEN?.trim());
   const paperSlippagePct = num(env.PAPER_SLIPPAGE_PCT, 2, "PAPER_SLIPPAGE_PCT");
@@ -597,6 +612,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!(momentumSizePct > 0) || momentumSizePct > 100) {
     throw new ConfigError("MOMENTUM_SIZE_PCT must be greater than 0 and at most 100");
   }
+  if (!(momentumMaxUsd > 0)) throw new ConfigError("MOMENTUM_MAX_USD must be positive");
+  if (!(gasReserveUsd >= 0)) throw new ConfigError("GAS_RESERVE_USD must be >= 0");
+  if (!(momentumJitoTipSol >= 0)) throw new ConfigError("MOMENTUM_JITO_TIP_SOL must be >= 0");
   if (!(momentumPriorityFeeSol > 0) || momentumPriorityFeeSol > momentumTurboFeeSol) {
     throw new ConfigError("MOMENTUM_PRIORITY_FEE_SOL must be > 0 and at most MOMENTUM_TURBO_FEE_SOL");
   }
@@ -717,7 +735,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     momentumPollSec,
     momentumResistanceCandles,
     momentumSizePct,
+    momentumMaxUsd,
+    gasReserveUsd,
     momentumUseJito,
+    momentumJitoTipSol,
     momentumPriorityFeeSol,
     momentumTurboFeeSol,
     momentumJitoTipMinSol,
@@ -725,6 +746,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     momentumPumpswapFeeBps,
     momentumRaydiumFeeBps,
     paperStartBalanceUsd,
+    heliusSenderUrl,
+    killFile,
     jitoBlockEngineUrl: str(
       env.JITO_BLOCK_ENGINE_URL,
       "https://mainnet.block-engine.jito.wtf/api/v1/bundles",

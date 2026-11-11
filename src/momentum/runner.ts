@@ -8,11 +8,13 @@ import { berlinDay, type TradeLog } from "../report.js";
 import type { Executor, MarketGraduation, MarketLaunch, MarketTrade, Position, TradeCosts, TradeReason } from "../types.js";
 import type { ChainFacts } from "./chain.js";
 import type { DexPair, MomentumMarket } from "./market.js";
+import { EquityBook, positionValueSol } from "./equity.js";
 import { ATA_RENT_SOL, momentumPaperBuy, momentumPaperSell, reservesFromPair, swapFeeBps } from "./paper.js";
 import {
   bundledInsiderPct,
   clampPriorityFee,
   evaluateMomentum,
+  liveAvailableSol,
   momentumExit,
   momentumFees,
   momentumPool,
@@ -50,6 +52,7 @@ export interface MomentumDeps {
   quoteFee?: (level: "medium" | "high", mint: string) => Promise<number>;
   /** Live-only. Paper credits the rent inside the simulated fill. */
   reclaimRent?: (mint: string) => Promise<{ closed: boolean; rentSol: number; reason: string }>;
+  honeypot?: (mint: string) => Promise<{ ok: boolean; reason: string | null }>;
 }
 
 /**
@@ -63,9 +66,12 @@ export class MomentumRunner {
   private queue: string[] = [];
   private readonly selling = new Set<string>();
   private readonly daily: DailyLossBook;
+  private readonly equity: EquityBook;
+  private killLogged = false;
 
   constructor(private readonly deps: MomentumDeps) {
     this.daily = deps.daily ?? new DailyLossBook(`${deps.config.dataDir}/daily-pnl.json`);
+    this.equity = new EquityBook(`${deps.config.dataDir}/equity-hwm.json`, deps.config.killFile);
   }
 
   noteLaunch(event: MarketLaunch): void {
@@ -100,6 +106,19 @@ export class MomentumRunner {
 
   async tick(): Promise<void> {
     await this.manageExits();
+    await this.markEquity();
+    if (this.equity.killed()) {
+      if (!this.killLogged) {
+        this.killLogged = true;
+        const kill = this.equity.killReason();
+        this.deps.log.info("kill_switch", {
+          reason: kill?.reason ?? "drawdown",
+          equitySol: kill?.equitySol,
+          hwmSol: kill?.hwmSol,
+        });
+      }
+      return;
+    }
     if (this.entriesHalted()) {
       this.deps.log.info("momentum", { decision: "hold", reason: "daily_stop" });
       return;
@@ -168,7 +187,10 @@ export class MomentumRunner {
       return;
     }
     const chain = await this.deps.chain(mint, memory?.creator ?? null);
-    const facts = this.facts(pair, candles, trades, chain, nowMs);
+    const honeypot = this.deps.honeypot
+      ? await this.deps.honeypot(mint).catch(() => ({ ok: false, reason: "honeypot_unsimulated" }))
+      : { ok: false, reason: "honeypot_unsimulated" };
+    const facts = this.facts(pair, candles, trades, chain, nowMs, honeypot, pair.socialsOk);
     const decision = evaluateMomentum(facts);
     this.logDecision(mint, decision.action, decision.reason, decision.confidence, {
       mcap: pair.marketCapUsd,
@@ -184,6 +206,8 @@ export class MomentumRunner {
     trades: Awaited<ReturnType<MomentumMarket["trades"]>>,
     chain: ChainFacts,
     nowMs: number,
+    honeypot: { ok: boolean; reason: string | null },
+    socialsOk: boolean,
   ): MomentumFacts {
     const memory = this.launches.get(pair.mint);
     const bundlePct = memory?.incomplete
@@ -214,6 +238,9 @@ export class MomentumRunner {
       resistanceCandles: this.deps.config.momentumResistanceCandles,
       mintOk: chain.mintOk,
       mintReason: chain.mintReason,
+      honeypotOk: honeypot.ok,
+      honeypotReason: honeypot.reason,
+      socialsOk,
       sellVolume15mUsd: trades?.sellVolume15mUsd ?? null,
       buyVolume15mUsd: trades?.buyVolume15mUsd ?? null,
       volume15mComplete: trades?.volume15mComplete ?? false,
@@ -221,17 +248,18 @@ export class MomentumRunner {
   }
 
   private async buy(pair: DexPair, facts: MomentumFacts, confidence: number, solUsd: number): Promise<void> {
-    const parts = await this.balance();
+    const parts = await this.balance(solUsd);
     const sized = momentumSize({
-      balanceSol: parts.balanceSol,
+      availableSol: parts.availableSol,
       solUsd,
       sizePct: this.deps.config.momentumSizePct,
+      maxUsd: this.deps.config.momentumMaxUsd,
     });
     if (!sized.ok) {
       this.logDecision(pair.mint, "hold", sized.reason, confidence);
       return;
     }
-    const fees = momentumFees(this.deps.config, sized.sizeSol, true);
+    const fees = momentumFees(this.deps.config, true);
     const priorityFeeSol = await this.prioritySol(fees.feeLevel, fees.priorityCapSol, pair.mint);
     const overhead = priorityFeeSol + this.deps.config.paper.baseFeeSol + fees.tipSol + ATA_RENT_SOL;
     if (!(parts.freeSol >= sized.sizeSol + overhead)) {
@@ -271,6 +299,7 @@ export class MomentumRunner {
         tipSol: fees.tipSol,
         feeLevel: fees.feeLevel,
         useJito: fees.useJito,
+        mevRequired: true,
         useQuotedSlippage: true,
       });
     }
@@ -354,6 +383,8 @@ export class MomentumRunner {
         sellVolume15mUsd: trades?.sellVolume15mUsd ?? null,
         buyVolume15mUsd: trades?.buyVolume15mUsd ?? null,
         volume15mComplete: trades?.volume15mComplete ?? false,
+        openedAtMs: Date.parse(position.openedAt),
+        nowMs: this.deps.now().getTime(),
       });
       if (!exit) continue;
       await this.sell(position, exit.reason, exit.sellFraction, priceSol, pair);
@@ -375,7 +406,7 @@ export class MomentumRunner {
       const portion = Math.min(1, Math.max(0, fraction));
       const requested = portion >= 0.999 ? before : before * portion;
       const closing = portion >= 0.999;
-      const fees = momentumFees(this.deps.config, quote * requested, reason === "momentum_sl");
+      const fees = momentumFees(this.deps.config, reason === "momentum_sl");
       const priorityFeeSol = await this.prioritySol(fees.feeLevel, fees.priorityCapSol, current.mint);
       const slippagePct = momentumSlippagePct(pair.marketCapUsd);
       let fill;
@@ -409,6 +440,7 @@ export class MomentumRunner {
           tipSol: fees.tipSol,
           feeLevel: fees.feeLevel,
           useJito: fees.useJito,
+          mevRequired: true,
           useQuotedSlippage: true,
         });
       }
@@ -472,15 +504,38 @@ export class MomentumRunner {
     }
   }
 
-  private async balance(): Promise<{ balanceSol: number; freeSol: number }> {
-    const openCost = this.deps.positions.list().reduce((sum, position) => sum + Math.max(0, position.costSol), 0);
+  private async balance(solUsd: number): Promise<{ availableSol: number; freeSol: number }> {
     if (this.deps.config.mode === "paper") {
       const cash = this.deps.paperBalance?.cash() ?? 0;
-      return { balanceSol: cash + openCost, freeSol: cash };
+      return { availableSol: cash, freeSol: cash };
     }
     const wallet = this.deps.walletBalanceSol ? await this.deps.walletBalanceSol() : 0;
-    const reserve = this.deps.config.liveBalanceReserveSol;
-    return { balanceSol: wallet + openCost - reserve, freeSol: Math.max(0, wallet - reserve) };
+    const available = liveAvailableSol(wallet, this.deps.config.gasReserveUsd, solUsd);
+    return { availableSol: available, freeSol: available };
+  }
+
+  /** Paper adds the gas reserve beside tradable cash. Live already holds that reserve in the wallet. */
+  private async markEquity(): Promise<void> {
+    const solUsd = this.deps.solUsd();
+    if (!(solUsd != null && solUsd > 0)) return;
+    const cash = this.deps.config.mode === "paper"
+      ? (this.deps.paperBalance?.cash() ?? 0)
+      : this.deps.walletBalanceSol
+        ? await this.deps.walletBalanceSol()
+        : 0;
+    const reserve = this.deps.config.mode === "paper" ? this.deps.config.gasReserveUsd / solUsd : 0;
+    let marked = 0;
+    for (const position of this.deps.positions.list()) {
+      if (!position.momentum) continue;
+      marked += positionValueSol(
+        position.tokenAmount,
+        position.lastMarkPriceSol,
+        swapFeeBps(this.deps.config, position.momentumPool === "raydium" ? "raydium" : "pumpswap"),
+        this.deps.config.paper.baseFeeSol,
+        this.deps.config.momentumPriorityFeeSol,
+      );
+    }
+    this.equity.mark(cash + reserve + marked, this.deps.now().toISOString());
   }
 
   private entriesHalted(): boolean {

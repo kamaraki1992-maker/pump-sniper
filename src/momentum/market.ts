@@ -1,3 +1,4 @@
+import { hasRequiredSocial } from "./honeypot.js";
 import type { Candle } from "./rules.js";
 
 const DEX = "https://api.dexscreener.com";
@@ -23,6 +24,8 @@ export interface DexPair {
   /** Quote side of the pool, in quote-token units. */
   quoteAmount: number | null;
   quoteMint: string | null;
+  /** True when the pair info has an X, Telegram, or website link. */
+  socialsOk: boolean;
 }
 
 export interface TradeWindow {
@@ -96,6 +99,7 @@ export function parseDexPair(payload: unknown, mint: string): DexPair | null {
       baseAmount: num(liquidityRow?.base),
       quoteAmount: num(liquidityRow?.quote),
       quoteMint: typeof quoteToken?.address === "string" ? quoteToken.address : null,
+      socialsOk: hasRequiredSocial(row.info),
     };
     if (!best || pair.liquidityUsd > best.liquidityUsd) best = pair;
   }

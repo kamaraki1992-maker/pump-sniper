@@ -25,8 +25,10 @@ export interface LivePorts {
   simulate(tx: VersionedTransaction): Promise<{ unitsConsumed: number | null; err: string | null }>;
   lookupTables(tx: VersionedTransaction): Promise<AddressLookupTableAccount[]>;
   sendBundle(tx: VersionedTransaction): Promise<{ bundleId: string; signature: string }>;
-  /** Normal RPC send. Momentum uses this when Jito is off. */
+  /** Normal RPC send. Sniper does not use this. Live momentum refuses it. */
   sendTransaction?: (tx: VersionedTransaction) => Promise<{ signature: string }>;
+  /** Helius staked sender. Used when a momentum Jito bundle is unavailable. */
+  sendHelius?: (tx: VersionedTransaction) => Promise<{ signature: string }>;
   confirm(signature: string): Promise<ConfirmResult>;
   /** Dynamic priority fee in SOL. A throw or a missing port uses PRIORITY_FEE_SOL. */
   priorityFee?: (accountKeys: string[], cuLimit: number, level?: "medium" | "high") => Promise<number>;
@@ -231,17 +233,36 @@ export class LiveExecutor implements Executor {
       return blank(order, "sign-failed");
     }
 
-    let sent: { bundleId: string; signature: string };
-    try {
-      if (order.useJito === false) {
-        if (!this.ports.sendTransaction) return blank(order, "send-unavailable");
-        const tx = await this.ports.sendTransaction(prepared);
-        sent = { bundleId: "", signature: tx.signature };
-      } else {
-        sent = await this.ports.sendBundle(prepared);
+    let sent: { bundleId: string; signature: string } | null = null;
+    if (order.mevRequired) {
+      if (order.useJito !== false) {
+        try {
+          sent = await this.ports.sendBundle(prepared);
+        } catch {
+          sent = null;
+        }
       }
-    } catch (error) {
-      return blank(order, error instanceof Error ? error.message : "bundle-send-failed");
+      if (!sent && this.ports.sendHelius) {
+        try {
+          const tx = await this.ports.sendHelius(prepared);
+          sent = { bundleId: "", signature: tx.signature };
+        } catch {
+          sent = null;
+        }
+      }
+      if (!sent) return blank(order, "mev_route_unavailable");
+    } else {
+      try {
+        if (order.useJito === false) {
+          if (!this.ports.sendTransaction) return blank(order, "send-unavailable");
+          const tx = await this.ports.sendTransaction(prepared);
+          sent = { bundleId: "", signature: tx.signature };
+        } else {
+          sent = await this.ports.sendBundle(prepared);
+        }
+      } catch (error) {
+        return blank(order, error instanceof Error ? error.message : "bundle-send-failed");
+      }
     }
 
     const confirm = await this.ports.confirm(sent.signature);
@@ -317,6 +338,28 @@ export function createLivePorts(
       const signature = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
       return { signature };
     },
+    ...(config.heliusSenderUrl
+      ? {
+          sendHelius: async (tx: VersionedTransaction) => {
+            const encoded = Buffer.from(tx.serialize()).toString("base64");
+            const response = await fetch(config.heliusSenderUrl!, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "sendTransaction",
+                params: [encoded, { encoding: "base64", skipPreflight: true, maxRetries: 0 }],
+              }),
+            });
+            const body = (await response.json()) as { result?: string; error?: { message?: string } };
+            if (!response.ok || body.error || !body.result) {
+              throw new Error(body.error?.message ?? `helius sender HTTP ${response.status}`);
+            }
+            return { signature: body.result };
+          },
+        }
+      : {}),
     sendBundle: async (tx) => {
       const signature = bs58.encode(tx.signatures[0] ?? new Uint8Array());
       const encoded = Buffer.from(tx.serialize()).toString("base64");

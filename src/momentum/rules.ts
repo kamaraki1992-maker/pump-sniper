@@ -1,4 +1,4 @@
-import { clampBuyUsd, type AppConfig } from "../config.js";
+import type { AppConfig } from "../config.js";
 import type { TradeReason } from "../types.js";
 
 /**
@@ -23,7 +23,7 @@ import type { TradeReason } from "../types.js";
 
 export const MOMENTUM = {
   minLiquidityUsd: 15_000,
-  maxTop10Pct: 22,
+  maxTop10Pct: 25,
   maxDevPct: 4,
   maxBundlePct: 15,
   minAgeMs: 10 * 60 * 1000,
@@ -38,6 +38,12 @@ export const MOMENTUM = {
   rsiMax: 72,
   higherLowCandles: 3,
   stopDrop: 0.25,
+  /** Peak gain that moves the stop from -25% to +5%. The stop never moves down. */
+  lockGain: 0.4,
+  lockStop: 0.05,
+  staleMs: 4 * 60 * 60 * 1000,
+  staleMinGain: 0.15,
+  killDrawdown: 0.25,
   tp1Multiple: 2,
   tp1OfOriginal: 0.5,
   tp2Multiple: 5,
@@ -92,6 +98,11 @@ export interface MomentumFacts {
   resistanceCandles: number;
   mintOk: boolean;
   mintReason: string | null;
+  /** Tiny-sell simulation. A miss is a hold. */
+  honeypotOk: boolean;
+  honeypotReason: string | null;
+  /** At least one X, Telegram, or website link on the DexScreener pair. */
+  socialsOk: boolean;
   sellVolume15mUsd: number | null;
   buyVolume15mUsd: number | null;
   volume15mComplete: boolean;
@@ -194,17 +205,28 @@ export function momentumSlippagePct(marketCapUsd: number): number {
  * Momentum fee choice. Sniper tips and priority caps are not read.
  * A missing Helius estimate is charged at the cap so paper does not understate it.
  */
+/** Fixed Jito tip, clamped to the momentum band. Zero when Jito is off. */
+export function momentumTipSol(config: AppConfig): number {
+  if (!config.momentumUseJito) return 0;
+  const raw = config.momentumJitoTipSol;
+  if (!(raw >= 0) || !Number.isFinite(raw)) return config.momentumJitoTipMinSol;
+  return Math.min(config.momentumJitoTipMaxSol, Math.max(config.momentumJitoTipMinSol, raw));
+}
+
 export function momentumFees(
   config: AppConfig,
-  tradeSol: number,
   turbo: boolean,
 ): { tipSol: number; priorityCapSol: number; feeLevel: "medium" | "high"; useJito: boolean } {
   const feeLevel = turbo ? "high" : "medium";
   const priorityCapSol = turbo ? config.momentumTurboFeeSol : config.momentumPriorityFeeSol;
-  if (!config.momentumUseJito) return { tipSol: 0, priorityCapSol, feeLevel, useJito: false };
-  const raw = (Number.isFinite(tradeSol) && tradeSol > 0 ? tradeSol : 0) * config.jitoTipPct;
-  const tipSol = Math.min(config.momentumJitoTipMaxSol, Math.max(config.momentumJitoTipMinSol, raw));
-  return { tipSol, priorityCapSol, feeLevel, useJito: true };
+  return { tipSol: momentumTipSol(config), priorityCapSol, feeLevel, useJito: config.momentumUseJito };
+}
+
+/** Live wallet SOL that can be spent. The gas reserve stays in the wallet. */
+export function liveAvailableSol(walletSol: number, gasReserveUsd: number, solUsd: number): number {
+  if (!(solUsd > 0) || !(walletSol > 0)) return 0;
+  const reserveSol = gasReserveUsd > 0 ? gasReserveUsd / solUsd : 0;
+  return Math.max(0, walletSol - reserveSol);
 }
 
 export function clampPriorityFee(estimateSol: number, capSol: number): number {
@@ -263,6 +285,8 @@ export function momentumSafety(facts: MomentumFacts): string | null {
     if (facts.mintReason === "transfer-fee" || facts.mintReason === "transfer-hook") return facts.mintReason;
     return facts.mintReason ?? "token_program";
   }
+  if (!facts.honeypotOk) return facts.honeypotReason ?? "honeypot";
+  if (!facts.socialsOk) return "no_socials";
   if (!(facts.liquidityUsd >= MOMENTUM.minLiquidityUsd)) return "liquidity";
   const pool = momentumPool(facts.dexId);
   if (!pool) return "lp_not_canonical";
@@ -312,19 +336,29 @@ export function evaluateMomentum(facts: MomentumFacts): MomentumDecision {
 }
 
 export function momentumSize(input: {
-  balanceSol: number;
+  /** Cash that is not in a position. Paper cash is already tradable; live cash is net of the gas reserve. */
+  availableSol: number;
   solUsd: number;
   sizePct: number;
+  maxUsd: number;
 }): { ok: true; sizeSol: number; sizeUsd: number; pct: number } | { ok: false; reason: string } {
-  if (!(input.solUsd > 0) || !(input.balanceSol > 0) || !(input.sizePct > 0)) {
+  if (!(input.solUsd > 0) || !(input.availableSol > 0) || !(input.sizePct > 0) || !(input.maxUsd > 0)) {
     return { ok: false, reason: "no_price" };
   }
   const pct = input.sizePct;
-  const rawUsd = input.balanceSol * (pct / 100) * input.solUsd;
-  const sizeUsd = clampBuyUsd(rawUsd);
+  const rawUsd = input.availableSol * (pct / 100) * input.solUsd;
+  const sizeUsd = Math.min(rawUsd, input.maxUsd);
   const sizeSol = sizeUsd / input.solUsd;
   if (!(sizeSol >= MOMENTUM.minBuySol)) return { ok: false, reason: "buy_size_min" };
   return { ok: true, sizeSol, sizeUsd, pct };
+}
+
+/** Stop price from the peak. Once +40% has printed, the floor is +5% and does not fall. */
+export function momentumStopPrice(entryPriceSol: number, peakPriceSol: number): number {
+  const peak = Math.max(peakPriceSol, entryPriceSol);
+  const peakGain = entryPriceSol > 0 ? (peak - entryPriceSol) / entryPriceSol : 0;
+  if (peakGain + 1e-9 >= MOMENTUM.lockGain) return entryPriceSol * (1 + MOMENTUM.lockStop);
+  return entryPriceSol * (1 - MOMENTUM.stopDrop);
 }
 
 /**
@@ -340,11 +374,14 @@ export function momentumExit(input: {
   sellVolume15mUsd: number | null;
   buyVolume15mUsd: number | null;
   volume15mComplete: boolean;
+  openedAtMs?: number;
+  nowMs?: number;
 }): MomentumExit | null {
   const entry = input.entryPriceSol;
   const price = input.priceSol;
   if (!(entry > 0) || !(price > 0)) return null;
-  if (price <= entry * (1 - MOMENTUM.stopDrop)) return { reason: "momentum_sl", sellFraction: 1 };
+  const peak = Math.max(input.peakPriceSol, price);
+  if (price <= momentumStopPrice(entry, peak)) return { reason: "momentum_sl", sellFraction: 1 };
   if (!input.tp1Taken && price >= entry * MOMENTUM.tp1Multiple) {
     return { reason: "momentum_tp1", sellFraction: MOMENTUM.tp1OfOriginal };
   }
@@ -360,6 +397,10 @@ export function momentumExit(input: {
     if (input.volume15mComplete && sell != null && buy != null && sell > buy * MOMENTUM.moonbagSellToBuy) {
       return { reason: "momentum_moonbag", sellFraction: 1 };
     }
+  }
+  if (input.openedAtMs != null && input.nowMs != null && input.nowMs - input.openedAtMs >= MOMENTUM.staleMs) {
+    const peakGain = (peak - entry) / entry;
+    if (peakGain + 1e-9 < MOMENTUM.staleMinGain) return { reason: "momentum_stale", sellFraction: 1 };
   }
   return null;
 }

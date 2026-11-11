@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -17,9 +17,12 @@ import {
   localResistance,
   momentumExit,
   clampPriorityFee,
+  liveAvailableSol,
   momentumFees,
   momentumSize,
   momentumSlippagePct,
+  momentumStopPrice,
+  momentumTipSol,
   rsi,
   type Candle,
   type MomentumFacts,
@@ -28,6 +31,9 @@ import { ATA_RENT_SOL, constantProductBuy, momentumPaperBuy, momentumPaperSell, 
 import { closeAccountInstruction, rentDecision, withheldTransferFee } from "../src/momentum/rent.js";
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "../src/safety.js";
 import { WSOL_MINT } from "../src/pricing.js";
+import { classifySellSimulation, hasRequiredSocial, honeypotDecision } from "../src/momentum/honeypot.js";
+import { EquityBook, killTriggered } from "../src/momentum/equity.js";
+import { buildStatus } from "../src/status.js";
 import { PaperBalance } from "../src/paper-balance.js";
 import { PositionBook } from "../src/positions.js";
 import { TradeLog } from "../src/report.js";
@@ -82,6 +88,9 @@ function passingFacts(patch: Partial<MomentumFacts> = {}): MomentumFacts {
     resistanceCandles: 6,
     mintOk: true,
     mintReason: null,
+    honeypotOk: true,
+    honeypotReason: null,
+    socialsOk: true,
     sellVolume15mUsd: 1,
     buyVolume15mUsd: 10,
     volume15mComplete: true,
@@ -113,7 +122,10 @@ test("each safety filter fails closed on its own", () => {
     [{ liquidityUsd: 14_999 }, "liquidity"],
     [{ dexId: "orca" }, "lp_not_canonical"],
     [{ dexId: "raydium", sawGraduation: false }, "lp_not_canonical"],
-    [{ top10Pct: 22 }, "top10"],
+    [{ top10Pct: 25 }, "top10"],
+    [{ honeypotOk: false, honeypotReason: "honeypot" }, "honeypot"],
+    [{ honeypotOk: false, honeypotReason: null }, "honeypot"],
+    [{ socialsOk: false }, "no_socials"],
     [{ top10Pct: null }, "top10_unavailable"],
     [{ devPct: 4 }, "dev_wallet"],
     [{ devPct: null }, "dev_unknown"],
@@ -128,6 +140,7 @@ test("each safety filter fails closed on its own", () => {
     assert.equal(decision.action, "hold", reason);
     assert.equal(decision.reason, reason);
   }
+  assert.equal(evaluateMomentum(passingFacts({ top10Pct: 24.9 })).action, "buy");
   assert.equal(evaluateMomentum(passingFacts({ dexId: "raydium", sawGraduation: true })).action, "buy");
   assert.equal(
     evaluateMomentum(passingFacts({ pairCreatedAtMs: passingFacts().nowMs - MOMENTUM.minAgeMs })).action,
@@ -184,18 +197,20 @@ test("bundled insider supply counts non-creator buys in the create slot plus two
   assert.equal(bundledInsiderPct({ supplyTokens: 1, createSlot: null, creator: "dev", buys: [] }), null);
 });
 
-test("sizing is 20% of balance and keeps the $30 and 0.005 SOL caps", () => {
-  const capped = momentumSize({ balanceSol: 10, solUsd: 100, sizePct: 20 });
+test("sizing is 20% of available cash, capped at $100, with the gas reserve held back on live", () => {
+  const capped = momentumSize({ availableSol: 10, solUsd: 100, sizePct: 20, maxUsd: 100 });
   assert.equal(capped.ok && capped.pct, 20);
-  assert.equal(capped.ok && capped.sizeUsd, 30);
-  const same = momentumSize({ balanceSol: 10, solUsd: 100, sizePct: 20 });
-  assert.equal(same.ok && same.sizeSol, capped.ok ? capped.sizeSol : 0);
-  const small = momentumSize({ balanceSol: 0.32, solUsd: 100, sizePct: 20 });
-  assert.equal(small.ok && small.pct, 20);
-  assert.equal(small.ok && small.sizeUsd, 6.4);
-  const tiny = momentumSize({ balanceSol: 0.02, solUsd: 100, sizePct: 20 });
+  assert.equal(capped.ok && capped.sizeUsd, 100);
+  assert.equal(capped.ok && capped.sizeSol, 1);
+  const tradable = momentumSize({ availableSol: 0.3, solUsd: 100, sizePct: 20, maxUsd: 100 });
+  assert.equal(tradable.ok && tradable.sizeUsd, 6);
+  const tiny = momentumSize({ availableSol: 0.02, solUsd: 100, sizePct: 20, maxUsd: 100 });
   assert.equal(tiny.ok, false);
   if (!tiny.ok) assert.equal(tiny.reason, "buy_size_min");
+  const available = liveAvailableSol(0.34, 4, 100);
+  assert.ok(Math.abs(available - 0.3) < 1e-9);
+  const sized = momentumSize({ availableSol: available, solUsd: 100, sizePct: 20, maxUsd: 100 });
+  assert.ok(sized.ok && Math.abs(sized.sizeUsd - 6) < 1e-9);
 });
 
 test("exits fire in order and use fractions of the original position", () => {
@@ -251,6 +266,24 @@ test("exits fire in order and use fractions of the original position", () => {
     null,
   );
   assert.equal(momentumExit({ ...held, tp1Taken: false, priceSol: 0.5 })?.reason, "momentum_sl");
+  assert.equal(momentumStopPrice(1, 1), 0.75);
+  assert.equal(momentumStopPrice(1, 1.4), 1.05);
+  assert.equal(momentumExit({ ...held, peakPriceSol: 1.4, priceSol: 1.06 })?.reason, undefined);
+  assert.equal(momentumExit({ ...held, peakPriceSol: 1.4, priceSol: 1.05 })?.reason, "momentum_sl");
+  assert.equal(momentumExit({ ...held, peakPriceSol: 1.4, priceSol: 0.9 })?.reason, "momentum_sl");
+  const staleAt = 10 * 60 * 60 * 1000;
+  assert.equal(
+    momentumExit({ ...held, peakPriceSol: 1.1, priceSol: 1.05, openedAtMs: 0, nowMs: staleAt })?.reason,
+    "momentum_stale",
+  );
+  assert.equal(
+    momentumExit({ ...held, peakPriceSol: 1.2, priceSol: 1.1, openedAtMs: 0, nowMs: staleAt }),
+    null,
+  );
+  assert.equal(
+    momentumExit({ ...held, peakPriceSol: 1, priceSol: 1, openedAtMs: 0, nowMs: 60 * 60 * 1000 }),
+    null,
+  );
 });
 
 test("slippage is 15% under $150k and 8% at or above it", () => {
@@ -258,12 +291,12 @@ test("slippage is 15% under $150k and 8% at or above it", () => {
   assert.equal(momentumSlippagePct(150_000), 8);
 });
 
-test("momentum fees use the medium and high caps and do not change sniper tips", () => {
+test("momentum fees use the medium and high caps and a fixed Jito tip", () => {
   const config = loadConfig({ STRATEGY: "momentum", PAPER_START_BALANCE_SOL: "1" });
-  const normal = momentumFees(config, 0.1, false);
-  const turbo = momentumFees(config, 0.1, true);
-  assert.equal(normal.useJito, false);
-  assert.equal(normal.tipSol, 0);
+  const normal = momentumFees(config, false);
+  const turbo = momentumFees(config, true);
+  assert.equal(normal.useJito, true);
+  assert.equal(normal.tipSol, 0.0001);
   assert.equal(normal.feeLevel, "medium");
   assert.equal(normal.priorityCapSol, 0.00005);
   assert.equal(turbo.feeLevel, "high");
@@ -271,14 +304,16 @@ test("momentum fees use the medium and high caps and do not change sniper tips",
   assert.equal(clampPriorityFee(0.001, 0.00005), 0.00005);
   assert.equal(clampPriorityFee(0.00001, 0.00005), 0.00001);
   assert.equal(clampPriorityFee(Number.NaN, 0.0002), 0.0002);
-  const jito = loadConfig({
+  const raised = loadConfig({
     STRATEGY: "momentum",
     PAPER_START_BALANCE_SOL: "1",
-    MOMENTUM_USE_JITO: "true",
+    MOMENTUM_JITO_TIP_SOL: "0.001",
   });
-  assert.equal(momentumFees(jito, 0.001, true).tipSol, 0.0001);
-  assert.equal(momentumFees(jito, 1, false).tipSol, 0.0003);
-  assert.equal(jito.jitoTipMinSol, loadConfig({}).jitoTipMinSol);
+  assert.equal(momentumTipSol(raised), 0.0003);
+  const off = loadConfig({ STRATEGY: "momentum", PAPER_START_BALANCE_SOL: "1", MOMENTUM_USE_JITO: "false" });
+  assert.equal(momentumFees(off, true).tipSol, 0);
+  assert.equal(off.jitoTipMinSol, loadConfig({}).jitoTipMinSol);
+  assert.equal(off.priorityFeeMaxLamports, loadConfig({}).priorityFeeMaxLamports);
 });
 
 test("paper momentum charges swap impact, rent, and the close fee", () => {
@@ -403,7 +438,10 @@ test("strategy defaults to sniper and momentum is selected by env", () => {
   assert.equal(usd.maxOpenPositions, 4);
   assert.equal(loadConfig({}).maxOpenPositions, 5);
   assert.equal(usd.momentumSizePct, 20);
-  assert.equal(usd.momentumUseJito, false);
+  assert.equal(usd.momentumUseJito, true);
+  assert.equal(usd.momentumJitoTipSol, 0.0001);
+  assert.equal(usd.momentumMaxUsd, 100);
+  assert.equal(usd.gasReserveUsd, 4);
   assert.equal(usd.momentumPriorityFeeSol, 0.00005);
   assert.equal(usd.momentumTurboFeeSol, 0.0002);
   assert.equal(usd.priorityFeeMaxLamports, loadConfig({}).priorityFeeMaxLamports);
@@ -485,6 +523,7 @@ test("a paper momentum tick buys a breakout and the stop sells the position", as
     STRATEGY: "momentum",
     PAPER_START_BALANCE_SOL: "10",
     DATA_DIR: dir,
+    KILL_FILE: join(dir, "KILL"),
     MAX_DAILY_LOSS_SOL: "1",
   });
   const facts = passingFacts();
@@ -523,6 +562,7 @@ test("a paper momentum tick buys a breakout and the stop sells the position", as
           baseAmount: 1_000_000,
           quoteAmount: 1_000_000,
           quoteMint: WSOL_MINT,
+          socialsOk: true,
         };
       },
       async candles() {
@@ -539,6 +579,7 @@ test("a paper momentum tick buys a breakout and the stop sells the position", as
       },
     },
     chain: async () => ({ mintOk: true, mintReason: null, top10Pct: 10, devPct: 1 }),
+    honeypot: async () => ({ ok: true, reason: null }),
     quoteFee: async () => 0.001,
   });
   const launch: MarketLaunch = {
@@ -568,7 +609,8 @@ test("a paper momentum tick buys a breakout and the stop sells the position", as
   assert.equal(buy?.reason, "entry");
   assert.equal(buy?.entryScore != null && buy.entryScore > 0, true);
   assert.equal(buy?.costs?.priorityFeeSol, 0.0002);
-  assert.equal(buy?.costs?.tipSol, 0);
+  assert.equal(buy?.costs?.tipSol, 0.0001);
+  assert.ok((buy?.sizeUsd ?? 0) <= 100);
   assert.equal(buy?.costs?.ataRentSol, -ATA_RENT_SOL);
   assert.ok((buy?.costs?.swapFeeSol ?? 0) > 0);
   assert.ok((buy?.costs?.priceImpactPct ?? 0) > 0);
@@ -580,9 +622,115 @@ test("a paper momentum tick buys a breakout and the stop sells the position", as
   const sell = trades.readAll().at(-1);
   assert.equal(sell?.reason, "momentum_sl");
   assert.equal(sell?.side, "sell");
-  assert.equal(sell?.bundle, null);
-  assert.equal(sell?.jitoTipSol, 0);
+  assert.equal(sell?.bundle, "jito");
+  assert.equal(sell?.jitoTipSol, 0.0001);
   assert.equal(sell?.costs?.priorityFeeSol, 0.0002);
   assert.equal(sell?.costs?.ataRentSol, ATA_RENT_SOL);
   assert.equal(sell?.costs?.closeFeeSol, config.paper.baseFeeSol);
+});
+
+test("the kill switch persists the high-water mark and trips at a 25% drop", () => {
+  const dir = mkdtempSync(join(tmpdir(), "equity-"));
+  const book = new EquityBook(join(dir, "equity-hwm.json"), join(dir, "KILL"));
+  const opened = book.mark(1, "2026-01-01T00:00:00.000Z");
+  assert.equal(opened.killed, false);
+  assert.equal(opened.sessionStart, "2026-01-01T00:00:00.000Z");
+  assert.equal(book.mark(1.2, "2026-01-01T01:00:00.000Z").hwmSol, 1.2);
+  assert.equal(killTriggered(0.91, 1.2), false);
+  assert.equal(killTriggered(0.9, 1.2), true);
+  const killed = book.mark(0.9, "2026-01-01T02:00:00.000Z");
+  assert.equal(killed.killed, true);
+  assert.equal(killed.hwmSol, 1.2);
+  const again = new EquityBook(join(dir, "equity-hwm.json"), join(dir, "KILL"));
+  assert.equal(again.read()?.hwmSol, 1.2);
+  assert.equal(again.killed(), true);
+  assert.equal(again.mark(2, "2026-01-01T03:00:00.000Z").hwmSol, 1.2);
+});
+
+test("a failed or missing honeypot simulation holds, and a pair needs a social or website", () => {
+  assert.equal(honeypotDecision("fail").reason, "honeypot");
+  assert.equal(honeypotDecision("unsimulated").reason, "honeypot_unsimulated");
+  assert.equal(honeypotDecision("transfer-fee").reason, "transfer-fee");
+  assert.equal(honeypotDecision("ok").ok, true);
+  assert.equal(honeypotDecision("no-balance").ok, true);
+  assert.equal(classifySellSimulation({ Custom: 1 }, ["insufficient funds"]), "no-balance");
+  assert.equal(classifySellSimulation(null, ["TransferFee withheld"]), "transfer-fee");
+  assert.equal(classifySellSimulation("Slippage", []), "fail");
+  assert.equal(hasRequiredSocial({ websites: [{ url: "https://example.com" }] }), true);
+  assert.equal(hasRequiredSocial({ socials: [{ type: "twitter", url: "https://x.com/a" }] }), true);
+  assert.equal(hasRequiredSocial({ socials: [{ type: "discord", url: "https://discord.gg/a" }] }), false);
+  const held = evaluateMomentum(passingFacts({ socialsOk: false }));
+  assert.equal(held.action, "hold");
+  assert.equal(held.reason, "no_socials");
+});
+
+test("status reports pnl, fees, equity, and the kill switch", () => {
+  const dir = mkdtempSync(join(tmpdir(), "status-"));
+  const trades = new TradeLog(join(dir, "trades.jsonl"));
+  trades.append({
+    timestamp: "2026-01-01T00:00:00.000Z",
+    mode: "paper",
+    side: "sell",
+    status: "filled",
+    mint: "Mint",
+    name: "Aaa",
+    symbol: "AAA",
+    sizeSol: 0.2,
+    price: 1,
+    feesSol: 0.01,
+    jitoTipSol: 0.0001,
+    signature: "paper",
+    solscan: null,
+    reason: "momentum_sl",
+    error: null,
+    solUsd: 100,
+    tokenAmount: 1,
+    realizedPnlSol: 0.05,
+    costSol: 0.1,
+    costs: {
+      baseFeeSol: 0.000005,
+      priorityFeeSol: 0.0002,
+      tipSol: 0.0001,
+      swapFeeSol: 0.01,
+      priceImpactPct: 1,
+      ataRentSol: 0.00203928,
+      closeFeeSol: 0.000005,
+    },
+  });
+  writeFileSync(
+    join(dir, "paper-balance.json"),
+    JSON.stringify({ cashSol: 0.3 }),
+  );
+  writeFileSync(
+    join(dir, "positions.json"),
+    JSON.stringify({
+      solUsd: 100,
+      positions: [{ mint: "Mint2", symbol: "BBB", tokenAmount: 1, lastMarkPriceSol: 0.2, costSol: 0.1 }],
+    }),
+  );
+  writeFileSync(
+    join(dir, "equity-hwm.json"),
+    JSON.stringify({ hwmSol: 1, sessionStart: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }),
+  );
+  writeFileSync(join(dir, "KILL"), JSON.stringify({ reason: "equity fell 25% from the high-water mark" }));
+  const report = buildStatus({
+    tradesPath: join(dir, "trades.jsonl"),
+    positionsPath: join(dir, "positions.json"),
+    equityPath: join(dir, "equity-hwm.json"),
+    killPath: join(dir, "KILL"),
+    paperBalancePath: join(dir, "paper-balance.json"),
+    gasReserveUsd: 4,
+    feeBps: 25,
+  });
+  assert.equal(report.totalTrades, 1);
+  assert.equal(report.winRate, 1);
+  assert.equal(report.netPnlSol, 0.05);
+  assert.ok(report.grossPnlSol > report.netPnlSol);
+  assert.equal(report.fees.swapFeeSol, 0.01);
+  assert.equal(report.fees.tipSol, 0.0001);
+  assert.equal(report.openPositions.length, 1);
+  assert.equal(report.killSwitch.active, true);
+  assert.equal(report.sessionStart, "2026-01-01T00:00:00.000Z");
+  assert.equal(report.highWaterMarkSol, 1);
+  assert.ok((report.equitySol ?? 0) > 0);
 });

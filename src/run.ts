@@ -21,6 +21,7 @@ import { installProcessRedaction, rpcApiKey, rpcHost } from "./redact.js";
 import { TradeLog } from "./report.js";
 import { SolPriceFeed } from "./sol-price.js";
 import { createRpcSafetyCheck } from "./safety.js";
+import { createHoneypotCheck } from "./momentum/honeypot.js";
 import { readChainFacts } from "./momentum/chain.js";
 import { HttpMomentumMarket } from "./momentum/market.js";
 import { solFromUsdBalance } from "./momentum/paper.js";
@@ -340,6 +341,7 @@ export async function runMomentum(runtime: Runtime, options: { maxRuntimeMs?: nu
     ...(runtime.walletBalanceSol ? { walletBalanceSol: runtime.walletBalanceSol } : {}),
     ...(runtime.quoteFee ? { quoteFee: runtime.quoteFee } : {}),
     ...(runtime.reclaimRent ? { reclaimRent: runtime.reclaimRent } : {}),
+    honeypot: createHoneypotCheck(config),
   });
   log.info("momentum start", {
     mode: config.mode,
