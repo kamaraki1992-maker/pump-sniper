@@ -17,7 +17,7 @@ import { createRpcFetch, createRpcStats, startRpcPressureLog } from "./rpc-limit
 import { Logger } from "./logger.js";
 import { MetadataSocials } from "./socials.js";
 import { PositionBook } from "./positions.js";
-import { installProcessRedaction, rpcApiKey } from "./redact.js";
+import { installProcessRedaction, rpcApiKey, rpcHost } from "./redact.js";
 import { TradeLog } from "./report.js";
 import { SolPriceFeed } from "./sol-price.js";
 import { createRpcSafetyCheck } from "./safety.js";
@@ -61,6 +61,8 @@ export function readSecrets(): string[] {
   if (grpcToken && grpcToken.length >= 8) secrets.push(grpcToken);
   const rpcKey = rpcApiKey(process.env.RPC_WS_URL?.trim() ?? "");
   if (rpcKey && rpcKey.length >= 8) secrets.push(rpcKey);
+  const rugKey = rpcApiKey(process.env.RUG_CHECK_RPC_URL?.trim() ?? "");
+  if (rugKey && rugKey.length >= 8) secrets.push(rugKey);
   const pumpDevKey = process.env.PUMPDEV_API_KEY?.trim();
   if (pumpDevKey && pumpDevKey.length >= 8) secrets.push(pumpDevKey);
   const portalKey = process.env.PUMPPORTAL_API_KEY?.trim();
@@ -95,7 +97,7 @@ export async function buildRuntime(config: AppConfig = loadConfig()): Promise<Ru
   });
   const stopPressureLog = startRpcPressureLog(log, rpcStats);
   const history = new RpcCreatorHistory(config, log, Date.now, rpcFetch);
-  const holders = new RpcHolderCheck(config.rpcUrl, config.maxTop10Pct, rpcFetch, log, {
+  const holders = new RpcHolderCheck(config.rugCheckRpcUrl, config.maxTop10Pct, rpcFetch, log, {
     timeoutMs: config.rugCheckTimeoutMs,
   });
   const botRef: {
@@ -239,6 +241,7 @@ export async function runSniper(options: { maxRuntimeMs?: number } = {}): Promis
   const { config, log, bot, positions, sol } = runtime;
   const removeGuards = installProcessGuards(log);
   const balanceSol = await bot.reportedBalanceSol();
+  log.info("rug check rpc", { host: rpcHost(config.rugCheckRpcUrl) });
   log.info("sniper start", {
     mode: config.mode,
     ...(balanceSol != null ? { balanceSol } : {}),

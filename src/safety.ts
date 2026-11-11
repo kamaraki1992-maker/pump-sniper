@@ -163,7 +163,7 @@ export function createRpcSafetyCheck(config: AppConfig, rpcFetch: typeof fetch =
   });
   return (input) =>
     runSafetyCheck(async () => {
-      const account = await fetchMint(config.rpcUrl, input.mint, rpcFetch);
+      const account = await fetchMint(config.rugCheckRpcUrl, input.mint, rpcFetch);
       const simulate = async () => {
         const buy = await simulateTrade(connection, config, input.mint, input.spendSol, "buy");
         const sell = await simulateTrade(connection, config, input.mint, "100%", "sell");

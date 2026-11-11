@@ -149,6 +149,8 @@ export interface AppConfig {
   wsUrl: string;
   tradeApiUrl: string;
   rpcUrl: string;
+  /** Top-10 and mint-authority reads. Falls back to `rpcUrl` when unset. */
+  rugCheckRpcUrl: string;
   jitoBlockEngineUrl: string;
   solPriceUrl: string;
   dataDir: string;
@@ -537,6 +539,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
 
   const dataDir = str(env.DATA_DIR, "./data");
+  const rpcUrl = str(env.RPC_URL, "https://api.mainnet-beta.solana.com");
+  const rugCheckRpcUrl = str(env.RUG_CHECK_RPC_URL, rpcUrl);
   return {
     mode,
     buySizeMinUsd,
@@ -613,7 +617,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     dataWsUrl: str(env.DATA_WS_URL, "wss://pumpportal.fun/api/data"),
     wsUrl: str(env.WS_URL, "wss://pumpdev.io/ws"),
     tradeApiUrl: str(env.TRADE_API_URL, "https://pumpdev.io/api/bundle"),
-    rpcUrl: str(env.RPC_URL, "https://api.mainnet-beta.solana.com"),
+    rpcUrl,
+    rugCheckRpcUrl,
     jitoBlockEngineUrl: str(
       env.JITO_BLOCK_ENGINE_URL,
       "https://mainnet.block-engine.jito.wtf/api/v1/bundles",

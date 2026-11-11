@@ -22,6 +22,15 @@ export function redactRpcUrl(text: string): string {
   return text.replace(/([?&](?:api-key|api_key|apikey|key)=)[^&\s"]+/gi, "$1[REDACTED]");
 }
 
+/** Hostname only. The query string, including any API key, is not returned. */
+export function rpcHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "invalid-rpc-url";
+  }
+}
+
 export function rpcApiKey(url: string): string | null {
   try {
     const parsed = new URL(url);

@@ -2,6 +2,7 @@ import { PublicKey } from "@solana/web3.js";
 import { PUMP_PROGRAM_ID } from "./curve-watch.js";
 import type { FilterDecision } from "./filter.js";
 import { Logger } from "./logger.js";
+import { redactRpcUrl } from "./redact.js";
 import { WSOL_MINT } from "./pricing.js";
 
 const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
@@ -279,7 +280,7 @@ export class RpcHolderCheck {
           lastError = "top10-holders-not-visible";
         }
       } catch (error) {
-        lastError = error instanceof Error ? error.message : "rpc-error";
+        lastError = redactRpcUrl(error instanceof Error ? error.message : "rpc-error");
       }
       if (attempt >= 6) break;
       const remaining = deadline - this.now();
