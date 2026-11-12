@@ -21,6 +21,7 @@ export interface ScalpHint {
   liquidityUsd: number | null;
   bundlePct: number | null;
   creator: string | null;
+  pool?: "pump" | "pump-amm";
 }
 
 export interface ScalpDeps {
@@ -231,6 +232,7 @@ export class ScalpRunner {
         liquidityUsd,
         bundlePct,
         creator: memory?.creator ?? null,
+        pool: event.venue === "pumpswap" ? "pump-amm" : "pump",
       });
       if (gated === "timeout") {
         this.deps.log.info("scalp", { mint: event.mint, decision: "skip", reason: "gate_timeout" });
@@ -539,6 +541,7 @@ export class ScalpRunner {
             buys: memory?.buys ?? [],
           }),
       creator: memory?.creator ?? null,
+      pool: event.venue === "pumpswap" ? "pump-amm" : "pump",
     });
   }
 
