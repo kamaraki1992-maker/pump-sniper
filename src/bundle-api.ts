@@ -27,8 +27,11 @@ export interface BundleBody {
   jitoTip: number;
   slippage: number;
   priorityFee: number;
-  /** Present on a graduated sell. PumpDev routes the swap to PumpSwap. */
-  pool?: "pump-amm" | "auto";
+  /**
+   * Graduated route. PumpPortal's trade-local docs list `pump-amm`, `raydium`,
+   * and `auto`. The bundle body forwards the same field.
+   */
+  pool?: "pump" | "pump-amm" | "raydium" | "auto";
 }
 
 /**

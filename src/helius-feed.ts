@@ -1,6 +1,7 @@
 import WebSocket from "ws";
 import { Logger } from "./logger.js";
 import { nextBackoffMs } from "./stream.js";
+import { PUMP_AMM_PROGRAM_ID } from "./holders.js";
 import { eventsFromLogs, PUMP_LOG_PROGRAM, readLogsNotice } from "./helius-logs.js";
 import { redactRpcUrl } from "./redact.js";
 import type { MarketEvent } from "./types.js";
@@ -50,6 +51,10 @@ export interface HeliusFeedOptions {
   /** How often to publish the per-minute counters. */
   statsMs?: number;
   pingMs?: number;
+  /** Deliver trades for mints the bot is not already watching. Scalp needs this. */
+  allTrades?: boolean;
+  /** Also subscribe to PumpSwap logs and decode graduated swaps. */
+  pumpSwap?: boolean;
 }
 
 const CONNECT_TIMEOUT_MS = 10_000;
@@ -87,6 +92,8 @@ export class HeliusFeed {
   private readonly backoff: (attempt: number) => number;
   private readonly statsMs: number;
   private readonly pingMs: number;
+  private readonly allTrades: boolean;
+  private readonly pumpSwap: boolean;
   private window = { events: 0, decodeFailures: 0, failedTx: 0, dupes: 0 };
 
   constructor(
@@ -101,6 +108,8 @@ export class HeliusFeed {
     this.backoff = options.backoff ?? nextBackoffMs;
     this.statsMs = options.statsMs ?? 60_000;
     this.pingMs = options.pingMs ?? 20_000;
+    this.allTrades = options.allTrades ?? false;
+    this.pumpSwap = options.pumpSwap ?? false;
   }
 
   start(onEvent: (event: MarketEvent) => void): void {
@@ -237,7 +246,7 @@ export class HeliusFeed {
       if (this.ws !== socket) return;
       this.opened = true;
       this.attempt = 0;
-      this.send(this.subscribeBody());
+      for (const body of this.subscribeBodies()) this.send(body);
       this.log.info("helius open", { url: redactRpcUrl(this.url), commitment: HELIUS_LOG_COMMITMENT });
     });
     socket.on("message", (data) => {
@@ -332,13 +341,26 @@ export class HeliusFeed {
     }
   }
 
-  private subscribeBody(): string {
-    return JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "logsSubscribe",
-      params: [{ mentions: [PUMP_LOG_PROGRAM] }, { commitment: HELIUS_LOG_COMMITMENT }],
-    });
+  private subscribeBodies(): string[] {
+    const bodies = [
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "logsSubscribe",
+        params: [{ mentions: [PUMP_LOG_PROGRAM] }, { commitment: HELIUS_LOG_COMMITMENT }],
+      }),
+    ];
+    if (this.pumpSwap) {
+      bodies.push(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "logsSubscribe",
+          params: [{ mentions: [PUMP_AMM_PROGRAM_ID.toBase58()] }, { commitment: HELIUS_LOG_COMMITMENT }],
+        }),
+      );
+    }
+    return bodies;
   }
 
   private onMessage(data: unknown): void {
@@ -359,7 +381,7 @@ export class HeliusFeed {
       });
       return;
     }
-    if (record.method == null && record.id === 1 && record.result !== undefined) {
+    if (record.method == null && (record.id === 1 || record.id === 2) && record.result !== undefined) {
       this.noteActivity();
       this.noteSubscribed();
       return;
@@ -387,7 +409,7 @@ export class HeliusFeed {
     this.window.decodeFailures += decoded.failures;
     const created = new Set(decoded.events.filter((event) => event.kind === "launch").map((event) => event.mint));
     for (const event of decoded.events) {
-      if (event.kind === "trade" && !this.tracked.has(event.mint) && !created.has(event.mint)) continue;
+      if (event.kind === "trade" && !this.allTrades && !this.tracked.has(event.mint) && !created.has(event.mint)) continue;
       this.window.events += 1;
       try {
         this.onEvent(event);

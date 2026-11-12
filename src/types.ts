@@ -1,5 +1,7 @@
 export type Mode = "paper" | "live";
 
+export type Strategy = "sniper" | "momentum" | "scalp";
+
 export type TradeSide = "buy" | "sell";
 
 export type TradeStatus = "filled" | "failed";
@@ -19,7 +21,18 @@ export type TradeReason =
   | "fast_drop"
   | "early_no_momentum"
   | "profit_lock"
-  | "no_socials_time_stop";
+  | "no_socials_time_stop"
+  | "momentum_sl"
+  | "momentum_tp1"
+  | "momentum_tp2"
+  | "momentum_tp3"
+  | "momentum_moonbag"
+  | "momentum_stale"
+  | "scalp_sl"
+  | "scalp_tp"
+  | "scalp_trail"
+  | "scalp_fast"
+  | "scalp_max_hold";
 
 export interface MarketLaunch {
   kind: "launch";
@@ -90,8 +103,19 @@ export interface OrderRequest {
   tokenAmount?: number;
   /** Share of the remaining position to sell. 1 or omitted closes the position. */
   sellFraction?: number;
-  /** Set on a graduated sell so the bundle is built against PumpSwap. */
-  pool?: "pump-amm" | "auto";
+  /**
+   * Graduated route. PumpPortal accepts `pump-amm`, `raydium`, and `auto`.
+   * The Lightning bundle body forwards this field unchanged.
+   */
+  pool?: "pump" | "pump-amm" | "raydium" | "auto";
+  /** When set, paper and live use this priority fee instead of the dynamic quote. */
+  priorityFeeSol?: number;
+  /** Momentum fee tier. Unset keeps the sniper quote. */
+  feeLevel?: "medium" | "high";
+  /** `false` sends a normal transaction. Unset keeps the Jito bundle. */
+  useJito?: boolean;
+  /** Live momentum. Refuse a public-RPC send when both Jito and the Helius sender fail. */
+  mevRequired?: boolean;
   /** Computed Jito tip for this order. Falls back to the config tip when omitted. */
   tipSol?: number;
   /** Stop-like exits use this order's slippage instead of the smaller paper default. */
@@ -149,6 +173,23 @@ export interface TradeRecord {
   bundle?: "jito" | null;
   /** Buy had no verified socials and entered through the fast lane. */
   noSocials?: boolean;
+  /** Itemized momentum paper costs. Absent on sniper rows. */
+  costs?: TradeCosts;
+  /** Momentum entry that opened the position. Copied onto its sells. */
+  entryType?: "breakout" | "pullback" | null;
+  /** Which rule set wrote the row. Older sniper rows omit it. */
+  strategy?: "sniper" | "momentum" | "scalp";
+}
+
+export interface TradeCosts {
+  baseFeeSol: number;
+  priorityFeeSol: number;
+  tipSol: number;
+  swapFeeSol: number;
+  priceImpactPct: number;
+  /** Negative when rent is debited, positive when it is credited back. */
+  ataRentSol: number;
+  closeFeeSol: number;
 }
 
 export interface Position {
@@ -201,6 +242,22 @@ export interface Position {
   creatorTokens?: number | null;
   /** Entered without verified socials. Uses the no-socials time stop. */
   noSocials?: boolean;
+  /** Managed by STRATEGY=momentum. The sniper exits do not apply. */
+  momentum?: boolean;
+  /** Token amount of the original fill. Partials are fractions of this. */
+  momentumOriginalTokens?: number;
+  momentumTp1Taken?: boolean;
+  momentumTp2Taken?: boolean;
+  momentumTp3Taken?: boolean;
+  /** Graduated route sent on the Lightning bundle. */
+  momentumPool?: "pump" | "pump-amm" | "raydium" | "auto";
+  momentumEntryType?: "breakout" | "pullback";
+  /** Which bot opened the position. */
+  strategy?: "sniper" | "momentum" | "scalp";
+  /** Scalp already sold the 60% take-profit. The rest is on the 10% trail. */
+  scalpTpTaken?: boolean;
+  /** Round-trip cost as a fraction of the scalp buy. Exit targets are net of it. */
+  scalpCostPct?: number;
 }
 
 export interface Executor {

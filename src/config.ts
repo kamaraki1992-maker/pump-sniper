@@ -1,6 +1,6 @@
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
-import type { Mode } from "./types.js";
+import type { Mode, Strategy } from "./types.js";
 
 /**
  * Caps live in code on purpose. Env values outside these bounds abort startup.
@@ -36,6 +36,8 @@ export interface PaperModel {
 
 export interface AppConfig {
   mode: Mode;
+  /** `sniper` watches new launches. `momentum` trades graduated pump.fun mints. */
+  strategy: Strategy;
   buySizeMinUsd: number;
   buySizeMaxUsd: number;
   /** Buy cap. Also the value used when older code reads a single slippage. */
@@ -151,6 +153,65 @@ export interface AppConfig {
   rpcUrl: string;
   /** Top-10 and mint-authority reads. Falls back to `rpcUrl` when unset. */
   rugCheckRpcUrl: string;
+  /** Seconds between momentum candidate polls. */
+  momentumPollSec: number;
+  /** Closed 5m candles whose high is the local resistance. */
+  momentumResistanceCandles: number;
+  /** Minutes of 5m candles used as the pullback high. */
+  momentumPullbackLookbackMin: number;
+  /** Share of available cash for each momentum buy. Confidence does not change it. */
+  momentumSizePct: number;
+  /** Momentum notional cap. Replaces the sniper $30 cap. */
+  momentumMaxUsd: number;
+  /** SOL-denominated gas that is never spent on a momentum trade, valued in USD. */
+  gasReserveUsd: number;
+  /** Momentum sends the swap through Jito unless this is turned off. */
+  momentumUseJito: boolean;
+  /** Fixed Jito tip before the min/max clamp. */
+  momentumJitoTipSol: number;
+  /** Cap for the Helius Medium priority fee, in SOL. */
+  momentumPriorityFeeSol: number;
+  /** Cap for the Helius High priority fee used on breakout buys and stop-loss exits. */
+  momentumTurboFeeSol: number;
+  /** Momentum Jito tip band, used only when `momentumUseJito` is on. */
+  momentumJitoTipMinSol: number;
+  momentumJitoTipMaxSol: number;
+  /** PumpSwap LP plus protocol fee, in basis points. */
+  momentumPumpswapFeeBps: number;
+  /** Bonding-curve fee, in basis points. pump.fun charges about 1%. */
+  momentumPumpFeeBps: number;
+  /** Fixed priority fee for every scalp order. */
+  scalpPriorityFeeSol: number;
+  /** Hard close for a scalp position that is still open. */
+  scalpMaxHoldMin: number;
+  /** Safety gate budget after a scalp spike. A miss skips the buy. */
+  scalpGateMs: number;
+  /** Honeypot sell-simulation budget. Independent of the gate budget. */
+  scalpSimTimeoutMs: number;
+  /** Lowest 60-second rise, in percent, that counts as a scalp spike. */
+  scalpSpikeMinPct: number;
+  /** A 60-second rise above this percent is skipped as fomo. */
+  scalpSpikeMaxPct: number;
+  /** Skip a scalp buy when the round trip costs more than this percent of size. */
+  scalpMaxCostPct: number;
+  /** Sell the whole scalp position when the leftover would be worth less than this. */
+  scalpMinRemainderSol: number;
+  /** Buys at least this large required before a scalp entry. */
+  scalpMinLargeBuys: number;
+  /** A buy of this many dollars counts as large. */
+  scalpLargeBuyUsd: number;
+  /** A buy of at least this many SOL counts as large. */
+  scalpLargeBuySol: number;
+  /** How far back the large-buy count looks, in seconds. */
+  scalpLargeBuyWindowSec: number;
+  /** Raydium swap fee, in basis points. */
+  momentumRaydiumFeeBps: number;
+  /** Alternative paper bankroll. Converted with the live SOL/USD price when the balance file is created. */
+  paperStartBalanceUsd: number | null;
+  /** Optional Helius staked sender. Live momentum uses it when the Jito bundle does not land. */
+  heliusSenderUrl: string | null;
+  /** Written when equity falls 25% from its high-water mark. New entries stay off until it is removed. */
+  killFile: string;
   jitoBlockEngineUrl: string;
   solPriceUrl: string;
   dataDir: string;
@@ -193,6 +254,14 @@ function creatorHoldRaw(env: NodeJS.ProcessEnv): string | undefined {
     return env.MAX_CREATOR_HOLD_PCT;
   }
   return env.CREATOR_MAX_HOLD_PCT;
+}
+
+function flag(value: string | undefined, fallback: boolean, name = "flag"): boolean {
+  if (value === undefined || value.trim() === "") return fallback;
+  const raw = value.trim().toLowerCase();
+  if (raw === "1" || raw === "true") return true;
+  if (raw === "0" || raw === "false") return false;
+  throw new ConfigError(`${name} must be true or false`);
 }
 
 function str(value: string | undefined, fallback: string): string {
@@ -241,8 +310,17 @@ export function requiredBuyBalanceSol(config: AppConfig, buySize: number, openPo
   return buySize + txFee + tip + exitReserve + openPositions * exitReserve;
 }
 
+function strategyOf(value: string | undefined): Strategy {
+  const strategy = (value ?? "").trim().toLowerCase();
+  if (strategy === "" || strategy === "sniper") return "sniper";
+  if (strategy === "momentum") return "momentum";
+  if (strategy === "scalp") return "scalp";
+  throw new ConfigError("STRATEGY must be sniper, momentum, or scalp");
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const mode: Mode = env.MODE === "live" ? "live" : "paper";
+  const strategy = strategyOf(env.STRATEGY);
   const buySizeMinUsd = num(env.BUY_SIZE_MIN_USD, 5, "BUY_SIZE_MIN_USD");
   const buySizeMaxUsd = num(env.BUY_SIZE_MAX_USD, HARD_CAPS.maxBuyUsd, "BUY_SIZE_MAX_USD");
   const legacySlippage = optionalNum(env.MAX_SLIPPAGE_PCT, "MAX_SLIPPAGE_PCT");
@@ -325,7 +403,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const heliusRps = num(env.HELIUS_RPS, 5, "HELIUS_RPS");
   const rugCheckTimeoutMs = num(env.RUG_CHECK_TIMEOUT_MS, 2_000, "RUG_CHECK_TIMEOUT_MS");
   const rpcCacheTtlMs = num(env.RPC_CACHE_TTL_MS, 3_000, "RPC_CACHE_TTL_MS");
-  const maxOpenPositions = num(env.MAX_OPEN_POSITIONS, HARD_CAPS.maxOpenPositions, "MAX_OPEN_POSITIONS");
+  const maxOpenPositions = num(
+    env.MAX_OPEN_POSITIONS,
+    strategy === "momentum" || strategy === "scalp" ? 4 : HARD_CAPS.maxOpenPositions,
+    "MAX_OPEN_POSITIONS",
+  );
   const maxHoldMinutes = num(env.MAX_HOLD_MINUTES, 10, "MAX_HOLD_MINUTES");
   const liqDropPct = num(env.LIQ_DROP_PCT, 20, "LIQ_DROP_PCT");
   const volumeStallSec = num(env.VOLUME_STALL_SEC, 45, "VOLUME_STALL_SEC");
@@ -333,6 +415,40 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const sellPressureRatio = num(env.SELL_PRESSURE_RATIO, 3, "SELL_PRESSURE_RATIO");
   const sellPressureWindowSec = num(env.SELL_PRESSURE_WINDOW_SEC, 30, "SELL_PRESSURE_WINDOW_SEC");
   const safetyCheckTimeoutMs = num(env.SAFETY_CHECK_TIMEOUT_MS, 250, "SAFETY_CHECK_TIMEOUT_MS");
+  const momentumPollSec = Math.floor(num(env.MOMENTUM_POLL_SEC, 20, "MOMENTUM_POLL_SEC"));
+  const momentumResistanceCandles = Math.floor(
+    num(env.MOMENTUM_RESISTANCE_CANDLES, 6, "MOMENTUM_RESISTANCE_CANDLES"),
+  );
+  const momentumPullbackLookbackMin = Math.floor(
+    num(env.MOMENTUM_PULLBACK_LOOKBACK_MIN, 60, "MOMENTUM_PULLBACK_LOOKBACK_MIN"),
+  );
+  const momentumSizePct = num(env.MOMENTUM_SIZE_PCT, 20, "MOMENTUM_SIZE_PCT");
+  const momentumMaxUsd = num(env.MOMENTUM_MAX_USD, 100, "MOMENTUM_MAX_USD");
+  const gasReserveUsd = num(env.GAS_RESERVE_USD, 4, "GAS_RESERVE_USD");
+  const momentumUseJito = flag(env.MOMENTUM_USE_JITO, true, "MOMENTUM_USE_JITO");
+  const momentumJitoTipSol = num(env.MOMENTUM_JITO_TIP_SOL, 0.0001, "MOMENTUM_JITO_TIP_SOL");
+  const momentumPriorityFeeSol = num(env.MOMENTUM_PRIORITY_FEE_SOL, 0.00005, "MOMENTUM_PRIORITY_FEE_SOL");
+  const momentumTurboFeeSol = num(env.MOMENTUM_TURBO_FEE_SOL, 0.0002, "MOMENTUM_TURBO_FEE_SOL");
+  const momentumJitoTipMinSol = num(env.MOMENTUM_JITO_TIP_MIN_SOL, 0.0001, "MOMENTUM_JITO_TIP_MIN_SOL");
+  const momentumJitoTipMaxSol = num(env.MOMENTUM_JITO_TIP_MAX_SOL, 0.0003, "MOMENTUM_JITO_TIP_MAX_SOL");
+  const momentumPumpswapFeeBps = num(env.MOMENTUM_PUMPSWAP_FEE_BPS, 25, "MOMENTUM_PUMPSWAP_FEE_BPS");
+  const momentumPumpFeeBps = num(env.MOMENTUM_PUMP_FEE_BPS, 100, "MOMENTUM_PUMP_FEE_BPS");
+  const scalpPriorityFeeSol = num(env.SCALP_PRIORITY_FEE_SOL, 0.0002, "SCALP_PRIORITY_FEE_SOL");
+  const scalpMaxHoldMin = num(env.SCALP_MAX_HOLD_MIN, 30, "SCALP_MAX_HOLD_MIN");
+  const scalpGateMs = num(env.SCALP_GATE_MS, 3_000, "SCALP_GATE_MS");
+  const scalpSimTimeoutMs = num(env.SCALP_SIM_TIMEOUT_MS, 3_000, "SCALP_SIM_TIMEOUT_MS");
+  const scalpSpikeMinPct = num(env.SCALP_SPIKE_MIN_PCT, 12, "SCALP_SPIKE_MIN_PCT");
+  const scalpSpikeMaxPct = num(env.SCALP_SPIKE_MAX_PCT, 25, "SCALP_SPIKE_MAX_PCT");
+  const scalpMaxCostPct = num(env.SCALP_MAX_COST_PCT, 4, "SCALP_MAX_COST_PCT");
+  const scalpMinRemainderSol = num(env.SCALP_MIN_REMAINDER_SOL, 0.01, "SCALP_MIN_REMAINDER_SOL");
+  const scalpMinLargeBuys = Math.floor(num(env.SCALP_MIN_LARGE_BUYS, 2, "SCALP_MIN_LARGE_BUYS"));
+  const scalpLargeBuyUsd = num(env.SCALP_LARGE_BUY_USD, 300, "SCALP_LARGE_BUY_USD");
+  const scalpLargeBuySol = num(env.SCALP_LARGE_BUY_SOL, 2, "SCALP_LARGE_BUY_SOL");
+  const scalpLargeBuyWindowSec = num(env.SCALP_LARGE_BUY_WINDOW_SEC, 120, "SCALP_LARGE_BUY_WINDOW_SEC");
+  const momentumRaydiumFeeBps = num(env.MOMENTUM_RAYDIUM_FEE_BPS, 25, "MOMENTUM_RAYDIUM_FEE_BPS");
+  const paperStartBalanceUsd = optionalNum(env.PAPER_START_BALANCE_USD, "PAPER_START_BALANCE_USD");
+  const heliusSenderUrl = str(env.HELIUS_SENDER_URL, "") || null;
+  const killFile = str(env.KILL_FILE, "./KILL");
   const grpcUrlRaw = str(env.GRPC_URL, "");
   const grpcTokenPresent = Boolean(env.GRPC_TOKEN?.trim());
   const paperSlippagePct = num(env.PAPER_SLIPPAGE_PCT, 2, "PAPER_SLIPPAGE_PCT");
@@ -522,6 +638,72 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!(safetyCheckTimeoutMs > 0)) {
     throw new ConfigError("SAFETY_CHECK_TIMEOUT_MS must be positive");
   }
+  if (!Number.isInteger(momentumPollSec) || momentumPollSec < 5) {
+    throw new ConfigError("MOMENTUM_POLL_SEC must be an integer >= 5");
+  }
+  if (!Number.isInteger(momentumResistanceCandles) || momentumResistanceCandles < 2) {
+    throw new ConfigError("MOMENTUM_RESISTANCE_CANDLES must be an integer >= 2");
+  }
+  if (!Number.isInteger(momentumPullbackLookbackMin) || momentumPullbackLookbackMin < 5) {
+    throw new ConfigError("MOMENTUM_PULLBACK_LOOKBACK_MIN must be an integer >= 5");
+  }
+  if (
+    (strategy === "momentum" || strategy === "scalp") &&
+    mode === "paper" &&
+    paperStartBalanceSol == null &&
+    paperStartBalanceUsd == null
+  ) {
+    throw new ConfigError(
+      "STRATEGY=momentum or STRATEGY=scalp in paper mode requires PAPER_START_BALANCE_SOL or PAPER_START_BALANCE_USD",
+    );
+  }
+  if (!(momentumSizePct > 0) || momentumSizePct > 100) {
+    throw new ConfigError("MOMENTUM_SIZE_PCT must be greater than 0 and at most 100");
+  }
+  if (!(momentumMaxUsd > 0)) throw new ConfigError("MOMENTUM_MAX_USD must be positive");
+  if (!(gasReserveUsd >= 0)) throw new ConfigError("GAS_RESERVE_USD must be >= 0");
+  if (!(momentumJitoTipSol >= 0)) throw new ConfigError("MOMENTUM_JITO_TIP_SOL must be >= 0");
+  if (!(scalpPriorityFeeSol > 0) || scalpPriorityFeeSol > 0.01) {
+    throw new ConfigError("SCALP_PRIORITY_FEE_SOL must be between 0 and 0.01");
+  }
+  if (!(scalpMaxHoldMin > 0)) throw new ConfigError("SCALP_MAX_HOLD_MIN must be positive");
+  if (!(scalpGateMs >= 250)) throw new ConfigError("SCALP_GATE_MS must be at least 250");
+  if (!(scalpSimTimeoutMs >= 250)) throw new ConfigError("SCALP_SIM_TIMEOUT_MS must be at least 250");
+  if (!(scalpSpikeMinPct > 0) || !(scalpSpikeMaxPct > scalpSpikeMinPct)) {
+    throw new ConfigError("SCALP_SPIKE_MIN_PCT must be > 0 and SCALP_SPIKE_MAX_PCT must be greater");
+  }
+  if (!(scalpMaxCostPct > 0) || scalpMaxCostPct > 100) throw new ConfigError("SCALP_MAX_COST_PCT must be between 0 and 100");
+  if (!(scalpMinRemainderSol >= 0)) throw new ConfigError("SCALP_MIN_REMAINDER_SOL must be >= 0");
+  if (!(scalpMinLargeBuys >= 1)) throw new ConfigError("SCALP_MIN_LARGE_BUYS must be at least 1");
+  if (!(scalpLargeBuyUsd > 0)) throw new ConfigError("SCALP_LARGE_BUY_USD must be positive");
+  if (!(scalpLargeBuySol > 0)) throw new ConfigError("SCALP_LARGE_BUY_SOL must be positive");
+  if (!(scalpLargeBuyWindowSec > 0)) throw new ConfigError("SCALP_LARGE_BUY_WINDOW_SEC must be positive");
+  if (!(momentumPriorityFeeSol > 0) || momentumPriorityFeeSol > momentumTurboFeeSol) {
+    throw new ConfigError("MOMENTUM_PRIORITY_FEE_SOL must be > 0 and at most MOMENTUM_TURBO_FEE_SOL");
+  }
+  if (!(momentumTurboFeeSol > 0) || momentumTurboFeeSol > 0.01) {
+    throw new ConfigError("MOMENTUM_TURBO_FEE_SOL must be between 0 and 0.01");
+  }
+  if (
+    !(momentumJitoTipMinSol >= 0) ||
+    momentumJitoTipMinSol > momentumJitoTipMaxSol ||
+    momentumJitoTipMaxSol > HARD_CAPS.maxJitoTipSol
+  ) {
+    throw new ConfigError("MOMENTUM_JITO_TIP_MIN_SOL and MOMENTUM_JITO_TIP_MAX_SOL must sit inside 0 to 0.005");
+  }
+  if (
+    momentumPumpswapFeeBps < 0 ||
+    momentumPumpswapFeeBps > 500 ||
+    momentumPumpFeeBps < 0 ||
+    momentumPumpFeeBps > 500 ||
+    momentumRaydiumFeeBps < 0 ||
+    momentumRaydiumFeeBps > 500
+  ) {
+    throw new ConfigError("momentum swap fee bps must be between 0 and 500");
+  }
+  if (paperStartBalanceUsd != null && !(paperStartBalanceUsd > 0)) {
+    throw new ConfigError("PAPER_START_BALANCE_USD must be positive when set");
+  }
   const slippageCeiling = Math.max(buySlippagePct, sellSlippagePct);
   if (!(paperSlippagePct >= 0) || paperSlippagePct > slippageCeiling) {
     throw new ConfigError("PAPER_SLIPPAGE_PCT must be between 0 and the buy or sell slippage cap");
@@ -543,6 +725,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const rugCheckRpcUrl = str(env.RUG_CHECK_RPC_URL, rpcUrl);
   return {
     mode,
+    strategy,
     buySizeMinUsd,
     buySizeMaxUsd,
     maxSlippagePct: buySlippagePct,
@@ -619,6 +802,36 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     tradeApiUrl: str(env.TRADE_API_URL, "https://pumpdev.io/api/bundle"),
     rpcUrl,
     rugCheckRpcUrl,
+    momentumPollSec,
+    momentumResistanceCandles,
+    momentumPullbackLookbackMin,
+    momentumSizePct,
+    momentumMaxUsd,
+    gasReserveUsd,
+    momentumUseJito,
+    momentumJitoTipSol,
+    momentumPriorityFeeSol,
+    momentumTurboFeeSol,
+    momentumJitoTipMinSol,
+    momentumJitoTipMaxSol,
+    momentumPumpswapFeeBps,
+    momentumPumpFeeBps,
+    scalpPriorityFeeSol,
+    scalpMaxHoldMin,
+    scalpGateMs,
+    scalpSimTimeoutMs,
+    scalpSpikeMinPct,
+    scalpSpikeMaxPct,
+    scalpMaxCostPct,
+    scalpMinRemainderSol,
+    scalpMinLargeBuys,
+    scalpLargeBuyUsd,
+    scalpLargeBuySol,
+    scalpLargeBuyWindowSec,
+    momentumRaydiumFeeBps,
+    paperStartBalanceUsd,
+    heliusSenderUrl,
+    killFile,
     jitoBlockEngineUrl: str(
       env.JITO_BLOCK_ENGINE_URL,
       "https://mainnet.block-engine.jito.wtf/api/v1/bundles",

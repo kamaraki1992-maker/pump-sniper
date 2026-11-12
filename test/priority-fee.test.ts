@@ -68,6 +68,27 @@ test("Helius High is used, cached, and clamped", async () => {
   assert.equal(second.sol, first.sol);
 });
 
+test("Helius Medium is clamped to the momentum cap and does not reuse a High quote", async () => {
+  const levels: string[] = [];
+  const fetchImpl: typeof fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as {
+      method: string;
+      params: Array<{ options?: { priorityLevel?: string } }>;
+    };
+    levels.push(body.params[0]?.options?.priorityLevel ?? "");
+    const micro = body.params[0]?.options?.priorityLevel === "Medium" ? 5_000_000 : 80_000_000;
+    return json({ jsonrpc: "2.0", id: 1, result: { priorityFeeEstimate: micro } });
+  };
+  const estimator = new PriorityFeeEstimator("https://rpc.example", 0.00005, 500_000, 0, fetchImpl, () => 1_000);
+  const medium = await estimator.quote(["Mint"], 200_000, { level: "Medium", maxLamports: 50_000 });
+  const high = await estimator.quote(["Mint"], 200_000, { level: "High", maxLamports: 200_000 });
+  assert.deepEqual(levels, ["Medium", "High"]);
+  assert.equal(medium.totalLamports, 50_000);
+  assert.equal(medium.sol, 0.00005);
+  assert.equal(high.totalLamports, 200_000);
+  assert.equal(high.sol, 0.0002);
+});
+
 test("a missing Helius estimate uses the 90th percentile, then the SOL fallback", async () => {
   const recentFees = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1_000];
   let mode: "recent" | "down" = "recent";

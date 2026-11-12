@@ -72,6 +72,9 @@ export class PaperExecutor implements Executor {
 
   private async priced(order: OrderRequest): Promise<PaperModel> {
     const base = capped(this.model, order);
+    if (order.priorityFeeSol != null && order.priorityFeeSol >= 0 && Number.isFinite(order.priorityFeeSol)) {
+      return { ...base, priorityFeeSol: order.priorityFeeSol };
+    }
     if (!this.feeSol) return base;
     try {
       const sol = await this.feeSol(order);
