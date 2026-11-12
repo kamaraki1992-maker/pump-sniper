@@ -20,11 +20,17 @@ const SIM_PAYER = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
 
 export type SellSim = "ok" | "fail" | "transfer-fee" | "no-balance" | "unsimulated";
 
-export function honeypotDecision(result: SellSim): { ok: boolean; reason: string | null } {
-  if (result === "ok" || result === "no-balance") return { ok: true, reason: null };
-  if (result === "transfer-fee") return { ok: false, reason: "transfer-fee" };
+/**
+ * Sellable only when the round trip actually sold. A missing ATA is not itself
+ * a honeypot, but it is not a pass either: the sell did not run. Any other
+ * program error is a skip named with its code.
+ */
+export function honeypotDecision(result: SellSim, code?: number | null): { ok: boolean; reason: string | null } {
+  if (result === "ok") return { ok: true, reason: null };
   if (result === "unsimulated") return { ok: false, reason: "honeypot_unsimulated" };
-  return { ok: false, reason: "honeypot" };
+  if (result === "transfer-fee") return { ok: false, reason: "transfer-fee" };
+  const suffix = code != null ? `:${code}` : "";
+  return { ok: false, reason: `honeypot_sim_error${suffix}` };
 }
 
 const COMPUTE_BUDGET = "ComputeBudget111111111111111111111111111111";
@@ -32,6 +38,15 @@ const SYSTEM_PROGRAM = "11111111111111111111111111111111";
 const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
+const PUMP_AMM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+const PUMP_CURVE = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+/** pump-amm global config. `buyback_fee_recipients` is eight pubkeys at this offset. */
+const PUMP_AMM_GLOBAL = new PublicKey("ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw");
+const BUYBACK_RECIPIENT_OFFSET = 643;
+const BUYBACK_RECIPIENT_COUNT = 8;
+/** After the fee-program account, the upgraded sell reads the buyback wallet here. */
+const BUYBACK_ACCOUNT_INDEX = 21;
 const INFRA_PROGRAMS = new Set([COMPUTE_BUDGET, SYSTEM_PROGRAM, TOKEN_PROGRAM, TOKEN_2022, ATA_PROGRAM]);
 const BURN_OWNERS = new Set([
   "11111111111111111111111111111111",
@@ -65,26 +80,84 @@ export function firstProgramLog(logs: readonly string[] | null | undefined): str
   return line ? line.slice(0, 240) : null;
 }
 
+export interface TokenBalanceChange {
+  accountIndex?: number;
+  mint?: string;
+  uiTokenAmount?: { amount?: string };
+}
+
 /**
- * Classify a simulateTransaction result. A missing ATA or an empty balance is
- * the simulation payer, not a honeypot. A transfer fee, freeze, or hook is.
- * Running out of compute before the program finishes is not a verdict.
+ * A round trip is sellable only when nothing errored, the sell instruction
+ * ran, and SOL (WSOL or a transfer after that sell) actually moved.
+ */
+export function sellExecuted(input: {
+  err: unknown;
+  logs: readonly string[] | null | undefined;
+  preTokenBalances?: readonly TokenBalanceChange[] | null;
+  postTokenBalances?: readonly TokenBalanceChange[] | null;
+}): boolean {
+  if (input.err) return false;
+  const logs = input.logs ?? [];
+  const at = logs.findIndex((line) => line.includes("Instruction: Sell"));
+  if (at < 0) return false;
+  const tail = logs.slice(at);
+  const sold = tail.some((line) => /success/.test(line) && (line.includes(PUMP_AMM) || line.includes(PUMP_CURVE)));
+  if (!sold) return false;
+  if (tail.some((line) => /TransferChecked|Transfer /.test(line))) return true;
+  const pre = input.preTokenBalances ?? [];
+  const post = input.postTokenBalances ?? [];
+  for (const row of post) {
+    if (row.mint !== WSOL_MINT || row.accountIndex == null) continue;
+    const before = pre.find((item) => item.accountIndex === row.accountIndex);
+    const prior = BigInt(before?.uiTokenAmount?.amount ?? "0");
+    const next = BigInt(row.uiTokenAmount?.amount ?? "0");
+    if (next > prior) return true;
+  }
+  return false;
+}
+
+/**
+ * Classify a simulateTransaction result. This does not mark a clean success;
+ * `sellExecuted` does that. A missing ATA is a setup miss. Every other program
+ * error, including 6053, stays a failure. Running out of compute is no verdict.
  */
 export function classifySellSimulation(err: unknown, logs: readonly string[] | null | undefined): SellSim {
   const text = `${JSON.stringify(err ?? "")}\n${(logs ?? []).join("\n")}`;
   if (/transfer fee|TransferFee|withheld/i.test(text)) return "transfer-fee";
-  if (/transfer hook|Account is frozen|frozen account|FreezeAccount/i.test(text)) return "fail";
   if (/exceeded CUs|ProgramFailedToComplete|Computational budget exceeded/i.test(text)) return "unsimulated";
-  if (!err) return "ok";
+  if (!err) return "fail";
   const code = simulationErrorCode(err);
-  if (
-    code === 1 ||
-    code === 3012 ||
-    /accountnotinitialized|not initialized|no token balance|no balance|insufficient|no record of a prior credit|token account/i.test(text)
-  ) {
-    return "no-balance";
-  }
+  if (code === 3012 || /accountnotinitialized/i.test(text)) return "no-balance";
   return "fail";
+}
+
+/** First authorized buyback wallet stored on the pump-amm global config. */
+export function readBuybackRecipient(data: Uint8Array | Buffer | undefined): PublicKey | null {
+  if (!data || data.length < BUYBACK_RECIPIENT_OFFSET + 32) return null;
+  for (let i = 0; i < BUYBACK_RECIPIENT_COUNT; i += 1) {
+    const start = BUYBACK_RECIPIENT_OFFSET + i * 32;
+    if (start + 32 > data.length) return null;
+    const key = new PublicKey(data.subarray(start, start + 32));
+    if (!key.equals(PublicKey.default)) return key;
+  }
+  return null;
+}
+
+/**
+ * The upgraded sell reads the buyback wallet at account 21 and its WSOL ATA
+ * at account 22. Trade builders still put an unrelated pubkey at 21, which
+ * the program rejects as 6053.
+ */
+export function repairPumpAmmSell(ix: TransactionInstruction, recipient: PublicKey): TransactionInstruction {
+  if (!ix.programId.equals(new PublicKey(PUMP_AMM)) || ix.keys.length < BUYBACK_ACCOUNT_INDEX + 2) return ix;
+  const quoteAta = PublicKey.findProgramAddressSync(
+    [recipient.toBuffer(), new PublicKey(TOKEN_PROGRAM).toBuffer(), new PublicKey(WSOL_MINT).toBuffer()],
+    new PublicKey(ATA_PROGRAM),
+  )[0];
+  const keys = ix.keys.map((key) => ({ pubkey: key.pubkey, isSigner: key.isSigner, isWritable: key.isWritable }));
+  keys[BUYBACK_ACCOUNT_INDEX] = { pubkey: recipient, isSigner: false, isWritable: false };
+  keys[BUYBACK_ACCOUNT_INDEX + 1] = { pubkey: quoteAta, isSigner: false, isWritable: true };
+  return new TransactionInstruction({ programId: ix.programId, keys, data: ix.data });
 }
 
 export function hasRequiredSocial(info: unknown): boolean {
@@ -137,18 +210,13 @@ export function createHoneypotCheck(
         pool,
         slippagePct: config.sellSlippagePct,
         tradeUrl: `${origin}/api/trade-local`,
-        simulate: async (tx) => {
-          const sim = await connection.simulateTransaction(tx, {
-            sigVerify: false,
-            replaceRecentBlockhash: true,
-            commitment: "processed",
-          });
-          return { err: sim.value.err, logs: sim.value.logs };
-        },
+        simulate: (tx) => simulateRoundTrip(config.rugCheckRpcUrl, fetcher, tx),
         loadTable: async (key) => (await connection.getAddressLookupTable(key)).value,
         findHolder: (candidate) => findSellingHolder(connection, candidate),
+        loadBuybackRecipient: async () => readBuybackRecipient((await connection.getAccountInfo(PUMP_AMM_GLOBAL))?.data),
       });
-      const decision = honeypotDecision(trace.result);
+      const code = trace.err != null && /^\d+$/.test(trace.err) ? Number(trace.err) : simulationErrorCode(trace.err);
+      const decision = honeypotDecision(trace.result, code);
       return { ...decision, simErr: trace.err, simLog: trace.log, pool: trace.pool };
     } catch {
       return { ok: false, reason: "honeypot_unsimulated", simErr: null, simLog: null, pool };
@@ -167,16 +235,23 @@ export async function assessSellability(input: {
   slippagePct: number;
   tradeUrl: string;
   tradeFetch?: typeof fetch;
-  simulate: (tx: VersionedTransaction) => Promise<{ err: unknown; logs: readonly string[] | null }>;
+  simulate: (tx: VersionedTransaction) => Promise<{
+    err: unknown;
+    logs: readonly string[] | null;
+    preTokenBalances?: readonly TokenBalanceChange[] | null;
+    postTokenBalances?: readonly TokenBalanceChange[] | null;
+  }>;
   loadTable?: (key: PublicKey) => Promise<AddressLookupTableAccount | null>;
   findHolder?: (mint: string) => Promise<string | null>;
+  loadBuybackRecipient?: () => Promise<PublicKey | null>;
 }): Promise<SellSimTrace> {
   const tradeFetch = input.tradeFetch ?? fetch;
+  const recipient = await input.loadBuybackRecipient?.().catch(() => null) ?? null;
   const buy = await fetchTrade(tradeFetch, input.tradeUrl, tradeBody(input, "buy"));
   if (buy.kind !== "tx") return finish(input.pool, buy.result, buy.err, null);
   const sell = await fetchTrade(tradeFetch, input.tradeUrl, tradeBody(input, "sell", SIM_PAYER));
   if (sell.kind !== "tx") return finish(input.pool, sell.result, sell.err, null);
-  const merged = await mergeRoundTrip(buy.tx, sell.tx, input.loadTable);
+  const merged = await mergeRoundTrip(buy.tx, sell.tx, input.loadTable, recipient);
   let simulated: { err: unknown; logs: readonly string[] | null } | null;
   try {
     simulated = merged ? await input.simulate(merged) : await simulateHolderSell(input, tradeFetch);
@@ -185,7 +260,51 @@ export async function assessSellability(input: {
     return finish(input.pool, "unsimulated", message.slice(0, 240), null);
   }
   if (!simulated) return finish(input.pool, "unsimulated", "round-trip-too-large", null);
-  return finish(input.pool, classifySellSimulation(simulated.err, simulated.logs), simulationErrorText(simulated.err), firstProgramLog(simulated.logs));
+  const result = sellExecuted(simulated) ? "ok" : classifySellSimulation(simulated.err, simulated.logs);
+  return finish(input.pool, result, simulationErrorText(simulated.err), firstProgramLog(simulated.logs));
+}
+
+async function simulateRoundTrip(
+  rpcUrl: string,
+  fetcher: typeof fetch,
+  tx: VersionedTransaction,
+): Promise<{
+  err: unknown;
+  logs: string[] | null;
+  preTokenBalances: TokenBalanceChange[] | null;
+  postTokenBalances: TokenBalanceChange[] | null;
+}> {
+  const response = await fetcher(rpcUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "simulateTransaction",
+      params: [
+        Buffer.from(tx.serialize()).toString("base64"),
+        { encoding: "base64", sigVerify: false, replaceRecentBlockhash: true, commitment: "processed" },
+      ],
+    }),
+  });
+  const payload = (await response.json()) as {
+    error?: { message?: string };
+    result?: { value?: {
+      err?: unknown;
+      logs?: string[] | null;
+      preTokenBalances?: TokenBalanceChange[] | null;
+      postTokenBalances?: TokenBalanceChange[] | null;
+    } };
+  };
+  if (payload.error) throw new Error(payload.error.message ?? "simulate-failed");
+  const value = payload.result?.value;
+  if (!value) throw new Error("simulate-empty");
+  return {
+    err: value.err ?? null,
+    logs: value.logs ?? null,
+    preTokenBalances: value.preTokenBalances ?? null,
+    postTokenBalances: value.postTokenBalances ?? null,
+  };
 }
 
 function tradeBody(
@@ -235,6 +354,7 @@ async function mergeRoundTrip(
   buy: VersionedTransaction,
   sell: VersionedTransaction,
   loadTable?: (key: PublicKey) => Promise<AddressLookupTableAccount | null>,
+  recipient?: PublicKey | null,
 ): Promise<VersionedTransaction | null> {
   const keys = new Map<string, PublicKey>();
   for (const tx of [buy, sell]) {
@@ -248,7 +368,8 @@ async function mergeRoundTrip(
   const buyIxs = TransactionMessage.decompile(buy.message, { addressLookupTableAccounts: tables }).instructions
     .filter((ix) => ix.programId.toBase58() !== COMPUTE_BUDGET);
   const sellIxs = TransactionMessage.decompile(sell.message, { addressLookupTableAccounts: tables }).instructions
-    .filter((ix) => ix.programId.toBase58() !== COMPUTE_BUDGET);
+    .filter((ix) => ix.programId.toBase58() !== COMPUTE_BUDGET)
+    .map((ix) => (recipient ? repairPumpAmmSell(ix, recipient) : ix));
   const sellTrade = sellIxs.filter((ix) => !INFRA_PROGRAMS.has(ix.programId.toBase58()));
   let lastBuyTrade = -1;
   for (let i = buyIxs.length - 1; i >= 0; i -= 1) {
@@ -293,7 +414,12 @@ async function simulateHolderSell(
     pool: "pump" | "pump-amm";
     slippagePct: number;
     tradeUrl: string;
-    simulate: (tx: VersionedTransaction) => Promise<{ err: unknown; logs: readonly string[] | null }>;
+    simulate: (tx: VersionedTransaction) => Promise<{
+      err: unknown;
+      logs: readonly string[] | null;
+      preTokenBalances?: readonly TokenBalanceChange[] | null;
+      postTokenBalances?: readonly TokenBalanceChange[] | null;
+    }>;
     findHolder?: (mint: string) => Promise<string | null>;
   },
   tradeFetch: typeof fetch,

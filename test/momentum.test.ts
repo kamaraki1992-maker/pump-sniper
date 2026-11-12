@@ -666,12 +666,12 @@ test("the kill switch persists the high-water mark and trips at a 25% drop", () 
 });
 
 test("a failed or missing honeypot simulation holds, and a pair needs a social or website", () => {
-  assert.equal(honeypotDecision("fail").reason, "honeypot");
+  assert.equal(honeypotDecision("fail", 6053).reason, "honeypot_sim_error:6053");
   assert.equal(honeypotDecision("unsimulated").reason, "honeypot_unsimulated");
   assert.equal(honeypotDecision("transfer-fee").reason, "transfer-fee");
   assert.equal(honeypotDecision("ok").ok, true);
-  assert.equal(honeypotDecision("no-balance").ok, true);
-  assert.equal(classifySellSimulation({ Custom: 1 }, ["insufficient funds"]), "no-balance");
+  assert.equal(honeypotDecision("no-balance", 3012).ok, false);
+  assert.equal(classifySellSimulation({ InstructionError: [3, { Custom: 1 }] }, ["insufficient funds"]), "fail");
   assert.equal(classifySellSimulation(null, ["TransferFee withheld"]), "transfer-fee");
   assert.equal(classifySellSimulation("Slippage", []), "fail");
   assert.equal(hasRequiredSocial({ websites: [{ url: "https://example.com" }] }), true);

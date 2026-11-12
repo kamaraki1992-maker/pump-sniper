@@ -10,6 +10,7 @@ import {
   classifySellSimulation,
   createHoneypotCheck,
   honeypotDecision,
+  sellExecuted,
   simulationErrorCode,
 } from "../src/momentum/honeypot.js";
 
@@ -39,7 +40,14 @@ test("a curve round trip that sells is not a honeypot, and a PumpSwap mint uses 
     slippagePct: 15,
     tradeUrl: "https://trade.example/api/trade-local",
     tradeFetch: tradeFetch(curveBodies),
-    simulate: async () => ({ err: null, logs: ["Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success"] }),
+    simulate: async () => ({
+      err: null,
+      logs: [
+        "Program log: Instruction: Sell",
+        "Program log: Instruction: TransferChecked",
+        "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success",
+      ],
+    }),
   });
   assert.equal(curve.result, "ok");
   assert.equal(honeypotDecision(curve.result).ok, true);
@@ -54,7 +62,14 @@ test("a curve round trip that sells is not a honeypot, and a PumpSwap mint uses 
     slippagePct: 15,
     tradeUrl: "https://trade.example/api/trade-local",
     tradeFetch: tradeFetch(ammBodies),
-    simulate: async () => ({ err: null, logs: ["Program pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA success"] }),
+    simulate: async () => ({
+      err: null,
+      logs: [
+        "Program log: Instruction: Sell",
+        "Program log: Instruction: TransferChecked",
+        "Program pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA success",
+      ],
+    }),
   });
   assert.equal(amm.result, "ok");
   assert.equal(amm.pool, "pump-amm");
@@ -65,12 +80,19 @@ test("a reverting sell is a honeypot and a missing ATA is not", () => {
   const frozen = { InstructionError: [4, { Custom: 17 }] };
   assert.equal(simulationErrorCode(frozen), 17);
   assert.equal(classifySellSimulation(frozen, ["Program log: Account is frozen"]), "fail");
-  assert.equal(honeypotDecision("fail").reason, "honeypot");
+  assert.equal(honeypotDecision("fail", 17).reason, "honeypot_sim_error:17");
+  const buyback = { InstructionError: [2, { Custom: 6053 }] };
+  assert.equal(simulationErrorCode(buyback), 6053);
+  assert.equal(classifySellSimulation(buyback, ["Program log: BuybackFeeRecipientNotAuthorized", "user_base_token_account"]), "fail");
+  assert.equal(honeypotDecision("fail", 6053).ok, false);
+  assert.equal(honeypotDecision("fail", 6053).reason, "honeypot_sim_error:6053");
+  assert.equal(sellExecuted({ err: buyback, logs: ["Program log: Instruction: Sell"] }), false);
 
   const missing = { InstructionError: [3, { Custom: 3012 }] };
   const logs = ["Program log: AnchorError caused by account: associated_base_user. Error Code: AccountNotInitialized. Error Number: 3012."];
   assert.equal(classifySellSimulation(missing, logs), "no-balance");
-  assert.equal(honeypotDecision("no-balance").ok, true);
+  assert.equal(honeypotDecision("no-balance", 3012).ok, false);
+  assert.equal(honeypotDecision("no-balance", 3012).reason, "honeypot_sim_error:3012");
   assert.equal(classifySellSimulation(null, ["TransferFee withheld"]), "transfer-fee");
 });
 
@@ -89,7 +111,8 @@ test("a round trip that reverts is blocked, and a builder timeout stays fail-clo
   assert.equal(reverted.result, "fail");
   assert.equal(reverted.err, "6000");
   assert.match(reverted.log ?? "", /SellDisabled/);
-  assert.equal(honeypotDecision(reverted.result).reason, "honeypot");
+  assert.equal(honeypotDecision(reverted.result, 6000).reason, "honeypot_sim_error:6000");
+  assert.equal(honeypotDecision(reverted.result, 6000).ok, false);
 
   const dir = mkdtempSync(join(tmpdir(), "honeypot-"));
   const config = loadConfig({
