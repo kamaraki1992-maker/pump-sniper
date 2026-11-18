@@ -3,14 +3,17 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { Keypair, SystemProgram, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
+import { Keypair, PublicKey, SystemProgram, TransactionInstruction, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import { loadConfig } from "../src/config.js";
 import {
   assessSellability,
   classifySellSimulation,
   createHoneypotCheck,
+  formatRpcError,
   honeypotDecision,
+  repairPumpAmmSell,
   sellExecuted,
+  simulateRoundTrip,
   simulationErrorCode,
 } from "../src/momentum/honeypot.js";
 
@@ -129,7 +132,55 @@ test("a round trip that reverts is blocked, and a builder timeout stays fail-clo
     const verdict = await createHoneypotCheck(config)("MintTimeout", "pump");
     assert.equal(verdict.ok, false);
     assert.equal(verdict.reason, "honeypot_unsimulated");
+    assert.match(verdict.simErr ?? "", /timed out/);
   } finally {
     globalThis.fetch = previous;
   }
+});
+
+test("an RPC internal error is retried, and the buyback wallet is account 21", async () => {
+  assert.equal(formatRpcError({ code: -32603, message: "Internal error", data: { err: "lookup table" } }), "-32603 Internal error {\"err\":\"lookup table\"}");
+  const payer = Keypair.generate();
+  const message = new TransactionMessage({
+    payerKey: payer.publicKey,
+    recentBlockhash: "11111111111111111111111111111111",
+    instructions: [SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: payer.publicKey, lamports: 0 })],
+  }).compileToV0Message();
+  const tx = new VersionedTransaction(message);
+  const calls: string[] = [];
+  const fetcher: typeof fetch = async (url, init) => {
+    const body = JSON.parse(String(init?.body)) as { method?: string; params?: unknown[] };
+    calls.push(`${url} ${body.method}`);
+    if (String(url).includes("rug") && body.method === "simulateTransaction") {
+      return Response.json({ jsonrpc: "2.0", id: 1, error: { code: -32603, message: "Internal error", data: "flux rejected the round trip" } });
+    }
+    if (body.method === "getLatestBlockhash") {
+      return Response.json({ jsonrpc: "2.0", id: 1, result: { value: { blockhash: "11111111111111111111111111111111" } } });
+    }
+    return Response.json({
+      jsonrpc: "2.0",
+      id: 1,
+      result: {
+        value: {
+          err: null,
+          logs: [
+            "Program log: Instruction: Sell",
+            "Program log: Instruction: TransferChecked",
+            "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success",
+          ],
+        },
+      },
+    });
+  };
+  const sim = await simulateRoundTrip(["https://rug.example", "https://rpc.example"], fetcher, tx);
+  assert.equal(sim.err, null);
+  assert.ok(calls.some((call) => call.includes("rug.example")));
+  assert.ok(calls.some((call) => call.includes("rpc.example")));
+
+  const program = new PublicKey("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
+  const recipient = Keypair.generate().publicKey;
+  const keys = Array.from({ length: 24 }, () => ({ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: false }));
+  const repaired = repairPumpAmmSell(new TransactionInstruction({ programId: program, keys, data: Buffer.from([1]) }), recipient);
+  assert.equal(repaired.keys[21]?.pubkey.toBase58(), recipient.toBase58());
+  assert.equal(repaired.keys[22]?.isWritable, true);
 });

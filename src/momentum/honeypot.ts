@@ -210,7 +210,7 @@ export function createHoneypotCheck(
         pool,
         slippagePct: config.sellSlippagePct,
         tradeUrl: `${origin}/api/trade-local`,
-        simulate: (tx) => simulateRoundTrip(config.rugCheckRpcUrl, fetcher, tx),
+        simulate: (tx) => simulateRoundTrip([config.rugCheckRpcUrl, config.rpcUrl], fetcher, tx),
         loadTable: async (key) => (await connection.getAddressLookupTable(key)).value,
         findHolder: (candidate) => findSellingHolder(connection, candidate),
         loadBuybackRecipient: async () => readBuybackRecipient((await connection.getAccountInfo(PUMP_AMM_GLOBAL))?.data),
@@ -218,8 +218,9 @@ export function createHoneypotCheck(
       const code = trace.err != null && /^\d+$/.test(trace.err) ? Number(trace.err) : simulationErrorCode(trace.err);
       const decision = honeypotDecision(trace.result, code);
       return { ...decision, simErr: trace.err, simLog: trace.log, pool: trace.pool };
-    } catch {
-      return { ok: false, reason: "honeypot_unsimulated", simErr: null, simLog: null, pool };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "simulate-failed";
+      return { ok: false, reason: "honeypot_unsimulated", simErr: message.slice(0, 240), simLog: null, pool };
     }
   };
 }
@@ -264,47 +265,110 @@ export async function assessSellability(input: {
   return finish(input.pool, result, simulationErrorText(simulated.err), firstProgramLog(simulated.logs));
 }
 
-async function simulateRoundTrip(
+interface RpcSimValue {
+  err: unknown;
+  logs: string[] | null;
+  preTokenBalances?: TokenBalanceChange[] | null;
+  postTokenBalances?: TokenBalanceChange[] | null;
+}
+
+/** Keep the JSON-RPC code and the provider's data field, not just "Internal error". */
+export function formatRpcError(error: { code?: number; message?: string; data?: unknown } | undefined): string {
+  if (!error) return "simulate-failed";
+  const data = error.data == null ? "" : typeof error.data === "string" ? error.data : JSON.stringify(error.data);
+  return `${error.code ?? ""} ${error.message ?? "simulate-failed"} ${data}`.replace(/\s+/g, " ").trim().slice(0, 240);
+}
+
+/**
+ * Some providers (FluxRPC in the paper run) answer simulateTransaction with
+ * JSON-RPC -32603 for a versioned buy+sell. A real blockhash without
+ * replaceRecentBlockhash, then the main RPC, are the retries.
+ */
+export async function simulateRoundTrip(
+  rpcUrls: readonly string[],
+  fetcher: typeof fetch,
+  tx: VersionedTransaction,
+): Promise<RpcSimValue> {
+  const urls = [...new Set(rpcUrls.filter((url) => url.length > 0))];
+  let last = "simulate-failed";
+  for (const url of urls) {
+    const first = await postSimulate(url, fetcher, tx, true);
+    if (first.ok) return first.value;
+    last = first.error;
+    const blockhash = await latestBlockhash(url, fetcher);
+    if (blockhash) {
+      tx.message.recentBlockhash = blockhash;
+      const second = await postSimulate(url, fetcher, tx, false);
+      if (second.ok) return second.value;
+      last = second.error;
+    }
+  }
+  throw new Error(last);
+}
+
+async function postSimulate(
   rpcUrl: string,
   fetcher: typeof fetch,
   tx: VersionedTransaction,
-): Promise<{
-  err: unknown;
-  logs: string[] | null;
-  preTokenBalances: TokenBalanceChange[] | null;
-  postTokenBalances: TokenBalanceChange[] | null;
-}> {
-  const response = await fetcher(rpcUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "simulateTransaction",
-      params: [
-        Buffer.from(tx.serialize()).toString("base64"),
-        { encoding: "base64", sigVerify: false, replaceRecentBlockhash: true, commitment: "processed" },
-      ],
-    }),
-  });
-  const payload = (await response.json()) as {
-    error?: { message?: string };
-    result?: { value?: {
-      err?: unknown;
-      logs?: string[] | null;
-      preTokenBalances?: TokenBalanceChange[] | null;
-      postTokenBalances?: TokenBalanceChange[] | null;
-    } };
-  };
-  if (payload.error) throw new Error(payload.error.message ?? "simulate-failed");
-  const value = payload.result?.value;
-  if (!value) throw new Error("simulate-empty");
-  return {
-    err: value.err ?? null,
-    logs: value.logs ?? null,
-    preTokenBalances: value.preTokenBalances ?? null,
-    postTokenBalances: value.postTokenBalances ?? null,
-  };
+  replaceRecentBlockhash: boolean,
+): Promise<{ ok: true; value: RpcSimValue } | { ok: false; error: string }> {
+  try {
+    const response = await fetcher(rpcUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "simulateTransaction",
+        params: [
+          Buffer.from(tx.serialize()).toString("base64"),
+          {
+            encoding: "base64",
+            sigVerify: false,
+            commitment: "processed",
+            ...(replaceRecentBlockhash ? { replaceRecentBlockhash: true } : {}),
+          },
+        ],
+      }),
+    });
+    const payload = (await response.json()) as {
+      error?: { code?: number; message?: string; data?: unknown };
+      result?: { value?: RpcSimValue };
+    };
+    if (payload.error || !payload.result?.value) return { ok: false, error: formatRpcError(payload.error) };
+    const value = payload.result.value;
+    return {
+      ok: true,
+      value: {
+        err: value.err ?? null,
+        logs: value.logs ?? null,
+        preTokenBalances: value.preTokenBalances ?? null,
+        postTokenBalances: value.postTokenBalances ?? null,
+      },
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "simulate-failed";
+    return { ok: false, error: message.slice(0, 240) };
+  }
+}
+
+async function latestBlockhash(rpcUrl: string, fetcher: typeof fetch): Promise<string | null> {
+  try {
+    const response = await fetcher(rpcUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getLatestBlockhash",
+        params: [{ commitment: "processed" }],
+      }),
+    });
+    const payload = (await response.json()) as { result?: { value?: { blockhash?: string } } };
+    return payload.result?.value?.blockhash ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function tradeBody(
