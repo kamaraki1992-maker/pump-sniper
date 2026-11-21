@@ -399,6 +399,20 @@ function attachScalp(runtime: Runtime, runner: ScalpRunner): LiveStream | null {
   const stream = new HeliusFeed(runtime.config.rpcWsUrl, runtime.log, {
     stallMs: runtime.config.feedStallSec * 1000,
     pumpSwap: true,
+    ...(runtime.config.mode === "paper"
+      ? {
+          fallback: {
+            open: (onEvent) => {
+              const backup = new PumpDevStream(runtime.config.wsUrl, runtime.log, undefined, undefined, {
+                feed: "pumpdev",
+                apiKey: process.env.PUMPDEV_API_KEY?.trim() || null,
+              });
+              backup.start(onEvent);
+              return backup;
+            },
+          },
+        }
+      : {}),
   });
   runtime.subscription.stream = stream;
   runtime.log.info("stream", { source: "helius", feed: "scalp" });
