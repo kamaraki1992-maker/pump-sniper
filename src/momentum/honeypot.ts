@@ -62,6 +62,8 @@ export interface SellSimTrace {
   /** First program log that is not the compute-budget program. */
   log: string | null;
   pool: "pump" | "pump-amm";
+  /** Which simulate attempt returned: first pass, no-replace retry, or RPC_URL fallback. */
+  attempt: string | null;
 }
 
 /** Numeric Anchor / program error, when the simulation err carries one. */
@@ -160,6 +162,56 @@ export function repairPumpAmmSell(ix: TransactionInstruction, recipient: PublicK
   return new TransactionInstruction({ programId: ix.programId, keys, data: ix.data });
 }
 
+/** Creator pubkey on the bonding-curve account, 32 bytes at offset 49. */
+export function readCurveCreator(data: Uint8Array | Buffer | undefined): PublicKey | null {
+  if (!data || data.length < 81) return null;
+  const key = new PublicKey(data.subarray(49, 81));
+  if (key.equals(PublicKey.default)) return null;
+  return key;
+}
+
+/** `["creator-vault", creator]` on the pump curve program. */
+export function creatorVaultPda(creator: PublicKey): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("creator-vault"), creator.toBuffer()],
+    new PublicKey(PUMP_CURVE),
+  )[0];
+}
+
+/**
+ * Trade-local sometimes keeps a creator_vault PDA from an old creator.
+ * Anchor then fails the seeds check with 2006. Swap that PDA, and the raw
+ * creator key it was derived from, for the creator stored on the curve.
+ */
+export function repairPumpCreatorVault(ix: TransactionInstruction, creator: PublicKey): TransactionInstruction {
+  const program = new PublicKey(PUMP_CURVE);
+  if (!ix.programId.equals(program)) return ix;
+  const expected = creatorVaultPda(creator);
+  const keys = ix.keys.map((key) => ({ pubkey: key.pubkey, isSigner: key.isSigner, isWritable: key.isWritable }));
+  if (keys.some((key) => key.pubkey.equals(expected))) return ix;
+  let vaultIndex = -1;
+  let creatorIndex = -1;
+  for (let i = 0; i < keys.length; i += 1) {
+    for (let j = 0; j < keys.length; j += 1) {
+      if (i === j) continue;
+      if (creatorVaultPda(keys[j]!.pubkey).equals(keys[i]!.pubkey)) {
+        vaultIndex = i;
+        creatorIndex = j;
+        break;
+      }
+    }
+    if (vaultIndex >= 0) break;
+  }
+  if (vaultIndex < 0) return ix;
+  const vaultMeta = keys[vaultIndex]!;
+  keys[vaultIndex] = { pubkey: expected, isSigner: vaultMeta.isSigner, isWritable: vaultMeta.isWritable };
+  if (creatorIndex >= 0) {
+    const creatorMeta = keys[creatorIndex]!;
+    keys[creatorIndex] = { pubkey: creator, isSigner: creatorMeta.isSigner, isWritable: creatorMeta.isWritable };
+  }
+  return new TransactionInstruction({ programId: ix.programId, keys, data: ix.data });
+}
+
 export function hasRequiredSocial(info: unknown): boolean {
   if (!info || typeof info !== "object") return false;
   const record = info as { socials?: unknown; websites?: unknown };
@@ -190,6 +242,7 @@ export interface HoneypotVerdict {
   reason: string | null;
   simErr: string | null;
   simLog: string | null;
+  simAttempt: string | null;
   pool: "pump" | "pump-amm" | null;
 }
 
@@ -210,17 +263,18 @@ export function createHoneypotCheck(
         pool,
         slippagePct: config.sellSlippagePct,
         tradeUrl: `${origin}/api/trade-local`,
-        simulate: (tx) => simulateRoundTrip([config.rugCheckRpcUrl, config.rpcUrl], fetcher, tx),
+        simulate: (tx) => simulateRoundTrip([config.rugCheckRpcUrl, config.rpcUrl], fetcher, tx, Date.now() + config.scalpSimTimeoutMs),
         loadTable: async (key) => (await connection.getAddressLookupTable(key)).value,
         findHolder: (candidate) => findSellingHolder(connection, candidate),
         loadBuybackRecipient: async () => readBuybackRecipient((await connection.getAccountInfo(PUMP_AMM_GLOBAL))?.data),
+        loadCurveCreator: (mint) => loadCurveCreator(connection, mint),
       });
       const code = trace.err != null && /^\d+$/.test(trace.err) ? Number(trace.err) : simulationErrorCode(trace.err);
       const decision = honeypotDecision(trace.result, code);
-      return { ...decision, simErr: trace.err, simLog: trace.log, pool: trace.pool };
+      return { ...decision, simErr: trace.err, simLog: trace.log, simAttempt: trace.attempt, pool: trace.pool };
     } catch (error) {
       const message = error instanceof Error ? error.message : "simulate-failed";
-      return { ok: false, reason: "honeypot_unsimulated", simErr: message.slice(0, 240), simLog: null, pool };
+      return { ok: false, reason: "honeypot_unsimulated", simErr: message.slice(0, 240), simLog: null, simAttempt: null, pool };
     }
   };
 }
@@ -245,24 +299,29 @@ export async function assessSellability(input: {
   loadTable?: (key: PublicKey) => Promise<AddressLookupTableAccount | null>;
   findHolder?: (mint: string) => Promise<string | null>;
   loadBuybackRecipient?: () => Promise<PublicKey | null>;
+  /** Bonding-curve creator, read once per mint. */
+  loadCurveCreator?: (mint: string) => Promise<PublicKey | null>;
 }): Promise<SellSimTrace> {
   const tradeFetch = input.tradeFetch ?? fetch;
   const recipient = await input.loadBuybackRecipient?.().catch(() => null) ?? null;
+  const creator = await input.loadCurveCreator?.(input.mint).catch(() => null) ?? null;
   const buy = await fetchTrade(tradeFetch, input.tradeUrl, tradeBody(input, "buy"));
-  if (buy.kind !== "tx") return finish(input.pool, buy.result, buy.err, null);
+  if (buy.kind !== "tx") return finish(input.pool, buy.result, buy.err, null, null);
   const sell = await fetchTrade(tradeFetch, input.tradeUrl, tradeBody(input, "sell", SIM_PAYER));
-  if (sell.kind !== "tx") return finish(input.pool, sell.result, sell.err, null);
-  const merged = await mergeRoundTrip(buy.tx, sell.tx, input.loadTable, recipient);
-  let simulated: { err: unknown; logs: readonly string[] | null } | null;
+  if (sell.kind !== "tx") return finish(input.pool, sell.result, sell.err, null, null);
+  const merged = await mergeRoundTrip(buy.tx, sell.tx, input.loadTable, recipient, creator);
+  let simulated: { err: unknown; logs: readonly string[] | null; attempt?: string | null } | null;
   try {
-    simulated = merged ? await input.simulate(merged) : await simulateHolderSell(input, tradeFetch);
+    simulated = merged
+      ? await input.simulate(merged)
+      : await simulateHolderSell(input, tradeFetch, input.loadTable, recipient, creator);
   } catch (error) {
     const message = error instanceof Error ? error.message : "simulate-failed";
-    return finish(input.pool, "unsimulated", message.slice(0, 240), null);
+    return finish(input.pool, "unsimulated", message.slice(0, 240), null, null);
   }
-  if (!simulated) return finish(input.pool, "unsimulated", "round-trip-too-large", null);
+  if (!simulated) return finish(input.pool, "unsimulated", "round-trip-too-large", null, null);
   const result = sellExecuted(simulated) ? "ok" : classifySellSimulation(simulated.err, simulated.logs);
-  return finish(input.pool, result, simulationErrorText(simulated.err), firstProgramLog(simulated.logs));
+  return finish(input.pool, result, simulationErrorText(simulated.err), firstProgramLog(simulated.logs), simulated.attempt ?? null);
 }
 
 interface RpcSimValue {
@@ -288,22 +347,28 @@ export async function simulateRoundTrip(
   rpcUrls: readonly string[],
   fetcher: typeof fetch,
   tx: VersionedTransaction,
-): Promise<RpcSimValue> {
+  deadlineMs = Date.now() + 3_000,
+): Promise<RpcSimValue & { attempt: string }> {
   const urls = [...new Set(rpcUrls.filter((url) => url.length > 0))];
   let last = "simulate-failed";
-  for (const url of urls) {
-    const first = await postSimulate(url, fetcher, tx, true);
-    if (first.ok) return first.value;
+  for (let index = 0; index < urls.length; index += 1) {
+    const url = urls[index]!;
+    const first = await postSimulate(url, fetcher, tx, true, deadlineMs);
+    if (first.ok) return { ...first.value, attempt: index === 0 ? "first pass" : "RPC_URL fallback" };
     last = first.error;
     const blockhash = await latestBlockhash(url, fetcher);
     if (blockhash) {
       tx.message.recentBlockhash = blockhash;
-      const second = await postSimulate(url, fetcher, tx, false);
-      if (second.ok) return second.value;
+      const second = await postSimulate(url, fetcher, tx, false, deadlineMs);
+      if (second.ok) return { ...second.value, attempt: index === 0 ? "no-replace retry" : "RPC_URL fallback" };
       last = second.error;
     }
   }
   throw new Error(last);
+}
+
+function rateLimited(status: number, error: string): boolean {
+  return status === 429 || /rate limit exceeded|\b429\b/i.test(error);
 }
 
 async function postSimulate(
@@ -311,7 +376,31 @@ async function postSimulate(
   fetcher: typeof fetch,
   tx: VersionedTransaction,
   replaceRecentBlockhash: boolean,
+  deadlineMs: number,
 ): Promise<{ ok: true; value: RpcSimValue } | { ok: false; error: string }> {
+  const waits = [0, 200, 400];
+  let last = "simulate-failed";
+  for (let attempt = 0; attempt < waits.length; attempt += 1) {
+    if (attempt > 0) {
+      const wait = waits[attempt]!;
+      if (Date.now() + wait >= deadlineMs) return { ok: false, error: last };
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+    if (Date.now() >= deadlineMs) return { ok: false, error: last };
+    const once = await postSimulateOnce(rpcUrl, fetcher, tx, replaceRecentBlockhash);
+    if (once.ok) return once;
+    last = once.error;
+    if (!once.rateLimited || attempt === waits.length - 1) return once;
+  }
+  return { ok: false, error: last };
+}
+
+async function postSimulateOnce(
+  rpcUrl: string,
+  fetcher: typeof fetch,
+  tx: VersionedTransaction,
+  replaceRecentBlockhash: boolean,
+): Promise<{ ok: true; value: RpcSimValue } | { ok: false; error: string; rateLimited: boolean }> {
   try {
     const response = await fetcher(rpcUrl, {
       method: "POST",
@@ -331,11 +420,19 @@ async function postSimulate(
         ],
       }),
     });
+    if (response.status === 429) {
+      const text = await response.text();
+      const error = `429 ${text}`.slice(0, 240);
+      return { ok: false, error, rateLimited: true };
+    }
     const payload = (await response.json()) as {
       error?: { code?: number; message?: string; data?: unknown };
       result?: { value?: RpcSimValue };
     };
-    if (payload.error || !payload.result?.value) return { ok: false, error: formatRpcError(payload.error) };
+    if (payload.error || !payload.result?.value) {
+      const error = formatRpcError(payload.error);
+      return { ok: false, error, rateLimited: rateLimited(response.status, error) };
+    }
     const value = payload.result.value;
     return {
       ok: true,
@@ -348,7 +445,8 @@ async function postSimulate(
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : "simulate-failed";
-    return { ok: false, error: message.slice(0, 240) };
+    const text = message.slice(0, 240);
+    return { ok: false, error: text, rateLimited: rateLimited(0, text) };
   }
 }
 
@@ -414,11 +512,19 @@ async function fetchTrade(tradeFetch: typeof fetch, url: string, body: Record<st
   }
 }
 
+function repairInstruction(ix: TransactionInstruction, recipient: PublicKey | null, creator: PublicKey | null): TransactionInstruction {
+  let next = ix;
+  if (recipient) next = repairPumpAmmSell(next, recipient);
+  if (creator) next = repairPumpCreatorVault(next, creator);
+  return next;
+}
+
 async function mergeRoundTrip(
   buy: VersionedTransaction,
   sell: VersionedTransaction,
   loadTable?: (key: PublicKey) => Promise<AddressLookupTableAccount | null>,
   recipient?: PublicKey | null,
+  creator?: PublicKey | null,
 ): Promise<VersionedTransaction | null> {
   const keys = new Map<string, PublicKey>();
   for (const tx of [buy, sell]) {
@@ -430,10 +536,11 @@ async function mergeRoundTrip(
     if (table) tables.push(table);
   }
   const buyIxs = TransactionMessage.decompile(buy.message, { addressLookupTableAccounts: tables }).instructions
-    .filter((ix) => ix.programId.toBase58() !== COMPUTE_BUDGET);
+    .filter((ix) => ix.programId.toBase58() !== COMPUTE_BUDGET)
+    .map((ix) => repairInstruction(ix, recipient ?? null, creator ?? null));
   const sellIxs = TransactionMessage.decompile(sell.message, { addressLookupTableAccounts: tables }).instructions
     .filter((ix) => ix.programId.toBase58() !== COMPUTE_BUDGET)
-    .map((ix) => (recipient ? repairPumpAmmSell(ix, recipient) : ix));
+    .map((ix) => repairInstruction(ix, recipient ?? null, creator ?? null));
   const sellTrade = sellIxs.filter((ix) => !INFRA_PROGRAMS.has(ix.programId.toBase58()));
   let lastBuyTrade = -1;
   for (let i = buyIxs.length - 1; i >= 0; i -= 1) {
@@ -483,16 +590,36 @@ async function simulateHolderSell(
       logs: readonly string[] | null;
       preTokenBalances?: readonly TokenBalanceChange[] | null;
       postTokenBalances?: readonly TokenBalanceChange[] | null;
+      attempt?: string | null;
     }>;
     findHolder?: (mint: string) => Promise<string | null>;
   },
   tradeFetch: typeof fetch,
-): Promise<{ err: unknown; logs: readonly string[] | null } | null> {
+  loadTable?: (key: PublicKey) => Promise<AddressLookupTableAccount | null>,
+  recipient?: PublicKey | null,
+  creator?: PublicKey | null,
+): Promise<{ err: unknown; logs: readonly string[] | null; attempt?: string | null } | null> {
   const holder = await input.findHolder?.(input.mint).catch(() => null);
   if (!holder) return null;
   const sell = await fetchTrade(tradeFetch, input.tradeUrl, tradeBody(input, "sell", holder));
   if (sell.kind !== "tx") return { err: sell.err, logs: sell.err ? [sell.err] : null };
-  return input.simulate(sell.tx);
+  const repaired = await mergeRoundTrip(sell.tx, sell.tx, loadTable, recipient, creator);
+  return input.simulate(repaired ?? sell.tx);
+}
+
+async function loadCurveCreator(connection: Connection, mint: string): Promise<PublicKey | null> {
+  let mintKey: PublicKey;
+  try {
+    mintKey = new PublicKey(mint);
+  } catch {
+    return null;
+  }
+  const [curve] = PublicKey.findProgramAddressSync(
+    [Buffer.from("bonding-curve"), mintKey.toBuffer()],
+    new PublicKey(PUMP_CURVE),
+  );
+  const info = await connection.getAccountInfo(curve);
+  return readCurveCreator(info?.data);
 }
 
 /** A wallet that actually holds the mint, so a sell is not rejected for a missing ATA. */
@@ -525,6 +652,12 @@ function simulationErrorText(err: unknown): string | null {
   return code != null ? String(code) : JSON.stringify(err).slice(0, 240);
 }
 
-function finish(pool: "pump" | "pump-amm", result: SellSim, err: string | null, log: string | null): SellSimTrace {
-  return { result, err, log, pool };
+function finish(
+  pool: "pump" | "pump-amm",
+  result: SellSim,
+  err: string | null,
+  log: string | null,
+  attempt: string | null,
+): SellSimTrace {
+  return { result, err, log, pool, attempt };
 }

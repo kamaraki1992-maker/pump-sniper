@@ -9,9 +9,11 @@ import {
   assessSellability,
   classifySellSimulation,
   createHoneypotCheck,
+  creatorVaultPda,
   formatRpcError,
   honeypotDecision,
   repairPumpAmmSell,
+  repairPumpCreatorVault,
   sellExecuted,
   simulateRoundTrip,
   simulationErrorCode,
@@ -183,4 +185,108 @@ test("an RPC internal error is retried, and the buyback wallet is account 21", a
   const repaired = repairPumpAmmSell(new TransactionInstruction({ programId: program, keys, data: Buffer.from([1]) }), recipient);
   assert.equal(repaired.keys[21]?.pubkey.toBase58(), recipient.toBase58());
   assert.equal(repaired.keys[22]?.isWritable, true);
+});
+
+test("a stale creator_vault is rewritten, and 2006 stays a skip until the sell runs", async () => {
+  const program = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+  const creator = Keypair.generate().publicKey;
+  const stale = Keypair.generate().publicKey;
+  const staleVault = creatorVaultPda(stale);
+  const expected = creatorVaultPda(creator);
+  const keys = Array.from({ length: 20 }, () => ({
+    pubkey: Keypair.generate().publicKey,
+    isSigner: false,
+    isWritable: false,
+  }));
+  keys[16] = { pubkey: staleVault, isSigner: false, isWritable: true };
+  keys[18] = { pubkey: stale, isSigner: false, isWritable: false };
+  const repaired = repairPumpCreatorVault(
+    new TransactionInstruction({ programId: program, keys, data: Buffer.from([1]) }),
+    creator,
+  );
+  assert.equal(repaired.keys[16]?.pubkey.toBase58(), expected.toBase58());
+  assert.equal(repaired.keys[18]?.pubkey.toBase58(), creator.toBase58());
+
+  const payer = Keypair.generate();
+  const bytes = new VersionedTransaction(new TransactionMessage({
+    payerKey: payer.publicKey,
+    recentBlockhash: "11111111111111111111111111111111",
+    instructions: [new TransactionInstruction({ programId: program, keys, data: Buffer.from([1]) })],
+  }).compileToV0Message()).serialize();
+  const tradeFetch: typeof fetch = async () => new Response(Buffer.from(bytes));
+  const sold = {
+    err: null,
+    logs: [
+      "Program log: Instruction: Sell",
+      "Program log: Instruction: TransferChecked",
+      "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success",
+    ],
+  };
+  const broken = { err: { InstructionError: [1, { Custom: 2006 }] }, logs: ["Program log: ConstraintSeeds"] };
+  const simulate = async (tx: VersionedTransaction) => {
+    const present = tx.message.staticAccountKeys.some((key) => key.equals(expected));
+    return present ? sold : broken;
+  };
+  const fixed = await assessSellability({
+    mint: Keypair.generate().publicKey.toBase58(),
+    pool: "pump",
+    slippagePct: 15,
+    tradeUrl: "https://trade.example/api/trade-local",
+    tradeFetch,
+    simulate,
+    loadCurveCreator: async () => creator,
+  });
+  assert.equal(fixed.result, "ok");
+  assert.equal(honeypotDecision(fixed.result).ok, true);
+  const raw = await assessSellability({
+    mint: Keypair.generate().publicKey.toBase58(),
+    pool: "pump",
+    slippagePct: 15,
+    tradeUrl: "https://trade.example/api/trade-local",
+    tradeFetch,
+    simulate,
+  });
+  assert.equal(raw.result, "fail");
+  assert.equal(raw.err, "2006");
+  assert.equal(honeypotDecision(raw.result, 2006).ok, false);
+  assert.equal(honeypotDecision(raw.result, 2006).reason, "honeypot_sim_error:2006");
+});
+
+test("a 429 is retried inside the sim budget and then fails closed", async () => {
+  const payer = Keypair.generate();
+  const tx = new VersionedTransaction(new TransactionMessage({
+    payerKey: payer.publicKey,
+    recentBlockhash: "11111111111111111111111111111111",
+    instructions: [SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: payer.publicKey, lamports: 0 })],
+  }).compileToV0Message());
+  let calls = 0;
+  const started = Date.now();
+  const fetcher: typeof fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as { method?: string };
+    if (body.method === "getLatestBlockhash") {
+      return Response.json({ jsonrpc: "2.0", id: 1, result: { value: { blockhash: "11111111111111111111111111111111" } } });
+    }
+    calls += 1;
+    if (calls < 3) return new Response("rate limit exceeded", { status: 429 });
+    return Response.json({ jsonrpc: "2.0", id: 1, result: { value: { err: null, logs: [] } } });
+  };
+  const sim = await simulateRoundTrip(["https://rpc.example"], fetcher, tx, Date.now() + 5_000);
+  assert.equal(sim.err, null);
+  assert.equal(sim.attempt, "first pass");
+  assert.equal(calls, 3);
+  assert.ok(Date.now() - started >= 500);
+
+  const tightStart = Date.now();
+  let tightCalls = 0;
+  const tightFetch: typeof fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as { method?: string };
+    if (body.method !== "simulateTransaction") {
+      return Response.json({ jsonrpc: "2.0", id: 1, result: { value: null } });
+    }
+    tightCalls += 1;
+    return new Response("429 rate limit exceeded", { status: 429 });
+  };
+  await assert.rejects(() => simulateRoundTrip(["https://rpc.example"], tightFetch, tx, Date.now() + 50));
+  assert.equal(tightCalls, 1);
+  assert.ok(Date.now() - tightStart < 250);
 });

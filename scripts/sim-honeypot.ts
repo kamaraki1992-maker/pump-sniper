@@ -42,6 +42,7 @@ for (const job of jobs) {
     reason: verdict.reason,
     simErr: verdict.simErr,
     simLog: verdict.simLog,
+    simAttempt: verdict.simAttempt,
     ms: Date.now() - started,
   }));
 }

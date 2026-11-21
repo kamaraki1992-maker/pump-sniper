@@ -23,6 +23,7 @@ export interface ScalpSimResult {
   simMs: number;
   simErr: string | null;
   simLog: string | null;
+  simAttempt: string | null;
 }
 
 interface SafetySlot {
@@ -47,7 +48,7 @@ export interface ScalpGateOptions {
   honeypot?: (
     mint: string,
     pool?: "pump" | "pump-amm",
-  ) => Promise<{ ok: boolean; reason: string | null; simErr?: string | null; simLog?: string | null }>;
+  ) => Promise<{ ok: boolean; reason: string | null; simErr?: string | null; simLog?: string | null; simAttempt?: string | null }>;
   chain?: (mint: string, creator: string | null) => Promise<ChainFacts>;
 }
 
@@ -80,6 +81,7 @@ export function createScalpGate(
         simMs: Math.max(0, now() - started),
         simErr: "simErr" in result ? result.simErr ?? null : null,
         simLog: "simLog" in result ? result.simLog ?? null : null,
+        simAttempt: "simAttempt" in result ? result.simAttempt ?? null : null,
       };
     });
   };
@@ -104,7 +106,7 @@ export function createScalpGate(
       pool: hint.pool,
       pair: Promise.resolve(null),
       chain: Promise.resolve(null),
-      honey: Promise.resolve({ ok: false, reason: "honeypot_unsimulated", simMs: 0, simErr: null, simLog: null }),
+      honey: Promise.resolve({ ok: false, reason: "honeypot_unsimulated", simMs: 0, simErr: null, simLog: null, simAttempt: null }),
       honeySettled: false,
     };
     slot.pair = loadPair(mint);
@@ -130,6 +132,7 @@ export function createScalpGate(
         reason: honey.reason,
         simErr: honey.simErr,
         simLog: honey.simLog,
+        simAttempt: honey.simAttempt,
       });
       if (!chainFacts) return "timeout";
       const ageMs = hint.ageMs ?? (pair?.pairCreatedAtMs != null ? now() - pair.pairCreatedAtMs : null);
