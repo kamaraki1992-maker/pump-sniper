@@ -119,6 +119,30 @@ test("a sim that times out still blocks", async () => {
   assert.equal(scalpGate(facts).reason, "honeypot_unsimulated");
 });
 
+test("a creator_vault 2006 is not served again from the safety cache", async () => {
+  let calls = 0;
+  const gate = createScalpGate(config(), market(), {
+    chain: async () => chainOk,
+    honeypot: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return { ok: false, reason: "honeypot_sim_error:2006", simErr: "2006", simAttempt: "first pass" };
+      }
+      return { ok: true, reason: null, simErr: null, simAttempt: "first pass" };
+    },
+  });
+  const first = await gate.check("MintVault", hint);
+  assert.notEqual(first, "timeout");
+  if (first === "timeout") return;
+  assert.equal(first.honeypotOk, false);
+  assert.equal(first.honeypotReason, "honeypot_sim_error:2006");
+  const second = await gate.check("MintVault", hint);
+  assert.notEqual(second, "timeout");
+  if (second === "timeout") return;
+  assert.equal(second.honeypotOk, true);
+  assert.equal(calls, 2);
+});
+
 test("a sim that reports unsellable still blocks", async () => {
   const gate = createScalpGate(config(), market(), {
     chain: async () => chainOk,

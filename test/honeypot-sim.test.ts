@@ -254,6 +254,75 @@ test("a stale creator_vault is rewritten, and 2006 stays a skip until the sell r
   assert.equal(honeypotDecision(raw.result, 2006).reason, "honeypot_sim_error:2006");
 });
 
+test("sell_v2 rewrites creator_vault when the creator pubkey is not an account", async () => {
+  const program = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+  const creator = Keypair.generate().publicKey;
+  const stale = Keypair.generate().publicKey;
+  const quoteMint = new PublicKey("So11111111111111111111111111111111111111112");
+  const quoteProgram = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+  const expected = creatorVaultPda(creator);
+  const expectedAta = PublicKey.findProgramAddressSync(
+    [expected.toBuffer(), quoteProgram.toBuffer(), quoteMint.toBuffer()],
+    new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"),
+  )[0];
+  const data = Buffer.alloc(24);
+  data.set([93, 246, 130, 60, 231, 233, 64, 178], 0);
+  const keys = Array.from({ length: 26 }, () => ({
+    pubkey: Keypair.generate().publicKey,
+    isSigner: false,
+    isWritable: false,
+  }));
+  keys[2] = { pubkey: quoteMint, isSigner: false, isWritable: false };
+  keys[4] = { pubkey: quoteProgram, isSigner: false, isWritable: false };
+  keys[16] = { pubkey: creatorVaultPda(stale), isSigner: false, isWritable: true };
+  keys[17] = { pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true };
+  const repaired = repairPumpCreatorVault(
+    new TransactionInstruction({ programId: program, keys, data }),
+    creator,
+  );
+  assert.equal(repaired.keys[16]?.pubkey.toBase58(), expected.toBase58());
+  assert.equal(repaired.keys[17]?.pubkey.toBase58(), expectedAta.toBase58());
+  assert.equal(repaired.keys.some((key) => key.pubkey.equals(stale)), false);
+
+  const payer = Keypair.generate();
+  const bytes = new VersionedTransaction(new TransactionMessage({
+    payerKey: payer.publicKey,
+    recentBlockhash: "11111111111111111111111111111111",
+    instructions: [new TransactionInstruction({ programId: program, keys, data })],
+  }).compileToV0Message()).serialize();
+  const tradeFetch: typeof fetch = async () => new Response(Buffer.from(bytes));
+  const sold = {
+    err: null,
+    logs: [
+      "Program log: Instruction: Sell",
+      "Program log: Instruction: TransferChecked",
+      "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success",
+    ],
+  };
+  const broken = { err: { InstructionError: [1, { Custom: 2006 }] }, logs: ["Program log: ConstraintSeeds"] };
+  const fixed = await assessSellability({
+    mint: Keypair.generate().publicKey.toBase58(),
+    pool: "pump",
+    slippagePct: 15,
+    tradeUrl: "https://trade.example/api/trade-local",
+    tradeFetch,
+    loadCurveCreator: async () => creator,
+    simulate: async (tx) => (tx.message.staticAccountKeys.some((key) => key.equals(expected)) ? sold : broken),
+  });
+  assert.equal(fixed.result, "ok");
+  const unresolved = await assessSellability({
+    mint: Keypair.generate().publicKey.toBase58(),
+    pool: "pump",
+    slippagePct: 15,
+    tradeUrl: "https://trade.example/api/trade-local",
+    tradeFetch,
+    simulate: async () => broken,
+  });
+  assert.equal(unresolved.result, "fail");
+  assert.equal(unresolved.err, "2006");
+  assert.equal(honeypotDecision(unresolved.result, 2006).reason, "honeypot_sim_error:2006");
+});
+
 test("a 429 is retried inside the sim budget and then fails closed", async () => {
   const payer = Keypair.generate();
   const tx = new VersionedTransaction(new TransactionMessage({

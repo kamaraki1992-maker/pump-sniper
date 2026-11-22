@@ -74,8 +74,7 @@ export function createScalpGate(
     const started = now();
     const work = honeypot(mint, pool).catch(() => ({ ok: false, reason: "honeypot_unsimulated" as string | null }));
     return withTimeout(work, config.scalpSimTimeoutMs, { ok: false, reason: "honeypot_unsimulated" }).then((result) => {
-      slot.honeySettled = true;
-      return {
+      const row: ScalpSimResult = {
         ok: result.ok,
         reason: result.reason,
         simMs: Math.max(0, now() - started),
@@ -83,6 +82,11 @@ export function createScalpGate(
         simLog: "simLog" in result ? result.simLog ?? null : null,
         simAttempt: "simAttempt" in result ? result.simAttempt ?? null : null,
       };
+      slot.honeySettled = true;
+      // A creator_vault seeds error is the quote's old creator, not a final
+      // verdict. The next check reads the curve again instead of reusing it.
+      if (row.simErr === "2006" || row.reason?.endsWith(":2006")) slot.at = now() - SCALP_SAFETY_TTL_MS - 1;
+      return row;
     });
   };
 
@@ -92,6 +96,8 @@ export function createScalpGate(
       if (hint.creator && hint.creator !== existing.creator) {
         existing.creator = hint.creator;
         existing.chain = loadChain(mint, hint.creator);
+        existing.honeySettled = false;
+        existing.honey = loadHoney(mint, existing.pool, existing);
       }
       if (hint.pool && hint.pool !== existing.pool) {
         existing.pool = hint.pool;

@@ -51,6 +51,9 @@ const INFRA_PROGRAMS = new Set([COMPUTE_BUDGET, SYSTEM_PROGRAM, TOKEN_PROGRAM, T
 /** Anchor discriminators for the curve buys whose second u64 is max_sol_cost. */
 const BUY_DISCRIMINATOR = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
 const BUY_V2_DISCRIMINATOR = Buffer.from([184, 23, 238, 97, 103, 197, 211, 61]);
+const SELL_V2_DISCRIMINATOR = Buffer.from([93, 246, 130, 60, 231, 233, 64, 178]);
+/** `creator_vault` on buy_v2 and sell_v2. The raw creator pubkey is not an account. */
+const CREATOR_VAULT_INDEX = 16;
 /**
  * Probe buys are 0.001 SOL. The quoted max_sol_cost is often tighter than the
  * curve, so the sim fails 6002 before the sell runs. 10 SOL is only a sim cap.
@@ -186,16 +189,44 @@ export function creatorVaultPda(creator: PublicKey): PublicKey {
   )[0];
 }
 
+function isCurveV2Trade(data: Uint8Array): boolean {
+  if (data.length < 8) return false;
+  const disc = Buffer.from(data.subarray(0, 8));
+  return disc.equals(BUY_V2_DISCRIMINATOR) || disc.equals(SELL_V2_DISCRIMINATOR);
+}
+
+function creatorVaultAta(vault: PublicKey, quoteMint: PublicKey, quoteProgram: PublicKey): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [vault.toBuffer(), quoteProgram.toBuffer(), quoteMint.toBuffer()],
+    new PublicKey(ATA_PROGRAM),
+  )[0];
+}
+
 /**
  * Trade-local sometimes keeps a creator_vault PDA from an old creator.
- * Anchor then fails the seeds check with 2006. Swap that PDA, and the raw
- * creator key it was derived from, for the creator stored on the curve.
+ * Anchor then fails the seeds check with 2006. buy_v2 and sell_v2 do not
+ * pass the creator pubkey, so the vault is account 17 and its quote ATA is
+ * account 18. Older instructions still carry both keys, and those are swapped
+ * as a pair. The creator is the one stored on the curve.
  */
 export function repairPumpCreatorVault(ix: TransactionInstruction, creator: PublicKey): TransactionInstruction {
   const program = new PublicKey(PUMP_CURVE);
   if (!ix.programId.equals(program)) return ix;
   const expected = creatorVaultPda(creator);
   const keys = ix.keys.map((key) => ({ pubkey: key.pubkey, isSigner: key.isSigner, isWritable: key.isWritable }));
+  if (isCurveV2Trade(ix.data) && keys.length > CREATOR_VAULT_INDEX + 1) {
+    const quoteMint = keys[2]?.pubkey;
+    const quoteProgram = keys[4]?.pubkey;
+    const ata = quoteMint && quoteProgram ? creatorVaultAta(expected, quoteMint, quoteProgram) : null;
+    const vaultMeta = keys[CREATOR_VAULT_INDEX]!;
+    const ataMeta = keys[CREATOR_VAULT_INDEX + 1]!;
+    if (vaultMeta.pubkey.equals(expected) && (ata == null || ataMeta.pubkey.equals(ata))) return ix;
+    keys[CREATOR_VAULT_INDEX] = { pubkey: expected, isSigner: vaultMeta.isSigner, isWritable: vaultMeta.isWritable };
+    if (ata) {
+      keys[CREATOR_VAULT_INDEX + 1] = { pubkey: ata, isSigner: ataMeta.isSigner, isWritable: ataMeta.isWritable };
+    }
+    return new TransactionInstruction({ programId: ix.programId, keys, data: ix.data });
+  }
   if (keys.some((key) => key.pubkey.equals(expected))) return ix;
   let vaultIndex = -1;
   let creatorIndex = -1;
