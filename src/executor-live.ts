@@ -25,9 +25,13 @@ export interface LivePorts {
   simulate(tx: VersionedTransaction): Promise<{ unitsConsumed: number | null; err: string | null }>;
   lookupTables(tx: VersionedTransaction): Promise<AddressLookupTableAccount[]>;
   sendBundle(tx: VersionedTransaction): Promise<{ bundleId: string; signature: string }>;
+  /** Normal RPC send. Sniper does not use this. Live momentum refuses it. */
+  sendTransaction?: (tx: VersionedTransaction) => Promise<{ signature: string }>;
+  /** Helius staked sender. Used when a momentum Jito bundle is unavailable. */
+  sendHelius?: (tx: VersionedTransaction) => Promise<{ signature: string }>;
   confirm(signature: string): Promise<ConfirmResult>;
   /** Dynamic priority fee in SOL. A throw or a missing port uses PRIORITY_FEE_SOL. */
-  priorityFee?: (accountKeys: string[], cuLimit: number) => Promise<number>;
+  priorityFee?: (accountKeys: string[], cuLimit: number, level?: "medium" | "high") => Promise<number>;
   /** Fresh blockhash for a rebuilt bundle. The hot path uses the cached one. */
   blockhash?: () => Promise<string>;
   tipAccount: PublicKey;
@@ -138,7 +142,7 @@ export class LiveExecutor implements Executor {
       const sim = await this.ports.simulate(tx);
       if (sim.err) return;
       const cuLimit = cuLimitFromConsumed(sim.unitsConsumed);
-      const priorityFeeSol = await this.priorityFeeSol(tx, cuLimit);
+      const priorityFeeSol = await this.priorityFeeSol(order, tx, cuLimit);
       const tables = await this.ports.lookupTables(tx);
       const blockhash = this.ports.blockhash ? await this.ports.blockhash() : tx.message.recentBlockhash;
       this.armed.set(order.mint, { raw, units: sim.unitsConsumed, priorityFeeSol, blockhash, tables });
@@ -148,6 +152,7 @@ export class LiveExecutor implements Executor {
   }
 
   private tipSol(order: OrderRequest): number {
+    if (order.useJito === false) return 0;
     return order.tipSol != null && order.tipSol >= 0 && Number.isFinite(order.tipSol)
       ? order.tipSol
       : this.ports.config.jitoTipSol;
@@ -196,7 +201,7 @@ export class LiveExecutor implements Executor {
     if (sim.err) return blank(order, classifySimError(sim.err));
 
     const cuLimit = cuLimitFromConsumed(sim.unitsConsumed);
-    const priorityFeeSol = await this.priorityFeeSol(tx, cuLimit);
+    const priorityFeeSol = await this.priorityFeeSol(order, tx, cuLimit);
     let prepared: VersionedTransaction;
     try {
       const tables = await this.ports.lookupTables(tx);
@@ -228,11 +233,36 @@ export class LiveExecutor implements Executor {
       return blank(order, "sign-failed");
     }
 
-    let sent: { bundleId: string; signature: string };
-    try {
-      sent = await this.ports.sendBundle(prepared);
-    } catch (error) {
-      return blank(order, error instanceof Error ? error.message : "bundle-send-failed");
+    let sent: { bundleId: string; signature: string } | null = null;
+    if (order.mevRequired) {
+      if (order.useJito !== false) {
+        try {
+          sent = await this.ports.sendBundle(prepared);
+        } catch {
+          sent = null;
+        }
+      }
+      if (!sent && this.ports.sendHelius) {
+        try {
+          const tx = await this.ports.sendHelius(prepared);
+          sent = { bundleId: "", signature: tx.signature };
+        } catch {
+          sent = null;
+        }
+      }
+      if (!sent) return blank(order, "mev_route_unavailable");
+    } else {
+      try {
+        if (order.useJito === false) {
+          if (!this.ports.sendTransaction) return blank(order, "send-unavailable");
+          const tx = await this.ports.sendTransaction(prepared);
+          sent = { bundleId: "", signature: tx.signature };
+        } else {
+          sent = await this.ports.sendBundle(prepared);
+        }
+      } catch (error) {
+        return blank(order, error instanceof Error ? error.message : "bundle-send-failed");
+      }
     }
 
     const confirm = await this.ports.confirm(sent.signature);
@@ -246,7 +276,21 @@ export class LiveExecutor implements Executor {
     return liveFillFromConfirm(order, sent.signature, confirm, estimate);
   }
 
-  private async priorityFeeSol(tx: VersionedTransaction, cuLimit: number): Promise<number> {
+  private async priorityFeeSol(order: OrderRequest, tx: VersionedTransaction, cuLimit: number): Promise<number> {
+    if (order.feeLevel && this.ports.priorityFee) {
+      const cap = order.feeLevel === "high" ? this.ports.config.momentumTurboFeeSol : this.ports.config.momentumPriorityFeeSol;
+      try {
+        const keys = tx.message.staticAccountKeys.map((key) => key.toBase58());
+        const quoted = await this.ports.priorityFee(keys, cuLimit, order.feeLevel);
+        if (quoted >= 0 && Number.isFinite(quoted)) return Math.min(quoted, cap);
+      } catch {
+        return cap;
+      }
+      return cap;
+    }
+    if (order.priorityFeeSol != null && order.priorityFeeSol >= 0 && Number.isFinite(order.priorityFeeSol)) {
+      return order.priorityFeeSol;
+    }
     const fallback = this.ports.config.priorityFeeSol;
     if (!this.ports.priorityFee) return fallback;
     try {
@@ -290,6 +334,32 @@ export function createLivePorts(
         err: err ? JSON.stringify(err) : null,
       };
     },
+    sendTransaction: async (tx) => {
+      const signature = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
+      return { signature };
+    },
+    ...(config.heliusSenderUrl
+      ? {
+          sendHelius: async (tx: VersionedTransaction) => {
+            const encoded = Buffer.from(tx.serialize()).toString("base64");
+            const response = await fetch(config.heliusSenderUrl!, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "sendTransaction",
+                params: [encoded, { encoding: "base64", skipPreflight: true, maxRetries: 0 }],
+              }),
+            });
+            const body = (await response.json()) as { result?: string; error?: { message?: string } };
+            if (!response.ok || body.error || !body.result) {
+              throw new Error(body.error?.message ?? `helius sender HTTP ${response.status}`);
+            }
+            return { signature: body.result };
+          },
+        }
+      : {}),
     sendBundle: async (tx) => {
       const signature = bs58.encode(tx.signatures[0] ?? new Uint8Array());
       const encoded = Buffer.from(tx.serialize()).toString("base64");

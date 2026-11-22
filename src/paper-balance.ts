@@ -4,9 +4,12 @@ import { dirname } from "node:path";
 /**
  * Simulated free cash for percent-of-balance sizing.
  * The file is created from the start balance and then updated by fills.
- * Deleting the file is the only reset. Open-position cost is not stored here.
+ * Deleting the file is the reset. That also flags the equity high-water mark
+ * to start over at the new bankroll. Open-position cost is not stored here.
  */
 export class PaperBalance {
+  private created = false;
+
   constructor(
     private readonly path: string,
     private readonly startSol: number,
@@ -16,9 +19,17 @@ export class PaperBalance {
     const stored = this.read();
     if (stored == null) {
       this.write(this.startSol);
+      this.created = true;
       return this.startSol;
     }
     return stored;
+  }
+
+  /** True once after this process created the balance file from the configured start. */
+  takeReset(): boolean {
+    const created = this.created;
+    this.created = false;
+    return created;
   }
 
   add(delta: number): number {

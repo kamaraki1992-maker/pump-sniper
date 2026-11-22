@@ -515,3 +515,42 @@ test("a helius stall reconnects when close never fires, when connect hangs, and 
   assert.match(pongText, /"downtimeMs":/);
   pong.stop();
 });
+
+test("a silent helius socket reconnects and resubscribes with the subscription ids", async () => {
+  const log = captureLog();
+  const sockets: DeadSocket[] = [];
+  let now = 1_000;
+  const feed = new HeliusFeed("wss://rpc.example/?api-key=supersecretkey123", log.log, {
+    stallMs: 20_000,
+    connectTimeoutMs: 10_000,
+    pingMs: 60_000,
+    backoff: () => 5,
+    pumpSwap: true,
+    now: () => now,
+    sockets: () => {
+      const socket = new DeadSocket();
+      sockets.push(socket);
+      return socket;
+    },
+  });
+  feed.start(() => {});
+  sockets[0]?.emit("open");
+  sockets[0]?.emit("message", JSON.stringify({ jsonrpc: "2.0", result: 11, id: 1 }));
+  sockets[0]?.emit("message", JSON.stringify({ jsonrpc: "2.0", result: 12, id: 2 }));
+  now += 20_000;
+  feed.checkStall();
+  assert.equal(await until(() => sockets.length >= 2, 1_000), true);
+  assert.equal(sockets[0]?.terminated, true);
+  assert.match(log.lines.join("\n"), /stallDurationMs/);
+  sockets[1]?.emit("open");
+  const sent = sockets[1]?.sent.join("\n") ?? "";
+  assert.match(sent, /logsSubscribe/);
+  assert.match(sent, /"id":1/);
+  assert.match(sent, /"id":2/);
+  sockets[1]?.emit("message", JSON.stringify({ jsonrpc: "2.0", result: 21, id: 1 }));
+  sockets[1]?.emit("message", JSON.stringify({ jsonrpc: "2.0", result: 22, id: 2 }));
+  const after = log.lines.join("\n");
+  assert.match(after, /helius resubscribed/);
+  assert.match(after, /"subscriptionIds":\[1,2\]/);
+  feed.stop();
+});

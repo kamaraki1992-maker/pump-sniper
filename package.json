@@ -10,6 +10,7 @@
     "start": "tsx src/index.ts",
     "sniper": "tsx src/index.ts",
     "report": "tsx src/report-cli.ts",
+    "status": "tsx src/status.ts",
     "panic-sell": "tsx src/panic-sell.ts",
     "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit"

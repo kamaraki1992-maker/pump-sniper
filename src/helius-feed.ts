@@ -1,6 +1,7 @@
 import WebSocket from "ws";
 import { Logger } from "./logger.js";
 import { nextBackoffMs } from "./stream.js";
+import { PUMP_AMM_PROGRAM_ID } from "./holders.js";
 import { eventsFromLogs, PUMP_LOG_PROGRAM, readLogsNotice } from "./helius-logs.js";
 import { redactRpcUrl } from "./redact.js";
 import type { MarketEvent } from "./types.js";
@@ -50,10 +51,20 @@ export interface HeliusFeedOptions {
   /** How often to publish the per-minute counters. */
   statsMs?: number;
   pingMs?: number;
+  /** Paper fallback while this socket is down. Stopped once logsSubscribe is acked again. */
+  fallback?: {
+    open: (onEvent: (event: MarketEvent) => void) => { stop: () => void };
+  };
+  /** Deliver trades for mints the bot is not already watching. Scalp needs this. */
+  allTrades?: boolean;
+  /** Also subscribe to PumpSwap logs and decode graduated swaps. */
+  pumpSwap?: boolean;
 }
 
 const CONNECT_TIMEOUT_MS = 10_000;
 const STALL_CHECK_MS = 5_000;
+/** Silence longer than this forces a close, even if the configured stall is higher. */
+const WATCHDOG_MS = 20_000;
 
 /**
  * One Helius logsSubscribe for the pump program. Token trades are filtered
@@ -87,7 +98,14 @@ export class HeliusFeed {
   private readonly backoff: (attempt: number) => number;
   private readonly statsMs: number;
   private readonly pingMs: number;
+  private readonly allTrades: boolean;
+  private readonly pumpSwap: boolean;
   private window = { events: 0, decodeFailures: 0, failedTx: 0, dupes: 0 };
+  private readonly expectedSubs = new Set<number>();
+  private readonly ackedSubs = new Set<number>();
+  private confirmTimer: NodeJS.Timeout | null = null;
+  private fallbackStop: (() => void) | null = null;
+  private readonly fallback?: HeliusFeedOptions["fallback"];
 
   constructor(
     private readonly url: string,
@@ -101,6 +119,14 @@ export class HeliusFeed {
     this.backoff = options.backoff ?? nextBackoffMs;
     this.statsMs = options.statsMs ?? 60_000;
     this.pingMs = options.pingMs ?? 20_000;
+    this.allTrades = options.allTrades ?? false;
+    this.pumpSwap = options.pumpSwap ?? false;
+    this.fallback = options.fallback;
+  }
+
+  /** Silence that forces a reconnect. Never longer than 20s. */
+  private silenceLimitMs(): number {
+    return Math.min(this.stallMs, WATCHDOG_MS);
   }
 
   start(onEvent: (event: MarketEvent) => void): void {
@@ -130,6 +156,7 @@ export class HeliusFeed {
   stop(): void {
     this.stopped = true;
     this.clearTimers();
+    this.stopFallback();
     const socket = this.ws;
     this.ws = null;
     this.opened = false;
@@ -170,8 +197,8 @@ export class HeliusFeed {
       return;
     }
     const silent = now - this.lastActivityAt;
-    if (silent < this.stallMs) return;
-    this.log.info("helius stall", { silentMs: silent, state: "silent" });
+    if (silent < this.silenceLimitMs()) return;
+    this.log.info("helius stall", { silentMs: silent, stallDurationMs: silent, state: "silent" });
     this.dropAndSchedule(socket, "stall");
   }
 
@@ -193,11 +220,13 @@ export class HeliusFeed {
     if (this.stallTimer) clearInterval(this.stallTimer);
     if (this.statsTimer) clearInterval(this.statsTimer);
     if (this.connectTimer) clearTimeout(this.connectTimer);
+    if (this.confirmTimer) clearTimeout(this.confirmTimer);
     this.timer = null;
     this.pingTimer = null;
     this.stallTimer = null;
     this.statsTimer = null;
     this.connectTimer = null;
+    this.confirmTimer = null;
   }
 
   private publishStats(): void {
@@ -237,7 +266,7 @@ export class HeliusFeed {
       if (this.ws !== socket) return;
       this.opened = true;
       this.attempt = 0;
-      this.send(this.subscribeBody());
+      this.sendSubscriptions();
       this.log.info("helius open", { url: redactRpcUrl(this.url), commitment: HELIUS_LOG_COMMITMENT });
     });
     socket.on("message", (data) => {
@@ -287,18 +316,75 @@ export class HeliusFeed {
     this.hadActivity = true;
   }
 
-  /** A subscribe ack or a logs notification means this socket is usable. */
+  /** Every logsSubscribe ack has to land before this socket counts as up. */
   private noteSubscribed(): void {
+    if (!this.subscriptionsConfirmed()) return;
     this.opened = true;
     this.subscribed = true;
     if (this.connectTimer) {
       clearTimeout(this.connectTimer);
       this.connectTimer = null;
     }
+    if (this.confirmTimer) {
+      clearTimeout(this.confirmTimer);
+      this.confirmTimer = null;
+    }
+    this.stopFallback();
     if (this.downSince == null) return;
     const downtimeMs = Math.max(0, this.now() - this.downSince);
     this.downSince = null;
-    this.log.info("helius resubscribed", { downtimeMs });
+    this.log.info("helius resubscribed", {
+      downtimeMs,
+      stallDurationMs: downtimeMs,
+      subscriptionIds: [...this.ackedSubs],
+    });
+  }
+
+  private subscriptionsConfirmed(): boolean {
+    if (this.expectedSubs.size === 0) return false;
+    for (const id of this.expectedSubs) {
+      if (!this.ackedSubs.has(id)) return false;
+    }
+    return true;
+  }
+
+  private sendSubscriptions(): void {
+    this.ackedSubs.clear();
+    this.expectedSubs.clear();
+    for (const body of this.subscribeBodies()) {
+      const parsed = JSON.parse(body) as { id?: number };
+      if (typeof parsed.id === "number") this.expectedSubs.add(parsed.id);
+      this.send(body);
+    }
+    this.armConfirmTimer();
+  }
+
+  /** Subscribe acks have to land, or this socket is closed and tried again. */
+  private armConfirmTimer(): void {
+    if (this.confirmTimer) clearTimeout(this.confirmTimer);
+    this.confirmTimer = setTimeout(() => {
+      this.confirmTimer = null;
+      if (this.stopped || this.subscriptionsConfirmed()) return;
+      const socket = this.ws;
+      if (!socket) return;
+      const waited = Math.max(0, this.now() - this.connectStartedAt);
+      this.log.info("helius stall", { silentMs: waited, stallDurationMs: waited, state: "resubscribe-timeout" });
+      this.dropAndSchedule(socket, "resubscribe-timeout");
+    }, this.connectTimeoutMs);
+    this.confirmTimer.unref?.();
+  }
+
+  private startFallback(): void {
+    if (!this.fallback || this.fallbackStop || this.stopped) return;
+    const handle = this.fallback.open(this.onEvent);
+    this.fallbackStop = () => handle.stop();
+    this.log.info("helius fallback", { feed: "pumpdev" });
+  }
+
+  private stopFallback(): void {
+    const stop = this.fallbackStop;
+    this.fallbackStop = null;
+    stop?.();
   }
 
   /** Drop handlers, kill the socket, and reconnect without waiting for close. */
@@ -308,6 +394,7 @@ export class HeliusFeed {
     this.subscribed = false;
     this.ws = null;
     this.markDown();
+    this.startFallback();
     if (this.connectTimer) {
       clearTimeout(this.connectTimer);
       this.connectTimer = null;
@@ -332,13 +419,26 @@ export class HeliusFeed {
     }
   }
 
-  private subscribeBody(): string {
-    return JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "logsSubscribe",
-      params: [{ mentions: [PUMP_LOG_PROGRAM] }, { commitment: HELIUS_LOG_COMMITMENT }],
-    });
+  private subscribeBodies(): string[] {
+    const bodies = [
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "logsSubscribe",
+        params: [{ mentions: [PUMP_LOG_PROGRAM] }, { commitment: HELIUS_LOG_COMMITMENT }],
+      }),
+    ];
+    if (this.pumpSwap) {
+      bodies.push(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "logsSubscribe",
+          params: [{ mentions: [PUMP_AMM_PROGRAM_ID.toBase58()] }, { commitment: HELIUS_LOG_COMMITMENT }],
+        }),
+      );
+    }
+    return bodies;
   }
 
   private onMessage(data: unknown): void {
@@ -359,7 +459,8 @@ export class HeliusFeed {
       });
       return;
     }
-    if (record.method == null && record.id === 1 && record.result !== undefined) {
+    if (record.method == null && typeof record.id === "number" && this.expectedSubs.has(record.id) && record.result !== undefined) {
+      this.ackedSubs.add(record.id);
       this.noteActivity();
       this.noteSubscribed();
       return;
@@ -387,7 +488,7 @@ export class HeliusFeed {
     this.window.decodeFailures += decoded.failures;
     const created = new Set(decoded.events.filter((event) => event.kind === "launch").map((event) => event.mint));
     for (const event of decoded.events) {
-      if (event.kind === "trade" && !this.tracked.has(event.mint) && !created.has(event.mint)) continue;
+      if (event.kind === "trade" && !this.allTrades && !this.tracked.has(event.mint) && !created.has(event.mint)) continue;
       this.window.events += 1;
       try {
         this.onEvent(event);
@@ -416,7 +517,9 @@ export class HeliusFeed {
 
   private schedule(reason: string): void {
     if (this.stopped || this.timer) return;
-    const delay = this.backoff(this.attempt);
+    const base = this.backoff(this.attempt);
+    const spread = Math.floor(base * 0.2);
+    const delay = spread <= 0 ? base : base - spread + Math.floor(Math.random() * (spread * 2 + 1));
     this.attempt += 1;
     this.reconnectDueAt = this.now() + delay;
     this.log.info("helius reconnect", { attempt: this.attempt, delayMs: delay, reason });

@@ -83,6 +83,53 @@ test("bundle body matches the Lightning trade fields and omits the private key",
 
   const graduated = buildBundleBody("Pubkey111", { ...order(), reason: "tp", pool: "pump-amm" }, config);
   assert.equal(graduated.pool, "pump-amm");
+  const raydium = buildBundleBody("Pubkey111", { ...order(), reason: "entry", pool: "raydium" }, config);
+  assert.equal(raydium.pool, "raydium");
+});
+
+test("live momentum refuses a public RPC send when Jito and the Helius sender are both down", async () => {
+  let publicSends = 0;
+  const payer = Keypair.generate();
+  const { ports: base } = ports({
+    sendBundle: async () => {
+      throw new Error("jito down");
+    },
+    sendTransaction: async (tx) => {
+      publicSends += 1;
+      return { signature: bs58.encode(tx.signatures[0] ?? new Uint8Array()) };
+    },
+    publicKey: payer.publicKey,
+    sign: (tx) => tx.sign([payer]),
+    buildUnsignedTx: async () => unsigned(payer.publicKey),
+  });
+  const blocked = await new LiveExecutor(base).buy({
+    ...order(),
+    useJito: true,
+    mevRequired: true,
+    feeLevel: "high",
+    tipSol: 0.0001,
+  });
+  assert.equal(blocked.error, "mev_route_unavailable");
+  assert.equal(publicSends, 0);
+  let helius = 0;
+  const routed = await new LiveExecutor({
+    ...base,
+    sendHelius: async (tx) => {
+      helius += 1;
+      return { signature: bs58.encode(tx.signatures[0] ?? new Uint8Array()) };
+    },
+    confirm: async () => ({ state: "landed", solDelta: null }),
+  }).buy({
+    ...order(),
+    useJito: true,
+    mevRequired: true,
+    feeLevel: "high",
+    tipSol: 0.0001,
+  });
+  assert.equal(helius, 1);
+  assert.equal(publicSends, 0);
+  assert.equal(routed.status, "filled");
+  assert.equal(routed.jitoTipSol, 0.0001);
 });
 
 test("a base58 bundle payload decodes", () => {
