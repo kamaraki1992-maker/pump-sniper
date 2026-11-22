@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -84,6 +84,76 @@ test("scalp exits ratchet the stop, sell 60%, trail 10%, and honor both clocks",
   assert.equal(scalpExit({ ...held, peakPriceSol: 1.09, priceSol: 1.05, nowMs: SCALP.fastHoldMs })?.reason, "scalp_fast");
   assert.equal(scalpExit({ ...held, peakPriceSol: 1.1, priceSol: 1.1, nowMs: SCALP.fastHoldMs }), null);
   assert.equal(scalpExit({ ...held, tpTaken: true, peakPriceSol: 1.2, priceSol: 1.15, nowMs: held.maxHoldMs })?.reason, "scalp_max_hold");
+});
+
+test("scalp age and liquidity defaults stay 60s and $10000, and the env overrides the gate", () => {
+  const defaults = loadConfig({ STRATEGY: "scalp", PAPER_START_BALANCE_SOL: "1" });
+  assert.equal(defaults.scalpMinAgeSec, 60);
+  assert.equal(defaults.scalpMinLiquidityUsd, 10_000);
+  const facts = {
+    ageMs: 45_000,
+    liquidityUsd: 12_000,
+    mintOk: true,
+    mintReason: null,
+    honeypotOk: true,
+    honeypotReason: null,
+    top10Pct: 10,
+    devPct: 1,
+    bundlePct: 2,
+    socialsOk: true,
+  };
+  assert.equal(scalpGate(facts).reason, "too_young");
+  const config = loadConfig({
+    STRATEGY: "scalp",
+    PAPER_START_BALANCE_SOL: "1",
+    SCALP_MIN_AGE_SEC: "30",
+    SCALP_MIN_LIQUIDITY_USD: "50000",
+  });
+  assert.equal(scalpGate(facts, {
+    minAgeMs: config.scalpMinAgeSec * 1000,
+    minLiquidityUsd: config.scalpMinLiquidityUsd,
+  }).reason, "liquidity");
+  assert.equal(scalpGate({ ...facts, liquidityUsd: 60_000 }, {
+    minAgeMs: config.scalpMinAgeSec * 1000,
+    minLiquidityUsd: config.scalpMinLiquidityUsd,
+  }).ok, true);
+});
+
+test("creating the paper balance resets the high-water mark to the new equity", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "scalp-hwm-"));
+  const equityPath = join(dir, "equity-hwm.json");
+  writeFileSync(equityPath, JSON.stringify({
+    hwmSol: 0.4837,
+    sessionStart: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  }));
+  const config = loadConfig({
+    STRATEGY: "scalp",
+    PAPER_START_BALANCE_SOL: "0.426",
+    DATA_DIR: dir,
+    KILL_FILE: join(dir, "KILL"),
+    GAS_RESERVE_USD: "0",
+  });
+  const runner = new ScalpRunner({
+    config,
+    executor: new PaperExecutor(config.paper),
+    positions: new PositionBook(join(dir, "positions.json")),
+    trades: new TradeLog(join(dir, "trades.jsonl")),
+    log: new Logger(),
+    solUsd: () => 100,
+    now: () => new Date("2026-02-01T00:00:00.000Z"),
+    market: {
+      async candidates() { return []; },
+      async pair() { return null; },
+      async candles() { return []; },
+      async trades() { return null; },
+    },
+    paperBalance: new PaperBalance(join(dir, "paper-balance.json"), 0.426),
+    gate: async () => "timeout",
+  });
+  await runner.tick();
+  const saved = JSON.parse(readFileSync(equityPath, "utf8")) as { hwmSol: number };
+  assert.equal(saved.hwmSol, 0.426);
 });
 
 test("the safety gate fails closed and a paper spike buys at the fixed priority fee", async () => {

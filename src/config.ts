@@ -204,6 +204,10 @@ export interface AppConfig {
   scalpLargeBuySol: number;
   /** How far back the large-buy count looks, in seconds. */
   scalpLargeBuyWindowSec: number;
+  /** Minimum mint age before a scalp entry. */
+  scalpMinAgeSec: number;
+  /** Minimum pool liquidity, in USD, before a scalp entry. */
+  scalpMinLiquidityUsd: number;
   /** Raydium swap fee, in basis points. */
   momentumRaydiumFeeBps: number;
   /** Alternative paper bankroll. Converted with the live SOL/USD price when the balance file is created. */
@@ -445,6 +449,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const scalpLargeBuyUsd = num(env.SCALP_LARGE_BUY_USD, 300, "SCALP_LARGE_BUY_USD");
   const scalpLargeBuySol = num(env.SCALP_LARGE_BUY_SOL, 2, "SCALP_LARGE_BUY_SOL");
   const scalpLargeBuyWindowSec = num(env.SCALP_LARGE_BUY_WINDOW_SEC, 120, "SCALP_LARGE_BUY_WINDOW_SEC");
+  const scalpMinAgeSec = num(env.SCALP_MIN_AGE_SEC, 60, "SCALP_MIN_AGE_SEC");
+  const scalpMinLiquidityUsd = num(env.SCALP_MIN_LIQUIDITY_USD, 10_000, "SCALP_MIN_LIQUIDITY_USD");
   const momentumRaydiumFeeBps = num(env.MOMENTUM_RAYDIUM_FEE_BPS, 25, "MOMENTUM_RAYDIUM_FEE_BPS");
   const paperStartBalanceUsd = optionalNum(env.PAPER_START_BALANCE_USD, "PAPER_START_BALANCE_USD");
   const heliusSenderUrl = str(env.HELIUS_SENDER_URL, "") || null;
@@ -678,6 +684,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!(scalpLargeBuyUsd > 0)) throw new ConfigError("SCALP_LARGE_BUY_USD must be positive");
   if (!(scalpLargeBuySol > 0)) throw new ConfigError("SCALP_LARGE_BUY_SOL must be positive");
   if (!(scalpLargeBuyWindowSec > 0)) throw new ConfigError("SCALP_LARGE_BUY_WINDOW_SEC must be positive");
+  if (!(scalpMinAgeSec > 0)) throw new ConfigError("SCALP_MIN_AGE_SEC must be positive");
+  if (!(scalpMinLiquidityUsd > 0)) throw new ConfigError("SCALP_MIN_LIQUIDITY_USD must be positive");
   if (!(momentumPriorityFeeSol > 0) || momentumPriorityFeeSol > momentumTurboFeeSol) {
     throw new ConfigError("MOMENTUM_PRIORITY_FEE_SOL must be > 0 and at most MOMENTUM_TURBO_FEE_SOL");
   }
@@ -828,6 +836,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     scalpLargeBuyUsd,
     scalpLargeBuySol,
     scalpLargeBuyWindowSec,
+    scalpMinAgeSec,
+    scalpMinLiquidityUsd,
     momentumRaydiumFeeBps,
     paperStartBalanceUsd,
     heliusSenderUrl,

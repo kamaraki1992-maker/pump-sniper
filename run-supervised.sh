@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Restarts the paper process. Immediate crashes back off; npm ci failure does not loop.
 set -u
-root="$(cd "$(dirname "$0")" && pwd)"
-cd "$root"
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+cd "$script_dir"
+export PAPER_SUPERVISED=1
 
 read -r -a delays <<< "${PAPER_SUPERVISOR_DELAYS:-10 30 60}"
 max_tries="${PAPER_SUPERVISOR_MAX:-5}"
 immediate_sec="${PAPER_SUPERVISOR_IMMEDIATE_SEC:-15}"
-cmd="${START_CMD:-$root/start-paper.sh}"
+cmd="${START_CMD:-$script_dir/start-paper.sh}"
 
 tries=0
 while (( tries < max_tries )); do

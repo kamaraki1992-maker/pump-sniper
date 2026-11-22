@@ -238,7 +238,10 @@ export class ScalpRunner {
         this.deps.log.info("scalp", { mint: event.mint, decision: "skip", reason: "gate_timeout" });
         return;
       }
-      const decision = scalpGate(gated);
+      const decision = scalpGate(gated, {
+        minAgeMs: this.deps.config.scalpMinAgeSec * 1000,
+        minLiquidityUsd: this.deps.config.scalpMinLiquidityUsd,
+      });
       this.deps.log.info("scalp", { mint: event.mint, decision: decision.ok ? "buy" : "skip", reason: decision.reason });
       if (!decision.ok) return;
       await this.buy(event, solUsd, gated.liquidityUsd ?? liquidityUsd ?? 0, memory?.creator ?? "");
@@ -578,6 +581,12 @@ export class ScalpRunner {
     for (const position of this.deps.positions.list()) {
       marked += positionValueSol(position.tokenAmount, position.lastMarkPriceSol, 25, this.deps.config.paper.baseFeeSol, this.deps.config.scalpPriorityFeeSol);
     }
-    this.equity.mark(cash + reserve + marked, this.deps.now().toISOString());
+    const equitySol = cash + reserve + marked;
+    const nowIso = this.deps.now().toISOString();
+    if (this.deps.config.mode === "paper" && equitySol > 0 && this.deps.paperBalance?.takeReset()) {
+      this.equity.rebase(equitySol, nowIso);
+      return;
+    }
+    this.equity.mark(equitySol, nowIso);
   }
 }

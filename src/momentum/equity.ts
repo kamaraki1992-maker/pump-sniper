@@ -73,6 +73,16 @@ export class EquityBook {
   }
 
   /**
+   * A new paper bankroll starts the mark over. An existing KILL file stays
+   * until it is removed by hand.
+   */
+  rebase(equitySol: number, nowIso: string): { hwmSol: number; killed: boolean; sessionStart: string } {
+    const row: EquityFile = { hwmSol: equitySol, sessionStart: nowIso, updatedAt: nowIso };
+    this.write(row);
+    return { hwmSol: equitySol, killed: this.killed(), sessionStart: nowIso };
+  }
+
+  /**
    * Raises the high-water mark. A 25% drop writes KILL and leaves the mark
    * where it is. An existing KILL file is not cleared here.
    */

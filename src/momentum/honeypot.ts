@@ -48,6 +48,14 @@ const BUYBACK_RECIPIENT_COUNT = 8;
 /** After the fee-program account, the upgraded sell reads the buyback wallet here. */
 const BUYBACK_ACCOUNT_INDEX = 21;
 const INFRA_PROGRAMS = new Set([COMPUTE_BUDGET, SYSTEM_PROGRAM, TOKEN_PROGRAM, TOKEN_2022, ATA_PROGRAM]);
+/** Anchor discriminators for the curve buys whose second u64 is max_sol_cost. */
+const BUY_DISCRIMINATOR = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
+const BUY_V2_DISCRIMINATOR = Buffer.from([184, 23, 238, 97, 103, 197, 211, 61]);
+/**
+ * Probe buys are 0.001 SOL. The quoted max_sol_cost is often tighter than the
+ * curve, so the sim fails 6002 before the sell runs. 10 SOL is only a sim cap.
+ */
+export const PROBE_MAX_SOL_LAMPORTS = 10_000_000_000n;
 const BURN_OWNERS = new Set([
   "11111111111111111111111111111111",
   "1nc1nerator11111111111111111111111111111111",
@@ -302,6 +310,28 @@ export async function assessSellability(input: {
   /** Bonding-curve creator, read once per mint. */
   loadCurveCreator?: (mint: string) => Promise<PublicKey | null>;
 }): Promise<SellSimTrace> {
+  const first = await quoteRoundTrip(input);
+  if (first.err !== "6002") return first;
+  return quoteRoundTrip(input);
+}
+
+async function quoteRoundTrip(input: {
+  mint: string;
+  pool: "pump" | "pump-amm";
+  slippagePct: number;
+  tradeUrl: string;
+  tradeFetch?: typeof fetch;
+  simulate: (tx: VersionedTransaction) => Promise<{
+    err: unknown;
+    logs: readonly string[] | null;
+    preTokenBalances?: readonly TokenBalanceChange[] | null;
+    postTokenBalances?: readonly TokenBalanceChange[] | null;
+  }>;
+  loadTable?: (key: PublicKey) => Promise<AddressLookupTableAccount | null>;
+  findHolder?: (mint: string) => Promise<string | null>;
+  loadBuybackRecipient?: () => Promise<PublicKey | null>;
+  loadCurveCreator?: (mint: string) => Promise<PublicKey | null>;
+}): Promise<SellSimTrace> {
   const tradeFetch = input.tradeFetch ?? fetch;
   const recipient = await input.loadBuybackRecipient?.().catch(() => null) ?? null;
   const creator = await input.loadCurveCreator?.(input.mint).catch(() => null) ?? null;
@@ -512,8 +542,23 @@ async function fetchTrade(tradeFetch: typeof fetch, url: string, body: Record<st
   }
 }
 
+/**
+ * Raise max_sol_cost on a probe buy. A 6002 here is the quote's own slippage
+ * bound, not a token that cannot be sold. Sells are left alone.
+ */
+export function relaxProbeMaxSol(ix: TransactionInstruction): TransactionInstruction {
+  const program = new PublicKey(PUMP_CURVE);
+  if (!ix.programId.equals(program) || ix.data.length < 24) return ix;
+  const disc = Buffer.from(ix.data.subarray(0, 8));
+  if (!disc.equals(BUY_DISCRIMINATOR) && !disc.equals(BUY_V2_DISCRIMINATOR)) return ix;
+  if (ix.data.readBigUInt64LE(16) >= PROBE_MAX_SOL_LAMPORTS) return ix;
+  const data = Buffer.from(ix.data);
+  data.writeBigUInt64LE(PROBE_MAX_SOL_LAMPORTS, 16);
+  return new TransactionInstruction({ programId: ix.programId, keys: ix.keys, data });
+}
+
 function repairInstruction(ix: TransactionInstruction, recipient: PublicKey | null, creator: PublicKey | null): TransactionInstruction {
-  let next = ix;
+  let next = relaxProbeMaxSol(ix);
   if (recipient) next = repairPumpAmmSell(next, recipient);
   if (creator) next = repairPumpCreatorVault(next, creator);
   return next;

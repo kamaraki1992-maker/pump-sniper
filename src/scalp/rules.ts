@@ -143,11 +143,16 @@ export interface ScalpGateFacts {
 }
 
 /** Safety and universe checks. A missing figure fails closed. */
-export function scalpGate(facts: ScalpGateFacts): { ok: boolean; reason: string } {
+export function scalpGate(
+  facts: ScalpGateFacts,
+  limits: { minAgeMs?: number; minLiquidityUsd?: number } = {},
+): { ok: boolean; reason: string } {
+  const minAgeMs = limits.minAgeMs ?? SCALP.minAgeMs;
+  const minLiquidityUsd = limits.minLiquidityUsd ?? SCALP.minLiquidityUsd;
   if (facts.ageMs == null) return { ok: false, reason: "age_unknown" };
-  if (facts.ageMs < SCALP.minAgeMs) return { ok: false, reason: "too_young" };
+  if (facts.ageMs < minAgeMs) return { ok: false, reason: "too_young" };
   if (facts.ageMs >= SCALP.maxAgeMs) return { ok: false, reason: "too_old" };
-  if (facts.liquidityUsd == null || !(facts.liquidityUsd >= SCALP.minLiquidityUsd)) return { ok: false, reason: "liquidity" };
+  if (facts.liquidityUsd == null || !(facts.liquidityUsd >= minLiquidityUsd)) return { ok: false, reason: "liquidity" };
   if (!facts.mintOk) return { ok: false, reason: facts.mintReason ?? "mint_authority" };
   if (!facts.honeypotOk) return { ok: false, reason: facts.honeypotReason ?? "honeypot" };
   if (facts.top10Pct == null || !(facts.top10Pct < 25)) return { ok: false, reason: facts.top10Pct == null ? "top10_unavailable" : "top10" };

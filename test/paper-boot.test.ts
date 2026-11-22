@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -34,6 +34,41 @@ exit 0
   assert.equal(result.status, 2);
   assert.match(`${result.stderr}`, /npm ci failed/);
   assert.match(`${result.stderr}`, /node_modules missing dotenv/);
+});
+
+test("start-paper keeps the npm ci check and restarts through the supervisor", () => {
+  const dir = mkdtempSync(join(tmpdir(), "paper-supervised-"));
+  mkdirSync(join(dir, "node_modules", "dotenv"), { recursive: true });
+  writeFileSync(join(dir, "node_modules", "dotenv", "package.json"), "{}");
+  const binDir = join(dir, "bin");
+  mkdirSync(binDir);
+  const log = join(dir, "npm.log");
+  bin(binDir, "npm", `#!/usr/bin/env bash
+echo "$@" >> "${log}"
+if [[ "$1" == "ci" ]]; then
+  echo "npm ci should not run" >&2
+  exit 1
+fi
+exit 1
+`);
+  const result = spawnSync("bash", [join(root, "start-paper.sh")], {
+    cwd: dir,
+    env: {
+      ...process.env,
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      PAPER_ROOT: dir,
+      PAPER_SUPERVISOR_DELAYS: "0 0",
+      PAPER_SUPERVISOR_MAX: "2",
+      PAPER_SUPERVISOR_IMMEDIATE_SEC: "60",
+    },
+    encoding: "utf8",
+  });
+  assert.notEqual(result.status, 0);
+  const calls = readFileSync(log, "utf8");
+  assert.equal(calls.includes("ci"), false);
+  assert.equal(calls.trim().split("\n").length, 2);
+  assert.match(`${result.stderr}`, /retry 1 in 0s/);
+  assert.match(`${result.stderr}`, /giving up after 2 immediate exits/);
 });
 
 test("the supervisor backs off and stops after repeated immediate exits", () => {

@@ -589,7 +589,13 @@ export class MomentumRunner {
         this.deps.config.momentumPriorityFeeSol,
       );
     }
-    this.equity.mark(cash + reserve + marked, this.deps.now().toISOString());
+    const equitySol = cash + reserve + marked;
+    const nowIso = this.deps.now().toISOString();
+    if (this.deps.config.mode === "paper" && equitySol > 0 && this.deps.paperBalance?.takeReset()) {
+      this.equity.rebase(equitySol, nowIso);
+      return;
+    }
+    this.equity.mark(equitySol, nowIso);
   }
 
   private entriesHalted(): boolean {

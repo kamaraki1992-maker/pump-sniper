@@ -12,6 +12,8 @@ import {
   creatorVaultPda,
   formatRpcError,
   honeypotDecision,
+  PROBE_MAX_SOL_LAMPORTS,
+  relaxProbeMaxSol,
   repairPumpAmmSell,
   repairPumpCreatorVault,
   sellExecuted,
@@ -289,4 +291,73 @@ test("a 429 is retried inside the sim budget and then fails closed", async () =>
   await assert.rejects(() => simulateRoundTrip(["https://rpc.example"], tightFetch, tx, Date.now() + 50));
   assert.equal(tightCalls, 1);
   assert.ok(Date.now() - tightStart < 250);
+});
+
+test("a probe buy_v2 raises max_sol_cost, and a remaining 6002 still fails closed", async () => {
+  const program = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+  const data = Buffer.alloc(24);
+  data.set([184, 23, 238, 97, 103, 197, 211, 61], 0);
+  data.writeBigUInt64LE(1n, 8);
+  data.writeBigUInt64LE(1_000n, 16);
+  const ix = new TransactionInstruction({
+    programId: program,
+    keys: [{ pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: false }],
+    data,
+  });
+  assert.equal(relaxProbeMaxSol(ix).data.readBigUInt64LE(16), PROBE_MAX_SOL_LAMPORTS);
+  const payer = Keypair.generate();
+  const bytes = new VersionedTransaction(new TransactionMessage({
+    payerKey: payer.publicKey,
+    recentBlockhash: "11111111111111111111111111111111",
+    instructions: [ix],
+  }).compileToV0Message()).serialize();
+  const sellLogs = [
+    "Program log: Instruction: Sell",
+    "Program log: Instruction: TransferChecked",
+    "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success",
+  ];
+  const tooMuch = { InstructionError: [1, { Custom: 6002 }] };
+  let fetches = 0;
+  const caps: bigint[] = [];
+  const tradeFetch: typeof fetch = async () => {
+    fetches += 1;
+    return new Response(Buffer.from(bytes));
+  };
+  let sims = 0;
+  const held = await assessSellability({
+    mint: "Mint",
+    pool: "pump",
+    slippagePct: 15,
+    tradeUrl: "https://trade.example/api/trade-local",
+    tradeFetch,
+    simulate: async (tx) => {
+      sims += 1;
+      const decoded = TransactionMessage.decompile(tx.message).instructions;
+      const buy = decoded.find((row) => row.data.length >= 24 && row.data[0] === 184);
+      caps.push(buy ? Buffer.from(buy.data).readBigUInt64LE(16) : 0n);
+      return { err: tooMuch, logs: ["TooMuchSolRequired"] };
+    },
+  });
+  assert.equal(held.result, "fail");
+  assert.equal(held.err, "6002");
+  assert.equal(honeypotDecision(held.result, 6002).reason, "honeypot_sim_error:6002");
+  assert.equal(sims, 2);
+  assert.equal(fetches, 4);
+  assert.deepEqual(caps, [PROBE_MAX_SOL_LAMPORTS, PROBE_MAX_SOL_LAMPORTS]);
+
+  sims = 0;
+  const recovered = await assessSellability({
+    mint: "Mint",
+    pool: "pump",
+    slippagePct: 15,
+    tradeUrl: "https://trade.example/api/trade-local",
+    tradeFetch,
+    simulate: async () => {
+      sims += 1;
+      if (sims === 1) return { err: tooMuch, logs: ["TooMuchSolRequired"] };
+      return { err: null, logs: sellLogs };
+    },
+  });
+  assert.equal(recovered.result, "ok");
+  assert.equal(sims, 2);
 });
